@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    image: run4221-bot:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data

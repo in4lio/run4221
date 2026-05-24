@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "run4221"
+version = "0.1.0"
+description = "Telegram tracker for marathon and half marathon registration openings."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.22,<4",
+    "alembic>=1.13,<2",
+    "httpx>=0.27,<1",
+    "openai>=2,<3",
+    "pydantic-settings>=2.7,<3",
+    "python-dotenv>=1.0,<2",
+    "sqlalchemy>=2.0,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+    "ruff>=0.9,<1",
+]
+
+[project.scripts]
+run4221-bot = "run4221.bot.app:run"
+run4221-seed-prompts = "run4221.db.seed_prompts:main"
+run4221-seed-suggestions = "run4221.db.seed_suggestions:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/run4221"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
