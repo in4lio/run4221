@@ -1,0 +1,134 @@
+name: Bootstrap Production Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Data action to run"
+        required: true
+        default: "seed-prompts"
+        type: choice
+        options:
+          - seed-prompts
+          - reset-and-seed-suggestions
+      private_ref:
+        description: "Branch, tag, or SHA in in4lio/run4221-private"
+        required: true
+        default: "main"
+        type: string
+      confirm_reset:
+        description: "Required only for reset-and-seed-suggestions"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: production-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    name: Bootstrap production data
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+
+    steps:
+      - name: Validate reset confirmation
+        if: ${{ inputs.action == 'reset-and-seed-suggestions' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.confirm_reset }}" != "RESET_SUGGESTION_BOOTSTRAP" ]]; then
+            echo "reset-and-seed-suggestions requires confirm_reset=RESET_SUGGESTION_BOOTSTRAP"
+            exit 1
+          fi
+
+      - name: Checkout private data
+        uses: actions/checkout@v4
+        with:
+          repository: in4lio/run4221-private
+          ref: ${{ inputs.private_ref }}
+          path: private-source
+          ssh-key: ${{ secrets.PRIVATE_REPO_SSH_KEY }}
+
+      - name: Validate private data files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f private-source/prompts/discover_event_profile.instructions.txt
+          test -f private-source/prompts/update_registration_window.instructions.txt
+          if [[ "${{ inputs.action }}" == "reset-and-seed-suggestions" ]]; then
+            test -f private-source/data/launch_suggestions.json
+          fi
+
+      - name: Configure VPS SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${{ secrets.VPS_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Sync private data to VPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          remote_private_dir="${{ secrets.VPS_APP_DIR }}/private"
+          tar -C private-source -czf - data prompts | ssh \
+            -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            "mkdir -p '$remote_private_dir' && tar -C '$remote_private_dir' -xzf -"
+
+      - name: Seed prompts
+        if: ${{ inputs.action == 'seed-prompts' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            "APP_DIR='${{ secrets.VPS_APP_DIR }}' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "$APP_DIR"
+          docker compose run --rm \
+            -v "$PWD/private:/app/private:ro" \
+            bot uv run python -m run4221.db.seed_prompts \
+              --prompts-dir private/prompts \
+              --database-url sqlite:///data/run4221.sqlite3
+          docker compose up -d
+          docker compose ps
+          REMOTE
+
+      - name: Reset database and seed suggestions
+        if: ${{ inputs.action == 'reset-and-seed-suggestions' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            "APP_DIR='${{ secrets.VPS_APP_DIR }}' bash -s" <<'REMOTE'
+          set -euo pipefail
+          cd "$APP_DIR"
+          docker compose stop bot
+          docker compose run --rm \
+            -v "$PWD/private:/app/private:ro" \
+            bot uv run python -m run4221.db.seed_suggestions \
+              --input private/data/launch_suggestions.json \
+              --database-url sqlite:///data/run4221.sqlite3 \
+              --reset-sqlite \
+              --confirm-reset RESET_SUGGESTION_BOOTSTRAP
+          docker compose up -d --build --remove-orphans
+          docker compose ps
+          REMOTE
