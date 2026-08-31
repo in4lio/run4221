@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, selectinload
 from run4221.db import models
 from run4221.db.bootstrap import ensure_database_schema
 from run4221.db.models import utcnow
-from run4221.db.session import session_scope
+from run4221.db.session import run_serialized_transaction, session_scope
 from run4221.events import (
     DISTANCE_CODE_TO_KEY,
     REGION_LABELS,
@@ -447,23 +447,33 @@ def add_event_suggestion(
     ensure_database_schema(database_url)
     validate_event_suggestion_create(suggestion)
 
-    with session_scope(database_url) as session:
+    def add_in_transaction(session: Session) -> EventSuggestionRecord:
         validate_event_suggestion_queue_capacity(session, suggestion)
-        model = models.EventSuggestion(
-            event_name=suggestion.event_name.strip(),
-            url=optional_text(suggestion.url),
-            event_date=suggestion.event_date,
-            location=optional_text(suggestion.location),
-            region_tags=list(suggestion.region_tags),
-            distances=list(suggestion.distances),
-            note=optional_text(suggestion.note),
-            submitter_user_id=optional_text(suggestion.submitter_user_id),
-            submitter_username=optional_text(suggestion.submitter_username),
-            submitter_display_name=optional_text(suggestion.submitter_display_name),
-        )
-        session.add(model)
-        session.flush()
+        model = add_event_suggestion_in_session(session, suggestion)
         return event_suggestion_to_record(model)
+
+    return run_serialized_transaction(add_in_transaction, database_url=database_url)
+
+
+def add_event_suggestion_in_session(
+    session: Session,
+    suggestion: EventSuggestionCreate,
+) -> models.EventSuggestion:
+    model = models.EventSuggestion(
+        event_name=suggestion.event_name.strip(),
+        url=optional_text(suggestion.url),
+        event_date=suggestion.event_date,
+        location=optional_text(suggestion.location),
+        region_tags=list(suggestion.region_tags),
+        distances=list(suggestion.distances),
+        note=optional_text(suggestion.note),
+        submitter_user_id=optional_text(suggestion.submitter_user_id),
+        submitter_username=optional_text(suggestion.submitter_username),
+        submitter_display_name=optional_text(suggestion.submitter_display_name),
+    )
+    session.add(model)
+    session.flush()
+    return model
 
 
 def list_event_suggestions(

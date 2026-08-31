@@ -49,7 +49,7 @@ from run4221.db.repository import (
     update_event_suggestion_status,
 )
 from run4221.db.seed import seed_initial_data
-from run4221.db.session import session_scope
+from run4221.db.session import get_engine, session_scope
 from tests.seed_fixtures import sample_seed_events
 
 
@@ -61,6 +61,21 @@ def initialize_sample_database(url: str) -> None:
     initialize_database(url, seed_initial_events=False)
     with session_scope(url) as session:
         seed_initial_data(session, sample_seed_events())
+
+
+def test_sqlite_connections_enable_integrity_and_contention_pragmas(tmp_path) -> None:
+    url = database_url(tmp_path)
+
+    initialize_database(url, seed_initial_events=False)
+
+    engine = get_engine(url)
+    for _index in range(2):
+        engine.dispose()
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+            assert connection.exec_driver_sql("PRAGMA journal_mode").scalar_one() == "wal"
+            busy_timeout = connection.exec_driver_sql("PRAGMA busy_timeout").scalar_one()
+            assert 1_000 <= busy_timeout <= 10_000
 
 
 def suggestion_payload(
