@@ -895,6 +895,47 @@ def test_database_partially_applies_proposed_registration_update(tmp_path) -> No
     assert list_proposed_event_updates(database_url=url) == (result.follow_up_update,)
 
 
+def test_database_applies_explicit_registration_url_clear(tmp_path) -> None:
+    url = database_url(tmp_path)
+    invalid_url = "https://example.com/kids-and-youth/mini-marathon"
+    event = add_event(
+        EventCreate(
+            public_id="berlin.42",
+            name="BMW BERLIN-MARATHON",
+            city="Berlin",
+            country="Germany",
+            timezone="Europe/Berlin",
+            event_date="2026-09-27",
+            distances=("marathon",),
+            regions=("global", "eu", "de"),
+            official_url="https://example.com/berlin-marathon",
+            registration_url=invalid_url,
+        ),
+        database_url=url,
+    )
+    proposed = create_proposed_event_update(
+        ProposedEventUpdateCreate(
+            event_id=event.id,
+            update_type="registration_window",
+            current_fields={"registration_url": invalid_url},
+            proposed_fields={"registration_url": None},
+            evidence=("The saved URL belongs to the Mini Marathon.",),
+            confidence=0.99,
+        ),
+        database_url=url,
+    )
+
+    result = approve_proposed_event_update(
+        proposed.id,
+        reviewer_user_id="42",
+        database_url=url,
+    )
+
+    assert result is not None
+    assert result.event.registration_url is None
+    assert find_event(event.id, url).registration_url is None
+
+
 def test_database_counts_pending_updates_and_suggestions(tmp_path) -> None:
     url = database_url(tmp_path)
     event = add_event(

@@ -4232,7 +4232,7 @@ def proposed_update_changes(
                         max_html_chars=max_value_html_chars,
                     ),
                     "  "
-                    + format_json_field_value(
+                    + format_proposed_json_field_value(
                         proposed_value,
                         field=field,
                         max_html_chars=max_value_html_chars,
@@ -4275,7 +4275,22 @@ def decode_update_field_mask(
 
 
 def is_empty_proposed_update_value(value: object) -> bool:
-    return value is None or value == "" or value == "unknown"
+    return value == "" or value == "unknown"
+
+
+def format_proposed_json_field_value(
+    value: object,
+    *,
+    field: str,
+    max_html_chars: int | None = None,
+) -> str:
+    if value is None:
+        return "<i>clear</i>"
+    return format_json_field_value(
+        value,
+        field=field,
+        max_html_chars=max_html_chars,
+    )
 
 
 def is_generic_update_summary(summary: str) -> bool:

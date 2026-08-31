@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Protocol
 
 from run4221.ai.event_extractor import (
+    conflicts_with_event_identity,
     infer_event_date,
     infer_registration_url,
     is_likely_article_url,
@@ -226,11 +227,15 @@ class HeuristicRegistrationWindowProvider:
         lowered = text.casefold()
         registration_status = infer_registration_status(lowered)
         registration_open_at = infer_registration_open_date(text)
-        registration_url = infer_registration_url(snapshot)
+        registration_url = infer_registration_url(snapshot, event.distances)
         registration_url = registration_url or select_registration_url_for_distances(
             tuple((link.url, link.text) for link in snapshot.links),
             event.distances,
-            fallback=safe_registration_url(event.registration_url, event.event_date),
+            fallback=safe_registration_url(
+                event.registration_url,
+                event.event_date,
+                event.distances,
+            ),
         )
         raw_event_date = infer_event_date(text)
         stale_event_date = is_stale_event_date(raw_event_date, event.event_date)
@@ -289,7 +294,11 @@ def fallback_registration_extraction(
         registration_open_at=event.registration_open_at,
         registration_open_precision=event.registration_open_precision,
         registration_close_at=event.registration_close_at,
-        registration_url=safe_registration_url(event.registration_url, event.event_date),
+        registration_url=safe_registration_url(
+            event.registration_url,
+            event.event_date,
+            event.distances,
+        ),
         event_date=event.event_date,
         confidence=confidence,
         evidence_snippets=evidence,
@@ -298,7 +307,11 @@ def fallback_registration_extraction(
 
 
 def registration_source_url(event: TrackedEvent) -> tuple[str, tuple[str, ...]]:
-    safe_url = safe_registration_url(event.registration_url, event.event_date)
+    safe_url = safe_registration_url(
+        event.registration_url,
+        event.event_date,
+        event.distances,
+    )
     if safe_url:
         return safe_url, ()
 
@@ -314,10 +327,16 @@ def registration_source_url(event: TrackedEvent) -> tuple[str, tuple[str, ...]]:
     return event.official_url, ()
 
 
-def safe_registration_url(value: str | None, event_date: str | None) -> str | None:
+def safe_registration_url(
+    value: str | None,
+    event_date: str | None,
+    distances: tuple[str, ...] = (),
+) -> str | None:
     if not value:
         return None
     if is_likely_article_url(value, event_date):
+        return None
+    if conflicts_with_event_identity(value, "", distances):
         return None
 
     return value
@@ -367,13 +386,18 @@ def registration_current_fields(event: TrackedEvent) -> dict[str, object]:
 def registration_proposed_fields(
     extraction: RegistrationWindowExtraction,
 ) -> dict[str, object]:
-    return {
+    fields = {
         "registration_status": extraction.registration_status,
         "registration_open_at": extraction.registration_open_at,
         "registration_open_precision": extraction.registration_open_precision,
         "registration_close_at": extraction.registration_close_at,
         "registration_url": extraction.registration_url,
         "event_date": extraction.event_date,
+    }
+    return {
+        field: value
+        for field, value in fields.items()
+        if value is not None and value not in {"", "unknown"}
     }
 
 

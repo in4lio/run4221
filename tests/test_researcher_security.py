@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -82,6 +83,7 @@ def assessment_request() -> AssessmentRequest:
             CapturedSnapshotEvidence(
                 reference=reference(),
                 final_url="https://example.com/marathon",
+                fetched_at=datetime(2026, 8, 31, tzinfo=UTC),
                 normalized_text="Registration is open.",
                 text_hash="b" * 64,
             ),

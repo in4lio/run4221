@@ -4,6 +4,7 @@ import ast
 import asyncio
 import inspect
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -191,6 +192,56 @@ def test_ae1_refresh_creates_proposal_without_mutating_event(tmp_path: Path) -> 
     assert any("researcher-decision:v1" in line for line in updates[0].evidence)
     assert any("stored approved event source" in line for line in updates[0].evidence)
     assert any("captured_at=2026-08-31T14:00:00+00:00" in line for line in updates[0].evidence)
+
+
+def test_refresh_can_explicitly_clear_invalid_registration_url(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    invalid_url = "https://baden.example/kids-and-youth/mini-marathon"
+    event = add_event(
+        replace(event_payload(), registration_url=invalid_url),
+        database_url=url,
+    )
+    source = list_due_sources(
+        due_before=datetime.now(UTC),
+        limit=1,
+        database_url=url,
+    )[0]
+
+    def decide(request) -> ResearchDecision:
+        return ResearchDecision(
+            action="propose_update",
+            summary="Standard marathon registration is closed; the saved URL is a child event.",
+            confidence=0.96,
+            proposed_fields={
+                "registration_status": "closed",
+                "clear_fields": ["registration_url"],
+            },
+            evidence=[request.evidence[0].reference],
+        )
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url, text="The standard marathon lottery is closed.")
+
+    result = asyncio.run(
+        service(
+            tmp_path,
+            url=url,
+            agent=FakeAgent(decide=decide),
+            fetch=fetch,
+        ).refresh(source)
+    )
+
+    assert result.status.outcome == "proposal_created"
+    assert find_event(event.id, url).registration_url == invalid_url
+    updates = list_proposed_event_updates(event_id=event.id, database_url=url)
+    assert updates[0].current_fields == {
+        "registration_status": "unknown",
+        "registration_url": invalid_url,
+    }
+    assert updates[0].proposed_fields == {
+        "registration_status": "closed",
+        "registration_url": None,
+    }
 
 
 def test_ae2_discovery_creates_system_suggestion_and_no_event(tmp_path: Path) -> None:

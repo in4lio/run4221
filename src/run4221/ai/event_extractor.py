@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from run4221.ai.extraction_provider import (
     EventExtraction,
@@ -65,6 +65,35 @@ STOPWORDS = {
     "bank",
     "america",
 }
+
+NON_PRIMARY_EVENT_TERMS = (
+    "mini",
+    "kids",
+    "kid",
+    "youth",
+    "junior",
+    "children",
+    "school",
+    "schueler",
+    "schüler",
+)
+
+HALF_MARATHON_TERMS = (
+    "half",
+    "halfmarathon",
+    "halb",
+    "halbmarathon",
+    "21",
+    "21k",
+    "21km",
+)
+
+FULL_MARATHON_TERMS = (
+    "full",
+    "42",
+    "42k",
+    "42km",
+)
 
 
 async def extract_event_draft_from_url(
@@ -482,10 +511,16 @@ REGION_TIMEZONES = {
 }
 
 
-def infer_registration_url(snapshot: PageSnapshot) -> str | None:
+def infer_registration_url(
+    snapshot: PageSnapshot,
+    distances: tuple[str, ...] = (),
+) -> str | None:
     for link in snapshot.links:
         searchable = f"{link.text} {link.url}".casefold()
-        if any(term in searchable for term in REGISTRATION_LINK_TERMS):
+        if (
+            any(term in searchable for term in REGISTRATION_LINK_TERMS)
+            and not conflicts_with_event_identity(link.url, link.text, distances)
+        ):
             return link.url
 
     return None
@@ -498,13 +533,22 @@ def resolve_registration_url(
     *,
     candidates: tuple[tuple[str, str], ...] | None = None,
 ) -> str | None:
-    if explicit_url and not is_likely_article_url(explicit_url, extraction.event_date):
+    if (
+        explicit_url
+        and not is_likely_article_url(explicit_url, extraction.event_date)
+        and not conflicts_with_event_identity(explicit_url, "", extraction.distances)
+    ):
         return explicit_url
 
-    if inferred_url := infer_registration_url(snapshot):
-        return inferred_url
+    event_specific_url = infer_event_specific_url(
+        snapshot,
+        extraction,
+        candidates=candidates,
+    )
+    if event_specific_url is not None:
+        return event_specific_url
 
-    return infer_event_specific_url(snapshot, extraction, candidates=candidates)
+    return infer_registration_url(snapshot, extraction.distances)
 
 
 def infer_event_specific_url(
@@ -560,6 +604,8 @@ def select_registration_url_for_distances(
             continue
         if is_likely_article_url(url):
             continue
+        if conflicts_with_event_identity(url, text, distances):
+            continue
         if matches_distance_url(url, text, distances):
             return url
 
@@ -614,16 +660,38 @@ def is_homepage_url(value: str) -> bool:
 
 
 def matches_distance_url(url: str, text: str, distances: tuple[str, ...]) -> bool:
-    parsed = urlparse(url)
-    searchable = f"{parsed.path} {parsed.query} {text}".casefold()
+    tokens = event_identity_tokens(url, text)
     if "half_marathon" in distances:
-        return any(term in searchable for term in ("half", "halb", "21"))
+        return any(term in tokens for term in HALF_MARATHON_TERMS)
     if "marathon" in distances:
-        return "marathon" in searchable and not any(
-            term in searchable for term in ("half", "halb", "21")
+        return "marathon" in tokens and not any(
+            term in tokens for term in HALF_MARATHON_TERMS
         )
 
     return False
+
+
+def conflicts_with_event_identity(
+    url: str,
+    text: str,
+    distances: tuple[str, ...],
+) -> bool:
+    if not distances:
+        return False
+    tokens = event_identity_tokens(url, text)
+    if any(term in tokens for term in NON_PRIMARY_EVENT_TERMS):
+        return True
+    if "marathon" in distances:
+        return any(term in tokens for term in HALF_MARATHON_TERMS)
+    if "half_marathon" in distances:
+        return any(term in tokens for term in FULL_MARATHON_TERMS)
+    return False
+
+
+def event_identity_tokens(url: str, text: str) -> frozenset[str]:
+    parsed = urlparse(url)
+    searchable = unquote(f"{parsed.path} {parsed.query} {text}").casefold()
+    return frozenset(re.findall(r"[^\W_]+", searchable))
 
 
 def resolve_timezone(

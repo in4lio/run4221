@@ -80,11 +80,34 @@ class ProposedEventChanges(ResearchSchema):
     registration_close_at: Annotated[str, Field(max_length=40)] | None = None
     registration_url: Annotated[str, Field(min_length=1, max_length=2_048)] | None = None
     event_date: Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")] | None = None
+    clear_fields: Annotated[
+        tuple[
+            Literal[
+                "registration_open_at",
+                "registration_close_at",
+                "registration_url",
+                "event_date",
+            ],
+            ...,
+        ],
+        Field(max_length=4),
+    ] = ()
 
     @field_validator("registration_url")
     @classmethod
     def validate_registration_url(cls, value: str | None) -> str | None:
         return None if value is None else validate_http_url(value)
+
+    @model_validator(mode="after")
+    def validate_clear_fields(self) -> Self:
+        if len(set(self.clear_fields)) != len(self.clear_fields):
+            raise ValueError("clear_fields cannot contain duplicates.")
+        conflicts = [
+            field for field in self.clear_fields if getattr(self, field) is not None
+        ]
+        if conflicts:
+            raise ValueError("A field cannot be set and cleared in the same decision.")
+        return self
 
 
 class ArtifactReference(ResearchSchema):
