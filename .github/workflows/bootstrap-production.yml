@@ -60,6 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           test -f private-source/prompts/discover_event_profile.instructions.txt
+          test -f private-source/prompts/research_agent.instructions.txt
           test -f private-source/prompts/update_registration_window.instructions.txt
           if [[ "${{ inputs.action }}" == "reset-and-seed-suggestions" ]]; then
             test -f private-source/data/launch_suggestions.json
@@ -101,6 +102,7 @@ jobs:
             "APP_DIR='${{ secrets.VPS_APP_DIR }}' bash -s" <<'REMOTE'
           set -euo pipefail
           cd "$APP_DIR"
+          docker compose stop bot researcher
           docker compose run --rm \
             -v "$PWD/private:/app/private:ro" \
             bot uv run python -m run4221.db.seed_prompts \
@@ -123,7 +125,17 @@ jobs:
             "APP_DIR='${{ secrets.VPS_APP_DIR }}' bash -s" <<'REMOTE'
           set -euo pipefail
           cd "$APP_DIR"
-          docker compose stop bot
+          docker compose stop bot researcher
+          mkdir -p data/backups
+          if [[ -f data/run4221.sqlite3 ]]; then
+            backup_path="data/backups/run4221.$(date -u +%Y%m%dT%H%M%SZ).pre-reset.sqlite3"
+            docker compose run --rm --no-deps bot uv run python -c \
+              'import sqlite3, sys; source = sqlite3.connect("data/run4221.sqlite3"); checkpoint = source.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone(); assert checkpoint is not None and checkpoint[0] == 0; assert source.execute("PRAGMA integrity_check").fetchone()[0] == "ok"; backup = sqlite3.connect(sys.argv[1]); source.backup(backup); backup.close(); source.close(); check = sqlite3.connect(sys.argv[1]); assert check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"; check.close()' \
+              "$backup_path"
+            test -s "$backup_path"
+            test ! -s data/run4221.sqlite3-wal
+            rm -f data/run4221.sqlite3-wal data/run4221.sqlite3-shm
+          fi
           docker compose run --rm \
             -v "$PWD/private:/app/private:ro" \
             bot uv run python -m run4221.db.seed_suggestions \
