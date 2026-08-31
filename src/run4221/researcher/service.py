@@ -81,6 +81,8 @@ class ResearcherService:
         trust_policy: SourceTrustPolicy,
         budget: ResearchBudget,
         fetch_snapshot: SnapshotFetcher = fetch_enriched_page_snapshot,
+        persist_queue: bool = True,
+        on_run_started: Callable[[str], None] | None = None,
     ) -> None:
         self.database_url = database_url
         self.artifacts = artifacts
@@ -88,6 +90,8 @@ class ResearcherService:
         self.trust_policy = trust_policy
         self.budget = budget
         self.fetch_snapshot = fetch_snapshot
+        self.persist_queue = persist_queue
+        self.on_run_started = on_run_started
 
     async def refresh(self, source: ResearchSourceRecord) -> ResearchJobResult:
         """Assess one frozen approved source and, at most, enqueue one proposal."""
@@ -103,6 +107,7 @@ class ResearcherService:
                 "frozen_fields": frozen_fields,
             },
         )
+        self._announce_run(run_id)
         try:
             captured = await self._capture(run_id, source.url)
         except PageFetchError as error:
@@ -178,6 +183,14 @@ class ResearcherService:
                 "proposed_fields": ProposedEventChanges.model_validate(changed_fields),
             }
         )
+        if not self.persist_queue:
+            return self._finish_without_queue(
+                run_id,
+                source.url,
+                RunState.SUCCEEDED,
+                RunOutcome.INCONCLUSIVE,
+                "Shadow mode validated a supported update without writing the queue.",
+            )
         committed_status = ResearchRunStatus(
             status=RunState.SUCCEEDED,
             outcome=RunOutcome.PROPOSAL_CREATED,
@@ -192,6 +205,7 @@ class ResearcherService:
             decision.summary,
             (captured,),
             trust_reason="stored approved event source",
+            prepared=prepared,
         )
         try:
             admission = admit_proposed_update(
@@ -246,6 +260,7 @@ class ResearcherService:
             job_type="discovery",
             metadata={"query": clean_query},
         )
+        self._announce_run(run_id)
         scout = await self.agent.scout(
             ScoutRequest(mode="discovery", query=clean_query)
         )
@@ -384,6 +399,14 @@ class ResearcherService:
                 status=RunState.SUCCEEDED,
                 outcome=RunOutcome.SUGGESTION_CREATED,
             )
+            if not self.persist_queue:
+                return self._finish_without_queue(
+                    run_id,
+                    candidate.source_url,
+                    RunState.SUCCEEDED,
+                    RunOutcome.INCONCLUSIVE,
+                    "Shadow mode validated an event candidate without writing the queue.",
+                )
             prepared = self.artifacts.prepare_decision(
                 run_id,
                 source_url=candidate.source_url,
@@ -395,6 +418,7 @@ class ResearcherService:
                     decision.summary,
                     tuple(evidence),
                     trust_reason=trust.reason,
+                    prepared=prepared,
                 )
             )
             try:
@@ -465,6 +489,10 @@ class ResearcherService:
             raise PageFetchError("Page capture failed.") from error
         reference = self.artifacts.write_page_snapshot(run_id, snapshot)
         return CapturedPage(snapshot=snapshot, reference=reference)
+
+    def _announce_run(self, run_id: str) -> None:
+        if self.on_run_started is not None:
+            self.on_run_started(run_id)
 
     def _record_assessment(
         self,
@@ -632,10 +660,12 @@ def _moderation_evidence(
     captures: tuple[CapturedPage, ...],
     *,
     trust_reason: str,
+    prepared: ArtifactReference,
 ) -> tuple[str, ...]:
     lines = [
         f"Researcher worker: {summary[:500]}",
         f"Source check: {trust_reason[:120]}.",
+        decision_queue_marker(prepared),
     ]
     lines.extend(
         "researcher-evidence:v1 "
@@ -646,3 +676,11 @@ def _moderation_evidence(
         for capture in captures
     )
     return tuple(lines)
+
+
+def decision_queue_marker(prepared: ArtifactReference) -> str:
+    return (
+        "researcher-decision:v1 "
+        f"run={prepared.run_id} artifact={prepared.artifact_name} "
+        f"sha256={prepared.content_hash}"
+    )
