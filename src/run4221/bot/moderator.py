@@ -22,6 +22,7 @@ from run4221.ai.registration_window import (
 )
 from run4221.bot.auth import is_moderator_account, require_moderator
 from run4221.bot.formatting import (
+    ResearcherProvenance,
     bounded_html_escape,
     format_bounded_field_line,
     format_event_detail,
@@ -2983,6 +2984,10 @@ def _append_researcher_source_check(
 
 
 def _researcher_suggestion_evidence(suggestion) -> str | None:
+    return suggestion.note if _researcher_suggestion_provenance(suggestion) else None
+
+
+def _researcher_suggestion_provenance(suggestion) -> ResearcherProvenance | None:
     if any(
         (
             suggestion.submitter_user_id,
@@ -2991,7 +2996,7 @@ def _researcher_suggestion_evidence(suggestion) -> str | None:
         )
     ):
         return None
-    return suggestion.note if parse_researcher_provenance(suggestion.note) else None
+    return parse_researcher_provenance(suggestion.note)
 
 
 def format_evidence_for_display(evidence: str) -> str:
@@ -3506,8 +3511,7 @@ def suggestion_show_keyboard(
 
 
 def format_suggestion_detail(suggestion, *, sequence: int | None = None) -> str:
-    researcher_evidence = _researcher_suggestion_evidence(suggestion)
-    provenance = parse_researcher_provenance(researcher_evidence)
+    provenance = _researcher_suggestion_provenance(suggestion)
     if provenance is not None:
         lines = [
             format_major_title(f"Suggestion {format_suggestion_handle(suggestion.id)}"),
@@ -3524,9 +3528,9 @@ def format_suggestion_detail(suggestion, *, sequence: int | None = None) -> str:
                 kind="tag",
                 max_html_chars=200,
             ),
-            format_field_line("From", format_submitter(suggestion)),
+            format_field_line("From", "Researcher worker"),
         ]
-        _append_researcher_source_check(lines, researcher_evidence)
+        lines.extend(["", format_researcher_source_check(provenance)])
         return "\n".join(lines)
 
     lines = [
@@ -4198,7 +4202,7 @@ def format_proposed_update_detail(
         lines.extend(changes)
 
     if provenance is not None:
-        _append_researcher_source_check(lines, update.evidence)
+        lines.extend(["", format_researcher_source_check(provenance)])
     elif update.evidence:
         lines.extend(["", format_evidence_for_display(" ".join(update.evidence))])
 

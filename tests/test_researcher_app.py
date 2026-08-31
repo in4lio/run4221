@@ -125,10 +125,10 @@ class Factory:
         self.tmp_path = tmp_path
         self.failures = list(failures or [])
         self.calls: list[tuple[str, object]] = []
-        self.read_only: list[bool] = []
+        self.shadow_modes: list[bool] = []
 
-    def __call__(self, read_only: bool, on_run_started):
-        self.read_only.append(read_only)
+    def __call__(self, shadow: bool, on_run_started):
+        self.shadow_modes.append(shadow)
         fail = self.failures.pop(0) if self.failures else False
         return FakeService(self.tmp_path / "failure-runs", on_run_started, self.calls, fail)
 
@@ -150,7 +150,7 @@ def test_check_config_validates_without_constructing_agent(tmp_path: Path) -> No
 
     checked = check_config(config)
 
-    assert checked.prompt_key == "research_agent"
+    assert checked.prompt.prompt_key == "research_agent"
     assert checked.model == "gpt-5.6-luna"
     assert checked.budget.max_agent_turns_per_job == 6
 
@@ -184,7 +184,7 @@ def test_operator_one_shot_processes_exact_event_and_shadow_is_read_only(tmp_pat
 
     assert execution.failed is False
     assert factory.calls == [("refresh", event_id)]
-    assert factory.read_only == [True]
+    assert factory.shadow_modes == [True]
     assert get_research_source(event_id, database_url=database_url(tmp_path)) is not None
 
 

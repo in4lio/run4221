@@ -12,7 +12,10 @@ from run4221.db.prompts import (
     get_file_prompt,
     get_runtime_prompt,
 )
-from run4221.researcher.schemas import ResearchBudget
+from run4221.researcher.schemas import (
+    RESEARCHER_MAX_PENDING_SUGGESTIONS,
+    ResearchBudget,
+)
 
 
 class ResearcherSettings(BaseSettings):
@@ -75,7 +78,11 @@ class ResearcherSettings(BaseSettings):
     max_retries_per_job: int = Field(default=2, ge=0, le=10)
     max_output_tokens_per_job: int = Field(default=2_000, ge=128, le=16_000)
     max_wall_time_seconds_per_job: int = Field(default=90, ge=10, le=900)
-    max_pending_suggestions: int = Field(default=20, ge=0, le=30)
+    max_pending_suggestions: int = Field(
+        default=RESEARCHER_MAX_PENDING_SUGGESTIONS,
+        ge=0,
+        le=RESEARCHER_MAX_PENDING_SUGGESTIONS,
+    )
     max_pending_updates: int = Field(default=50, ge=0, le=500)
 
     @property

@@ -73,13 +73,13 @@ class HealthStore:
             )
         )
 
-    def start_job(self, run_id: str) -> WorkerHealth:
+    def start_job(self) -> WorkerHealth:
         state = self.read()
         return self._write(
             replace(
                 state,
                 activity="active",
-                current_run_id=run_id[:160],
+                current_run_id=None,
                 last_progress_at=self._timestamp(),
             )
         )

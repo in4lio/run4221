@@ -83,7 +83,8 @@ def test_compose_keeps_bot_and_researcher_static_and_least_privileged() -> None:
     assert "target: /app/.env" in researcher
     assert "TELEGRAM" not in researcher
     assert "replicas: 1" in researcher
-    assert 'run4221-researcher", "--loop"' in researcher
+    assert 'CMD ["uv", "run", "run4221-researcher", "--loop"]' in dockerfile
+    assert "command:" not in researcher
     assert "run4221.researcher.health" in researcher
     assert "condition: service_healthy" in researcher
 

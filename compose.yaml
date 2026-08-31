@@ -27,7 +27,6 @@ services:
       target: researcher
     image: run4221-researcher:latest
     restart: unless-stopped
-    command: ["uv", "run", "run4221-researcher", "--loop"]
     depends_on:
       bot:
         condition: service_healthy
