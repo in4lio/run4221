@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime
+from itertools import chain
 from typing import Literal
 
 from sqlalchemy import func, or_, select, update
@@ -224,14 +225,12 @@ def _validate_suggestion_limit(max_pending: int) -> None:
 
 
 def _known_candidate_url(session: Session, candidate_url: str) -> bool:
-    event_urls = session.execute(
-        select(models.Event.official_url, models.Event.registration_url)
-    ).all()
-    source_urls = session.scalars(select(models.EventSource.url)).all()
-    suggestion_urls = session.scalars(select(models.EventSuggestion.url)).all()
-    known_urls = (
-        *(url for pair in event_urls for url in pair),
-        *source_urls,
-        *suggestion_urls,
+    event_urls = chain.from_iterable(
+        session.execute(select(models.Event.official_url, models.Event.registration_url))
+    )
+    known_urls = chain(
+        event_urls,
+        session.scalars(select(models.EventSource.url)),
+        session.scalars(select(models.EventSuggestion.url)),
     )
     return any(normalize_url(url) == candidate_url for url in known_urls)
