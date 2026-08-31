@@ -180,6 +180,7 @@ def test_ae1_refresh_creates_proposal_without_mutating_event(tmp_path: Path) -> 
     assert len(updates) == 1
     assert updates[0].proposed_fields == {"registration_status": "open"}
     assert any("researcher-evidence:v1" in line for line in updates[0].evidence)
+    assert any("researcher-decision:v1" in line for line in updates[0].evidence)
     assert any("stored approved event source" in line for line in updates[0].evidence)
     assert any("captured_at=2026-08-31T14:00:00+00:00" in line for line in updates[0].evidence)
 
@@ -213,8 +214,34 @@ def test_ae2_discovery_creates_system_suggestion_and_no_event(tmp_path: Path) ->
     assert suggestions[0].submitter_user_id is None
     assert suggestions[0].distances == ("marathon",)
     assert suggestions[0].note and "researcher-evidence:v1" in suggestions[0].note
+    assert "researcher-decision:v1" in suggestions[0].note
     assert "Source check: configured trusted domain." in suggestions[0].note
     assert "captured_at=2026-08-31T14:00:00+00:00" in suggestions[0].note
+
+
+def test_shadow_mode_audits_supported_finding_without_queue_write(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    source = tracked_source(url)
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url)
+
+    shadow = ResearcherService(
+        database_url=url,
+        artifacts=ResearchArtifactStore(tmp_path / "shadow-runs"),
+        agent=FakeAgent(decide=refresh_decision),
+        trust_policy=SourceTrustPolicy(trusted_domains=frozenset({"baden.example"})),
+        budget=ResearchBudget(max_wall_time_seconds_per_job=10),
+        fetch_snapshot=fetch,
+        persist_queue=False,
+    )
+
+    result = asyncio.run(shadow.refresh(source))
+
+    assert result.status.status == "succeeded"
+    assert result.status.outcome == "inconclusive"
+    assert "shadow" in (result.status.detail or "").casefold()
+    assert count_proposed_event_updates(database_url=url) == 0
 
 
 def test_repeated_discovery_is_audited_duplicate_skip(tmp_path: Path) -> None:

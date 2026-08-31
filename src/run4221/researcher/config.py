@@ -48,6 +48,14 @@ class ResearcherSettings(BaseSettings):
     discovery_enabled: bool = False
     rendering_enabled: bool = False
     interval_seconds: int = Field(default=3_600, ge=60, le=604_800)
+    artifact_dir: str = Field(default="data/research_runs", min_length=1)
+    schedule_path: str = Field(default="data/researcher_schedule.json", min_length=1)
+    lock_path: str = Field(default="data/researcher.lock", min_length=1)
+    health_path: str = Field(default="data/researcher_health.json", min_length=1)
+    health_stale_after_seconds: int = Field(default=180, ge=30, le=3_600)
+    trusted_domains: str = ""
+    trusted_registry_urls: str = ""
+    discovery_queries: str = ""
     prompt_source: Literal["file", "db"] = Field(
         default="file",
         validation_alias=AliasChoices("RESEARCHER_PROMPT_SOURCE", "RUN4221_PROMPT_SOURCE"),
@@ -86,6 +94,18 @@ class ResearcherSettings(BaseSettings):
             max_pending_updates=self.max_pending_updates,
         )
 
+    @property
+    def trusted_domain_values(self) -> frozenset[str]:
+        return frozenset(_comma_separated(self.trusted_domains))
+
+    @property
+    def trusted_registry_url_values(self) -> tuple[str, ...]:
+        return _comma_separated(self.trusted_registry_urls)
+
+    @property
+    def discovery_query_values(self) -> tuple[str, ...]:
+        return _comma_separated(self.discovery_queries)
+
 
 def load_researcher_prompt(settings: ResearcherSettings) -> PromptVersionRecord:
     """Load the researcher prompt through the existing file/DB versioning boundary."""
@@ -102,3 +122,7 @@ def load_researcher_prompt(settings: ResearcherSettings) -> PromptVersionRecord:
 @lru_cache(maxsize=1)
 def get_researcher_settings() -> ResearcherSettings:
     return ResearcherSettings()
+
+
+def _comma_separated(value: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(item.strip() for item in value.split(",") if item.strip()))

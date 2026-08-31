@@ -5,7 +5,7 @@ from datetime import datetime
 from itertools import chain
 from typing import Literal
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import Text, cast, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from run4221.db import models
@@ -34,6 +34,7 @@ _ACTIVE_PROPOSAL_STATUSES = ("pending", "applying")
 
 SuggestionAdmissionOutcome = Literal["admitted", "duplicate", "queue_full"]
 ProposalAdmissionOutcome = Literal["admitted", "conflicting_pending", "queue_full"]
+ResearchQueueKind = Literal["suggest_event", "propose_update"]
 
 
 @dataclass(frozen=True)
@@ -107,6 +108,76 @@ def list_due_sources(
             )
             for source in sources
         )
+
+
+def get_research_source(
+    event_id: str,
+    *,
+    database_url: str | None = None,
+) -> ResearchSourceRecord | None:
+    """Return the highest-priority active source for an operator one-shot."""
+
+    normalized_event_id = normalize_event_id(event_id)
+    ensure_database_schema(database_url)
+    with session_scope(database_url) as session:
+        source = session.scalar(
+            select(models.EventSource)
+            .join(models.Event, models.Event.id == models.EventSource.event_id)
+            .where(
+                models.EventSource.event_id == normalized_event_id,
+                models.EventSource.active.is_(True),
+                models.Event.removed_at.is_(None),
+                models.Event.status == "monitoring",
+            )
+            .order_by(models.EventSource.priority, models.EventSource.id)
+            .limit(1)
+        )
+        if source is None:
+            return None
+        event = session.scalar(base_event_query().where(models.Event.id == source.event_id))
+        assert event is not None
+        return ResearchSourceRecord(
+            source_id=source.id,
+            event=event_to_domain(event),
+            url=source.url,
+            source_type=source.source_type,
+            priority=source.priority,
+            last_checked_at=source.last_checked_at,
+        )
+
+
+def find_research_queue_reference(
+    queue_kind: ResearchQueueKind,
+    *,
+    decision_marker: str,
+    database_url: str | None = None,
+) -> str | None:
+    """Resolve one exact prepared-decision marker after an interrupted finalization."""
+
+    clean_marker = decision_marker.strip()
+    if not clean_marker:
+        raise ValueError("Research queue marker cannot be empty.")
+    ensure_database_schema(database_url)
+    with session_scope(database_url) as session:
+        if queue_kind == "suggest_event":
+            ids = session.scalars(
+                select(models.EventSuggestion.id).where(
+                    models.EventSuggestion.note.contains(clean_marker)
+                )
+            ).all()
+            prefix = "event_suggestion"
+        elif queue_kind == "propose_update":
+            ids = session.scalars(
+                select(models.ProposedEventUpdate.id).where(
+                    cast(models.ProposedEventUpdate.evidence, Text).contains(clean_marker)
+                )
+            ).all()
+            prefix = "proposed_event_update"
+        else:
+            raise ValueError(f"Unsupported research queue kind: {queue_kind}")
+    if len(ids) > 1:
+        raise EventWriteError("Prepared decision matched more than one queue record.")
+    return f"{prefix}:{ids[0]}" if ids else None
 
 
 def mark_source_checked(

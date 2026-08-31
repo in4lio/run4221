@@ -33,6 +33,7 @@ researcher = [
 run4221-bot = "run4221.bot.app:run"
 run4221-seed-prompts = "run4221.db.seed_prompts:main"
 run4221-seed-suggestions = "run4221.db.seed_suggestions:main"
+run4221-researcher = "run4221.researcher.app:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/run4221"]

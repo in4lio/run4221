@@ -21,6 +21,7 @@ from run4221.db.research import (
     RESEARCHER_MAX_PENDING_SUGGESTIONS,
     admit_proposed_update,
     admit_suggestion,
+    find_research_queue_reference,
     list_due_sources,
     mark_source_checked,
 )
@@ -208,6 +209,23 @@ def test_research_proposal_respects_pending_queue_cap(tmp_path) -> None:
     assert first.outcome == "admitted"
     assert capped.outcome == "queue_full"
     assert capped.update is None
+
+
+def test_research_queue_resolver_finds_json_proposal_evidence(tmp_path) -> None:
+    url = database_url(tmp_path)
+    event = add_event(event_payload(), database_url=url)
+    marker = "researcher-decision:v1 run=test artifact=prepared.json sha256=abc"
+    admitted = admit_proposed_update(
+        replace(proposed_update_payload(event.id), evidence=(marker,)),
+        database_url=url,
+    )
+
+    assert admitted.update is not None
+    assert find_research_queue_reference(
+        "propose_update",
+        decision_marker=marker,
+        database_url=url,
+    ) == f"proposed_event_update:{admitted.update.id}"
 
 
 def test_research_suggestion_admission_serializes_independent_engines(tmp_path) -> None:
