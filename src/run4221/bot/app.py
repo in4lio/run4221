@@ -12,6 +12,7 @@ from run4221.bot.public import router as public_router
 from run4221.bot.suggestions import router as suggestions_router
 from run4221.config import get_settings
 from run4221.db.bootstrap import initialize_database
+from run4221.db.session import require_initialized_database
 
 
 async def main() -> None:
@@ -20,6 +21,8 @@ async def main() -> None:
         level=settings.log_level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if settings.app_env == "production":
+        require_initialized_database(settings.database_url)
     initialize_database(
         settings.database_url,
         seed_initial_events=settings.seed_initial_events,
