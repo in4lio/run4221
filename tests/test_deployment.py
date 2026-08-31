@@ -67,8 +67,13 @@ def test_deploy_runs_quality_gate_health_check_and_rollback() -> None:
     assert "uv run ruff check" in workflow
     assert "uv run pytest" in workflow
     assert "--wait --wait-timeout 90" in workflow
-    assert "docker compose run --rm -T --build bot uv run python -m run4221.health" in workflow
-    assert workflow.count("docker compose run") == workflow.count("docker compose run --rm -T")
+    assert (
+        "docker compose run --rm -T --interactive=false --build bot "
+        "uv run python -m run4221.health"
+    ) in workflow
+    assert workflow.count("docker compose run") == workflow.count(
+        "docker compose run --rm -T --interactive=false"
+    )
     assert 'if [[ "$service_replaced" == "true" ]]' in workflow
     assert "docker compose exec -T bot uv run python -m run4221.health" in workflow
     assert "trap rollback ERR" in workflow
@@ -146,7 +151,9 @@ def test_bootstrap_shares_mutation_lock_and_treats_confirmation_as_data() -> Non
     workflow = read_project_file(".github/workflows/bootstrap-production.yml")
 
     assert "group: production-mutation" in workflow
-    assert workflow.count("docker compose run") == workflow.count("docker compose run --rm -T")
+    assert workflow.count("docker compose run") == workflow.count(
+        "docker compose run --rm -T --interactive=false"
+    )
     assert "--wait --wait-timeout 90" in workflow
     assert "CONFIRM_RESET: ${{ inputs.confirm_reset }}" in workflow
     assert 'if [[ "$CONFIRM_RESET" != "RESET_SUGGESTION_BOOTSTRAP" ]]' in workflow
