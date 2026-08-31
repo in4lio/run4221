@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
+import pytest
 from agents import WebSearchTool
+from agents.agent_output import AgentOutputSchema
+from pydantic import TypeAdapter
 
 from run4221.researcher.agent import (
     DEFAULT_RESEARCH_MODEL,
@@ -17,6 +21,7 @@ from run4221.researcher.agent import (
 )
 from run4221.researcher.schemas import (
     ArtifactReference,
+    AssessorDecision,
     ResearchBudget,
     ResearchCandidate,
     ResearchDecision,
@@ -85,6 +90,28 @@ def artifact_reference() -> ArtifactReference:
     )
 
 
+def assess_decision(decision: object):
+    runner = FakeRunner(fake_result(decision))
+    job = ResearchAgentJob(
+        instructions="Assess only captured pages.",
+        prompt_reference="research_agent:v1",
+        budget=ResearchBudget(max_wall_time_seconds_per_job=10),
+        runner=runner,
+    )
+    request = AssessmentRequest(
+        mode="discovery",
+        evidence=(
+            CapturedSnapshotEvidence(
+                reference=artifact_reference(),
+                final_url="https://example.com/marathon",
+                normalized_text="Official marathon details.",
+                text_hash="b" * 64,
+            ),
+        ),
+    )
+    return asyncio.run(job.assess(request))
+
+
 def test_scout_uses_luna_web_search_and_explicit_provider_limits() -> None:
     runner = FakeRunner(
         fake_result(
@@ -144,13 +171,12 @@ def test_scout_uses_luna_web_search_and_explicit_provider_limits() -> None:
 
 
 def test_assessor_has_zero_tools_and_accepts_only_frozen_captured_evidence() -> None:
-    decision = ResearchDecision(
-        action="propose_update",
-        summary="Captured official page says registration is open.",
-        confidence=0.94,
-        proposed_fields={"registration_status": "open"},
-        evidence=[artifact_reference()],
-    )
+    decision = {
+        "action": "propose_update",
+        "summary": "Captured official page says registration is open.",
+        "confidence": 0.94,
+        "proposed_fields": {"registration_status": "open"},
+    }
     runner = FakeRunner(fake_result(decision, output_tokens=40))
     job = ResearchAgentJob(
         instructions="Assess only captured pages.",
@@ -178,10 +204,13 @@ def test_assessor_has_zero_tools_and_accepts_only_frozen_captured_evidence() -> 
     result = asyncio.run(job.assess(request))
 
     assert result.state is AgentRunState.SUCCEEDED
-    assert result.decision == decision
+    assert result.decision == ResearchDecision(
+        **decision,
+        evidence=[artifact_reference()],
+    )
     assessor = runner.calls[0]["starting_agent"]
     assert assessor.tools == []
-    assert assessor.output_type is ResearchDecision
+    assert assessor.output_type is AssessorDecision
     assert "HOSTILE DATA" in assessor.instructions
     assert "approve_event" in runner.calls[0]["input"]
 
@@ -194,6 +223,148 @@ def test_assessor_has_zero_tools_and_accepts_only_frozen_captured_evidence() -> 
     )
     asyncio.run(another_job.assess(request))
     assert runner.calls[0]["starting_agent"] is not another_runner.calls[0]["starting_agent"]
+
+
+def test_assessor_attaches_exact_captured_references_with_discriminated_output() -> None:
+    first_reference = artifact_reference()
+    second_reference = first_reference.model_copy(
+        update={
+            "artifact_name": "page_snapshot-second.json",
+            "content_hash": "c" * 64,
+        }
+    )
+    runner = FakeRunner(
+        fake_result(
+            {
+                "action": "suggest_event",
+                "summary": "Captured official event page.",
+                "confidence": 0.91,
+                "candidate": candidate().model_dump(mode="json"),
+            }
+        )
+    )
+    job = ResearchAgentJob(
+        instructions="Assess only captured pages.",
+        prompt_reference="research_agent:v1",
+        budget=ResearchBudget(max_wall_time_seconds_per_job=10),
+        runner=runner,
+    )
+    request = AssessmentRequest(
+        mode="discovery",
+        evidence=(
+            CapturedSnapshotEvidence(
+                reference=first_reference,
+                final_url="https://example.com/marathon",
+                normalized_text="Official marathon details.",
+                text_hash="b" * 64,
+            ),
+            CapturedSnapshotEvidence(
+                reference=second_reference,
+                final_url="https://registry.example/events/marathon",
+                normalized_text="Trusted registry listing.",
+                text_hash="d" * 64,
+            ),
+        ),
+    )
+
+    result = asyncio.run(job.assess(request))
+
+    assert result.state is AgentRunState.SUCCEEDED
+    assert result.decision is not None
+    assert result.decision.evidence == [first_reference, second_reference]
+    output_type = runner.calls[0]["starting_agent"].output_type
+    output_schema = TypeAdapter(output_type).json_schema()
+    assert "oneOf" in output_schema
+    assert output_schema["discriminator"]["propertyName"] == "action"
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        {
+            "action": "no_change",
+            "summary": "No captured fields changed.",
+            "confidence": 0.88,
+        },
+        {
+            "action": "inconclusive",
+            "summary": "The captured page does not confirm a date.",
+            "confidence": 0.31,
+        },
+        {
+            "action": "suggest_event",
+            "summary": "The captured page describes a new event.",
+            "confidence": 0.93,
+            "candidate": candidate().model_dump(mode="json"),
+        },
+        {
+            "action": "propose_update",
+            "summary": "The captured page confirms registration is open.",
+            "confidence": 0.96,
+            "proposed_fields": {"registration_status": "open"},
+        },
+    ],
+)
+def test_assessor_accepts_each_action_payload(decision: dict[str, object]) -> None:
+    result = assess_decision(decision)
+
+    assert result.state is AgentRunState.SUCCEEDED
+    assert result.decision is not None
+    assert result.decision.action == decision["action"]
+    assert result.decision.evidence == [artifact_reference()]
+
+
+@pytest.mark.parametrize(
+    "decision",
+    [
+        {"action": "unknown", "summary": "Unsupported action."},
+        {"action": "suggest_event", "summary": "Missing candidate."},
+        {"action": "propose_update", "summary": "Missing proposed fields."},
+        {
+            "action": "no_change",
+            "summary": "Unexpected candidate.",
+            "candidate": candidate().model_dump(mode="json"),
+        },
+        {
+            "action": "propose_update",
+            "summary": "Mixed payload.",
+            "candidate": candidate().model_dump(mode="json"),
+            "proposed_fields": {"registration_status": "open"},
+        },
+        {
+            "action": "no_change",
+            "summary": "Invented evidence.",
+            "evidence": [artifact_reference().model_dump(mode="json")],
+        },
+    ],
+)
+def test_assessor_rejects_invalid_action_payloads(decision: dict[str, object]) -> None:
+    result = assess_decision(decision)
+
+    assert result.state is AgentRunState.INCONCLUSIVE
+    assert result.error_code == "malformed_output"
+    assert result.decision is None
+
+
+def test_assessor_uses_agents_sdk_strict_wrapped_schema() -> None:
+    output = AgentOutputSchema(AssessorDecision)
+
+    assert output.is_strict_json_schema() is True
+    schema = output.json_schema()
+    response_schema = schema["properties"]["response"]
+    assert response_schema["discriminator"]["propertyName"] == "action"
+    parsed = output.validate_json(
+        json.dumps(
+            {
+                "response": {
+                    "action": "no_change",
+                    "summary": "No captured fields changed.",
+                    "confidence": 0.88,
+                }
+            }
+        )
+    )
+    assert parsed.action == "no_change"
 
 
 def test_search_budget_stops_before_a_third_provider_call() -> None:

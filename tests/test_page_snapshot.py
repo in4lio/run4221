@@ -29,7 +29,10 @@ async def public_resolver(_hostname: str) -> tuple[str, ...]:
 
 
 def test_fetch_page_snapshot_extracts_text_title_links_and_hash() -> None:
+    requested_urls: list[str] = []
+
     async def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
         assert request.headers["user-agent"].startswith("run4221-bot/")
         html = """
         <html>
@@ -69,6 +72,8 @@ def test_fetch_page_snapshot_extracts_text_title_links_and_hash() -> None:
     assert len(snapshot.text_hash) == 64
     assert snapshot.links[0].url == "https://example.com/register"
     assert snapshot.links[0].text == "Register now"
+    assert len(requested_urls) == 1
+    assert requested_urls[0].endswith("/event")
 
 
 def test_fetch_page_snapshot_caps_links_for_bounded_audit() -> None:

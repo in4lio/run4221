@@ -18,7 +18,7 @@ from run4221.db.repository import (
     list_proposed_event_updates,
 )
 from run4221.db.research import list_due_sources
-from run4221.ingestion.page_snapshot import PageLink, PageSnapshot
+from run4221.ingestion.page_snapshot import PageLink, PageSnapshot, fetch_page_snapshot
 from run4221.researcher.agent import (
     AgentRunMetadata,
     AgentRunState,
@@ -154,6 +154,14 @@ def service(
         budget=ResearchBudget(max_wall_time_seconds_per_job=10),
         fetch_snapshot=fetch,
     )
+
+
+def test_default_researcher_fetcher_is_single_page_fetcher() -> None:
+    default_fetcher = inspect.signature(ResearcherService).parameters[
+        "fetch_snapshot"
+    ].default
+
+    assert default_fetcher is fetch_page_snapshot
 
 
 def test_ae1_refresh_creates_proposal_without_mutating_event(tmp_path: Path) -> None:

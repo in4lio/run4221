@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from pathlib import PurePath
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 from urllib.parse import urlsplit
 from uuid import UUID
 
@@ -116,6 +116,32 @@ class DecisionAction(StrEnum):
     INCONCLUSIVE = "inconclusive"
 
 
+class AssessorNoPayloadDecision(ResearchSchema):
+    action: Literal[DecisionAction.NO_CHANGE, DecisionAction.INCONCLUSIVE]
+    summary: SummaryText
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class AssessorSuggestionDecision(ResearchSchema):
+    action: Literal[DecisionAction.SUGGEST_EVENT]
+    summary: SummaryText
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    candidate: ResearchCandidate
+
+
+class AssessorUpdateDecision(ResearchSchema):
+    action: Literal[DecisionAction.PROPOSE_UPDATE]
+    summary: SummaryText
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    proposed_fields: ProposedEventChanges
+
+
+AssessorDecision = Annotated[
+    AssessorNoPayloadDecision | AssessorSuggestionDecision | AssessorUpdateDecision,
+    Field(discriminator="action"),
+]
+
+
 class ResearchDecision(ResearchSchema):
     action: DecisionAction
     summary: SummaryText
@@ -154,7 +180,7 @@ class ResearchBudget(ResearchSchema):
     max_static_pages_per_job: int = Field(default=4, ge=1, le=50)
     max_rendered_pages_per_job: int = Field(default=0, ge=0, le=10)
     max_retries_per_job: int = Field(default=2, ge=0, le=10)
-    max_output_tokens_per_job: int = Field(default=4_000, ge=128, le=16_000)
+    max_output_tokens_per_job: int = Field(default=2_000, ge=128, le=16_000)
     max_wall_time_seconds_per_job: int = Field(default=90, ge=10, le=900)
     max_pending_suggestions: int = Field(
         default=RESEARCHER_MAX_PENDING_SUGGESTIONS,
