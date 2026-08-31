@@ -6,7 +6,8 @@ from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine
+from sqlalchemy import Engine, create_engine, inspect
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 
@@ -31,6 +32,30 @@ def resolve_database_url(database_url: str | None = None) -> str:
         or os.getenv("RUN4221_DATABASE_URL")
         or default_database_url()
     )
+
+
+def sqlite_database_path(database_url: str | None = None) -> Path | None:
+    resolved_url = make_url(resolve_database_url(database_url))
+    if resolved_url.get_backend_name() != "sqlite":
+        return None
+    if resolved_url.database in {None, ":memory:"}:
+        return None
+    return Path(resolved_url.database)
+
+
+def require_initialized_database(database_url: str | None = None) -> None:
+    resolved_url = resolve_database_url(database_url)
+    database_path = sqlite_database_path(resolved_url)
+    if database_path is not None and (
+        not database_path.is_file() or database_path.stat().st_size == 0
+    ):
+        raise RuntimeError(
+            f"Configured database has not been initialized: {database_path}"
+        )
+
+    engine = get_engine(resolved_url)
+    if not inspect(engine).has_table("events"):
+        raise RuntimeError("Configured database is missing the events table.")
 
 
 @lru_cache(maxsize=8)

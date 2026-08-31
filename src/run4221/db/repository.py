@@ -872,15 +872,15 @@ def partial_apply_proposed_event_update(
 
         follow_up_model = None
         if remaining:
+            live_fields = registration_update_fields(event)
             follow_up_model = create_proposed_event_update_in_session(
                 session,
                 ProposedEventUpdateCreate(
                     event_id=update.event_id,
                     update_type=update.update_type,
                     current_fields={
-                        field: update.current_fields.get(field)
+                        field: live_fields.get(field)
                         for field in remaining
-                        if field in update.current_fields
                     },
                     proposed_fields={
                         field: update.proposed_fields[field]
@@ -1001,6 +1001,7 @@ def apply_registration_window_selected_fields_in_session(
     proposed_fields: dict[str, Any],
 ) -> TrackedEvent:
     registration_window = None
+    previous_edition_id = model.current_edition_id
     if "registration_status" in proposed_fields:
         model.registration_status = field_text(
             proposed_fields.get("registration_status"),
@@ -1018,11 +1019,18 @@ def apply_registration_window_selected_fields_in_session(
             "registration_open_at",
             "registration_open_precision",
             "registration_close_at",
+            "event_date",
         )
     )
     if needs_window:
         current_edition = ensure_current_edition(session, model, model.next_event_date)
         registration_window = current_registration_window(session, model.id, current_edition)
+        current_edition_id = current_edition.id if current_edition is not None else None
+        if (
+            current_edition_id != previous_edition_id
+            and "registration_status" not in proposed_fields
+        ):
+            model.registration_status = registration_window.status
         if "registration_open_at" in proposed_fields:
             registration_window.registration_open_at = field_text(
                 proposed_fields.get("registration_open_at")
@@ -1052,14 +1060,7 @@ def ensure_proposal_is_current(
     event: models.Event,
 ) -> None:
     live_event = event_to_domain(event)
-    live_fields = {
-        "registration_status": live_event.registration_status,
-        "registration_open_at": live_event.registration_open_at,
-        "registration_open_precision": live_event.registration_open_precision,
-        "registration_close_at": live_event.registration_close_at,
-        "registration_url": live_event.registration_url,
-        "event_date": live_event.event_date,
-    }
+    live_fields = registration_update_fields(live_event)
     stale_fields = tuple(
         field
         for field, expected_value in dict(update.current_fields or {}).items()
@@ -1070,6 +1071,17 @@ def ensure_proposal_is_current(
             "Proposed update is stale; live event fields changed: "
             + ", ".join(stale_fields)
         )
+
+
+def registration_update_fields(event: TrackedEvent) -> dict[str, str | None]:
+    return {
+        "registration_status": event.registration_status,
+        "registration_open_at": event.registration_open_at,
+        "registration_open_precision": event.registration_open_precision,
+        "registration_close_at": event.registration_close_at,
+        "registration_url": event.registration_url,
+        "event_date": event.event_date,
+    }
 
 
 def registration_window_apply_from_proposed_fields(

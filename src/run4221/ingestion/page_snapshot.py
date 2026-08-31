@@ -20,6 +20,7 @@ MAX_SNAPSHOT_TEXT_CHARS = 50_000
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_REDIRECTS = 5
 DEFAULT_TIMEOUT_SECONDS = 10.0
+DEFAULT_DNS_TIMEOUT_SECONDS = 5.0
 USER_AGENT = "run4221-bot/0.1 (+https://run4221.com)"
 LINK_DISCOVERY_TERMS = (
     "register",
@@ -104,6 +105,7 @@ async def validate_public_http_url(
     url: str,
     *,
     resolve_host: HostResolver = resolve_host_addresses,
+    resolver_timeout: float = DEFAULT_DNS_TIMEOUT_SECONDS,
 ) -> tuple[str, ...]:
     parsed = urlparse(url)
     if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
@@ -118,7 +120,13 @@ async def validate_public_http_url(
     try:
         literal_address = ipaddress.ip_address(hostname)
     except ValueError:
-        addresses = await resolve_host(hostname)
+        try:
+            addresses = await asyncio.wait_for(
+                resolve_host(hostname),
+                timeout=resolver_timeout,
+            )
+        except TimeoutError as error:
+            raise PageFetchError(f"Timed out resolving host {hostname}.") from error
     else:
         addresses = (str(literal_address),)
 
@@ -152,7 +160,11 @@ async def fetch_public_response(
 ) -> httpx.Response:
     current_url = url
     for redirect_count in range(MAX_REDIRECTS + 1):
-        addresses = await validate_public_http_url(current_url, resolve_host=resolve_host)
+        addresses = await validate_public_http_url(
+            current_url,
+            resolve_host=resolve_host,
+            resolver_timeout=min(timeout, DEFAULT_DNS_TIMEOUT_SECONDS),
+        )
         original_url = httpx.URL(current_url)
         request_headers = {**headers, "Host": original_url.netloc.decode("ascii")}
         redirect_url = None
@@ -188,6 +200,12 @@ async def fetch_public_response(
                         ):
                             raise PageFetchError(f"Unsupported page content type: {media_type}")
 
+                    content_encoding = streamed.headers.get("content-encoding", "identity")
+                    if content_encoding.strip().casefold() != "identity":
+                        raise PageFetchError(
+                            "Compressed page responses are not supported."
+                        )
+
                     declared_length = streamed.headers.get("content-length")
                     if declared_length and declared_length.isdigit():
                         if int(declared_length) > max_response_bytes:
@@ -195,13 +213,22 @@ async def fetch_public_response(
                                 f"Page exceeds the {max_response_bytes}-byte response limit."
                             )
 
-                    content = bytearray()
-                    async for chunk in streamed.aiter_bytes():
-                        content.extend(chunk)
-                        if len(content) > max_response_bytes:
-                            raise PageFetchError(
-                                f"Page exceeds the {max_response_bytes}-byte response limit."
-                            )
+                    content = (
+                        bytearray(streamed.content)
+                        if streamed.is_stream_consumed
+                        else bytearray()
+                    )
+                    if len(content) > max_response_bytes:
+                        raise PageFetchError(
+                            f"Page exceeds the {max_response_bytes}-byte response limit."
+                        )
+                    if not streamed.is_stream_consumed:
+                        async for chunk in streamed.aiter_raw():
+                            content.extend(chunk)
+                            if len(content) > max_response_bytes:
+                                raise PageFetchError(
+                                    f"Page exceeds the {max_response_bytes}-byte response limit."
+                                )
                     response_headers = httpx.Headers(
                         (name, value)
                         for name, value in streamed.headers.raw
@@ -251,6 +278,7 @@ async def fetch_page_snapshot(
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+        "Accept-Encoding": "identity",
     }
     try:
         if client is not None:
@@ -308,6 +336,7 @@ async def fetch_enriched_page_snapshot(
         headers = {
             "User-Agent": USER_AGENT,
             "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+            "Accept-Encoding": "identity",
         }
         async with httpx.AsyncClient(
             follow_redirects=False,

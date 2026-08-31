@@ -59,12 +59,17 @@ jobs:
           set -euo pipefail
           cd "$APP_DIR"
           previous_sha="$(git rev-parse HEAD)"
+          service_replaced=false
           rollback() {
             status="$?"
             trap - ERR
             git checkout --detach "$previous_sha"
             git reset --hard "$previous_sha"
-            docker compose up -d --build --remove-orphans --wait --wait-timeout 90
+            if [[ "$service_replaced" == "true" ]]; then
+              docker compose up -d --build --remove-orphans --wait --wait-timeout 90
+            else
+              docker compose build bot
+            fi
             docker compose ps
             exit "$status"
           }
@@ -72,6 +77,8 @@ jobs:
           git fetch --prune --tags origin '+refs/heads/*:refs/remotes/origin/*'
           git checkout --detach "$DEPLOY_SHA"
           git reset --hard "$DEPLOY_SHA"
+          docker compose run --rm --build bot uv run python -m run4221.health
+          service_replaced=true
           docker compose up -d --build --remove-orphans --wait --wait-timeout 90
           docker compose ps
           docker compose exec -T bot uv run python -m run4221.health

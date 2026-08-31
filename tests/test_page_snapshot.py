@@ -164,6 +164,59 @@ def test_fetch_page_snapshot_rejects_invalid_resolver_address() -> None:
         run(fetch())
 
 
+@pytest.mark.parametrize(
+    "addresses",
+    [
+        ("127.0.0.1",),
+        ("169.254.169.254",),
+        ("93.184.216.34", "127.0.0.1"),
+    ],
+)
+def test_fetch_page_snapshot_rejects_private_resolver_addresses(addresses) -> None:
+    request_sent = False
+
+    async def resolver(_hostname: str) -> tuple[str, ...]:
+        return addresses
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_sent
+        request_sent = True
+        return httpx.Response(200, request=request)
+
+    async def fetch():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_page_snapshot(
+                "https://example.com/",
+                client=client,
+                resolve_host=resolver,
+            )
+
+    with pytest.raises(PageFetchError, match="Private or non-public address"):
+        run(fetch())
+
+    assert request_sent is False
+
+
+def test_fetch_page_snapshot_times_out_stalled_resolver() -> None:
+    async def stalled_resolver(_hostname: str) -> tuple[str, ...]:
+        await asyncio.Event().wait()
+        return ()
+
+    async def fetch():
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, request=request))
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_page_snapshot(
+                "https://example.com/",
+                client=client,
+                resolve_host=stalled_resolver,
+                timeout=0.01,
+            )
+
+    with pytest.raises(PageFetchError, match="Timed out resolving host"):
+        run(fetch())
+
+
 def test_fetch_page_snapshot_revalidates_redirect_target() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -203,11 +256,13 @@ def test_fetch_page_snapshot_enforces_response_size_limit() -> None:
         run(fetch())
 
 
-def test_fetch_page_snapshot_does_not_double_decode_compressed_body() -> None:
-    html = b"<html><title>Compressed</title><p>Readable body.</p></html>"
+def test_fetch_page_snapshot_rejects_compressed_body() -> None:
+    html = b"<html><title>Compressed</title><p>" + b"x" * 10_000 + b"</p></html>"
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["accept-encoding"] == "identity"
         compressed = gzip.compress(html)
+        assert len(compressed) < 200
         return httpx.Response(
             200,
             headers={
@@ -226,9 +281,8 @@ def test_fetch_page_snapshot_does_not_double_decode_compressed_body() -> None:
                 "https://example.com/compressed",
                 client=client,
                 resolve_host=public_resolver,
+                max_response_bytes=200,
             )
 
-    snapshot = run(fetch())
-
-    assert snapshot.title == "Compressed"
-    assert "Readable body." in snapshot.normalized_text
+    with pytest.raises(PageFetchError, match="Compressed page responses"):
+        run(fetch())

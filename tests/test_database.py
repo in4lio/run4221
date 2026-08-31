@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
 import pytest
 from sqlalchemy import select
 
@@ -227,6 +230,43 @@ def test_database_deduplicates_identical_pending_proposals(tmp_path) -> None:
     assert count_proposed_event_updates(database_url=url) == 1
 
 
+def test_database_deduplicates_concurrent_pending_proposals(tmp_path) -> None:
+    url = database_url(tmp_path)
+    event = add_event(
+        EventCreate(
+            public_id="zurich.42",
+            name="Zurich Marathon",
+            city="Zurich",
+            country="Switzerland",
+            timezone="Europe/Zurich",
+            event_date="2027-04-18",
+            distances=("marathon",),
+            regions=("global", "eu", "ch"),
+            official_url="https://example.com/zurich-marathon",
+        ),
+        database_url=url,
+    )
+    payload = ProposedEventUpdateCreate(
+        event_id=event.id,
+        update_type="registration_window",
+        current_fields={"registration_status": "unknown"},
+        proposed_fields={"registration_status": "open"},
+        evidence=("Registration is open.",),
+        confidence=0.9,
+    )
+    ready = Barrier(2)
+
+    def create_proposal():
+        ready.wait(timeout=5)
+        return create_proposed_event_update(payload, database_url=url)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(lambda _index: create_proposal(), range(2)))
+
+    assert results[0].id == results[1].id
+    assert count_proposed_event_updates(database_url=url) == 1
+
+
 def test_database_adopts_legacy_pending_proposal_for_deduplication(tmp_path) -> None:
     url = database_url(tmp_path)
     event = add_event(
@@ -299,6 +339,51 @@ def test_database_proposal_approval_is_idempotent(tmp_path) -> None:
         stored = session.get(ProposedEventUpdate, proposal.id)
         assert stored is not None
         assert stored.status == "applied"
+
+
+def test_database_proposal_approval_is_atomic_under_contention(tmp_path) -> None:
+    url = database_url(tmp_path)
+    event = add_event(
+        EventCreate(
+            public_id="zurich.42",
+            name="Zurich Marathon",
+            city="Zurich",
+            country="Switzerland",
+            timezone="Europe/Zurich",
+            event_date="2027-04-18",
+            distances=("marathon",),
+            regions=("global", "eu", "ch"),
+            official_url="https://example.com/zurich-marathon",
+        ),
+        database_url=url,
+    )
+    proposal = create_proposed_event_update(
+        ProposedEventUpdateCreate(
+            event_id=event.id,
+            update_type="registration_window",
+            current_fields={"registration_status": "unknown"},
+            proposed_fields={"registration_status": "open"},
+            evidence=("Registration is open.",),
+            confidence=0.9,
+        ),
+        database_url=url,
+    )
+    ready = Barrier(2)
+
+    def approve_proposal():
+        ready.wait(timeout=5)
+        return approve_proposed_event_update(proposal.id, database_url=url)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(lambda _index: approve_proposal(), range(2)))
+
+    assert sum(result is not None for result in results) == 1
+    assert find_event(event.id, url).registration_status == "open"
+    with session_scope(url) as session:
+        stored = session.get(ProposedEventUpdate, proposal.id)
+
+    assert stored is not None
+    assert stored.status == "applied"
 
 
 def test_database_releases_deduplication_key_after_rejection(tmp_path) -> None:
@@ -559,6 +644,140 @@ def test_database_rolls_annual_event_into_new_edition_without_losing_history(
     assert windows[0].id == old_window_id
     assert windows[0].event_edition_id == old_edition_id
     assert windows[1].event_edition_id == editions[1].id
+
+
+def test_partial_apply_of_event_date_rolls_into_a_clean_current_edition(tmp_path) -> None:
+    url = database_url(tmp_path)
+    event = add_event(
+        EventCreate(
+            public_id="zurich.42",
+            name="Zurich Marathon",
+            city="Zurich",
+            country="Switzerland",
+            timezone="Europe/Zurich",
+            event_date="2027-04-18",
+            distances=("marathon",),
+            regions=("global", "eu", "ch"),
+            official_url="https://example.com/zurich-marathon",
+            registration_status="announced",
+            registration_open_at="2026-10-01",
+            registration_open_precision="date_only",
+            registration_close_at="2027-03-01",
+        ),
+        database_url=url,
+    )
+    proposal = create_proposed_event_update(
+        ProposedEventUpdateCreate(
+            event_id=event.id,
+            update_type="registration_window",
+            current_fields={"event_date": "2027-04-18"},
+            proposed_fields={"event_date": "2028-04-16"},
+            evidence=("The 2028 date was announced.",),
+            confidence=0.95,
+        ),
+        database_url=url,
+    )
+
+    result = partial_apply_proposed_event_update(
+        proposal.id,
+        selected_fields=("event_date",),
+        reviewer_user_id="42",
+        database_url=url,
+    )
+
+    assert result is not None
+    assert result.event.event_date == "2028-04-16"
+    assert result.event.registration_status == "unknown"
+    assert result.event.registration_open_at is None
+    assert result.event.registration_open_precision == "unknown"
+    assert result.event.registration_close_at is None
+    with session_scope(url) as session:
+        editions = session.scalars(
+            select(EventEdition)
+            .where(EventEdition.event_id == event.id)
+            .order_by(EventEdition.edition_year)
+        ).all()
+        windows = session.scalars(
+            select(RegistrationWindow)
+            .where(RegistrationWindow.event_id == event.id)
+            .order_by(RegistrationWindow.id)
+        ).all()
+
+    assert [(edition.edition_year, edition.is_current) for edition in editions] == [
+        (2027, False),
+        (2028, True),
+    ]
+    assert windows[0].event_edition_id == editions[0].id
+    assert windows[0].registration_open_at == "2026-10-01"
+    assert windows[0].registration_close_at == "2027-03-01"
+    assert windows[1].event_edition_id == editions[1].id
+    assert windows[1].registration_open_at is None
+    assert windows[1].registration_close_at is None
+
+
+def test_partial_apply_follow_up_uses_post_rollover_current_fields(tmp_path) -> None:
+    url = database_url(tmp_path)
+    event = add_event(
+        EventCreate(
+            public_id="zurich.42",
+            name="Zurich Marathon",
+            city="Zurich",
+            country="Switzerland",
+            timezone="Europe/Zurich",
+            event_date="2027-04-18",
+            distances=("marathon",),
+            regions=("global", "eu", "ch"),
+            official_url="https://example.com/zurich-marathon",
+            registration_status="announced",
+            registration_open_at="2026-10-01",
+            registration_open_precision="date_only",
+            registration_close_at="2027-03-01",
+        ),
+        database_url=url,
+    )
+    proposal = create_proposed_event_update(
+        ProposedEventUpdateCreate(
+            event_id=event.id,
+            update_type="registration_window",
+            current_fields={
+                "event_date": "2027-04-18",
+                "registration_close_at": "2027-03-01",
+                "registration_open_at": "2026-10-01",
+            },
+            proposed_fields={
+                "event_date": "2028-04-16",
+                "registration_close_at": "2028-03-01",
+                "registration_open_at": "2027-10-01",
+            },
+            evidence=("The 2028 registration schedule was announced.",),
+            confidence=0.95,
+        ),
+        database_url=url,
+    )
+
+    result = partial_apply_proposed_event_update(
+        proposal.id,
+        selected_fields=("event_date", "registration_close_at"),
+        reviewer_user_id="42",
+        database_url=url,
+    )
+
+    assert result is not None
+    assert result.event.event_date == "2028-04-16"
+    assert result.event.registration_open_at is None
+    assert result.event.registration_close_at == "2028-03-01"
+    assert result.follow_up_update is not None
+    assert result.follow_up_update.current_fields == {"registration_open_at": None}
+
+    applied_follow_up = approve_proposed_event_update(
+        result.follow_up_update.id,
+        reviewer_user_id="42",
+        database_url=url,
+    )
+
+    assert applied_follow_up is not None
+    assert applied_follow_up.event.registration_open_at == "2027-10-01"
+    assert applied_follow_up.event.registration_close_at == "2028-03-01"
 
 
 def test_database_rejects_proposed_registration_update(tmp_path) -> None:
