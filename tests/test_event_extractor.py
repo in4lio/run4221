@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from run4221.ai.event_extractor import (
+    draft_from_page_snapshot,
     extract_event_draft_from_url,
     select_registration_url_for_distances,
 )
@@ -242,6 +243,61 @@ def test_extractor_promotes_distance_link_when_ai_omits_registration_url() -> No
     assert "Selected timezone from location: Europe/Berlin." in draft.evidence
 
 
+def test_extractor_rejects_mini_marathon_url_for_marathon_profile() -> None:
+    correct_url = (
+        "https://www.bmw-berlin-marathon.com/en/registration/registration-information"
+    )
+    mini_url = (
+        "https://www.bmw-berlin-marathon.com/anmelden/kids-and-youth/mini-marathon"
+    )
+    snapshot = PageSnapshot(
+        source_url="https://www.bmw-berlin-marathon.com/en/",
+        final_url="https://www.bmw-berlin-marathon.com/en/",
+        fetched_at=datetime(2026, 8, 31, tzinfo=UTC),
+        status_code=200,
+        content_type="text/html",
+        title="BMW BERLIN-MARATHON",
+        normalized_text="The BMW BERLIN-MARATHON takes place on 27 September 2026.",
+        text_hash="e" * 64,
+        links=(
+            PageLink(url=mini_url, text="Register for the Mini Marathon"),
+            PageLink(url=correct_url, text="Registration information"),
+        ),
+    )
+
+    class MiniUrlProvider:
+        provider_name = "fake-ai"
+
+        async def extract(self, received_snapshot: PageSnapshot) -> EventExtraction:
+            assert received_snapshot is snapshot
+            return EventExtraction(
+                name="BMW BERLIN-MARATHON",
+                public_id="berlin.42",
+                city="Berlin",
+                country="Germany",
+                timezone="Europe/Berlin",
+                event_date="2026-09-27",
+                distances=("marathon",),
+                regions=("global", "eu", "de"),
+                official_url=snapshot.final_url,
+                registration_url=mini_url,
+                confidence=0.91,
+                evidence_snippets=("The supplied Mini Marathon link is a child event.",),
+                provider_name=self.provider_name,
+            )
+
+    draft = asyncio.run(
+        draft_from_page_snapshot(
+            snapshot,
+            snapshot_path=None,
+            extractor_provider=MiniUrlProvider(),
+        )
+    )
+
+    assert draft.registration_url == correct_url
+    assert draft.registration_url != mini_url
+
+
 def test_extractor_rejects_stale_article_registration_url() -> None:
     snapshot = PageSnapshot(
         source_url="https://zurichmaratobarcelona.es/en/",
@@ -317,6 +373,39 @@ def test_registration_url_selection_uses_confirmed_distance() -> None:
             fallback="https://www.badenmarathon.de/wettbewerbe/marathon",
         )
         == "https://www.badenmarathon.de/wettbewerbe/halbmarathon"
+    )
+    assert (
+        select_registration_url_for_distances(
+            (
+                (
+                    "https://example.com/kids-and-youth/mini-marathon",
+                    "Mini Marathon",
+                ),
+                ("https://example.com/races/marathon", "Marathon"),
+            ),
+            ("marathon",),
+        )
+        == "https://example.com/races/marathon"
+    )
+
+
+def test_registration_url_identity_checks_do_not_match_word_fragments_or_years() -> None:
+    marathon_url = "https://example.com/2021/skid-row/marathon-registration"
+    half_marathon_url = "https://example.com/2021/halfmarathon-registration"
+
+    assert (
+        select_registration_url_for_distances(
+            ((marathon_url, "Marathon registration"),),
+            ("marathon",),
+        )
+        == marathon_url
+    )
+    assert (
+        select_registration_url_for_distances(
+            ((half_marathon_url, "Half marathon registration"),),
+            ("marathon",),
+        )
+        is None
     )
 
 

@@ -1556,6 +1556,28 @@ def test_proposed_update_detail_formats_diff_and_evidence() -> None:
     assert "/reject_update 1" not in detail
 
 
+def test_proposed_update_detail_formats_explicit_field_clear() -> None:
+    detail = format_proposed_update_detail(
+        ProposedEventUpdateRecord(
+            id=4,
+            event_id="berlin.42",
+            update_type="registration_window",
+            current_fields={
+                "registration_url": "https://example.com/kids-and-youth/mini-marathon"
+            },
+            proposed_fields={"registration_url": None},
+            evidence=("The saved URL belongs to a child event.",),
+            confidence=0.99,
+            status="pending",
+            change_summary="Clear mismatched registration URL.",
+        )
+    )
+
+    assert "- <b>registration_url</b>" in detail
+    assert "<s>https://example.com/kids-and-youth/mini-marathon</s>" in detail
+    assert "<i>clear</i>" in detail
+
+
 def test_researcher_update_detail_is_bounded_and_keeps_actions() -> None:
     long_url = "https://example.com/register?" + ("x=<tag>&" * 500)
     update = ProposedEventUpdateRecord(

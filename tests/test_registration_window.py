@@ -233,3 +233,59 @@ def test_update_registration_window_ignores_stale_article_registration_url(tmp_p
     assert "Ignored stored registration URL" in result.evidence
     assert "Ignored stale page date 2026-04-30" in result.evidence
     assert list_proposed_event_updates(event_id=event.id, database_url=url) == ()
+
+
+def test_update_registration_window_ignores_mini_marathon_source_for_marathon(
+    tmp_path,
+) -> None:
+    url = database_url(tmp_path)
+    official_url = "https://www.bmw-berlin-marathon.com/en/"
+    mini_url = (
+        "https://www.bmw-berlin-marathon.com/anmelden/kids-and-youth/mini-marathon"
+    )
+    event = add_event(
+        EventCreate(
+            public_id="berlin.42",
+            name="BMW BERLIN-MARATHON",
+            city="Berlin",
+            country="Germany",
+            timezone="Europe/Berlin",
+            event_date="2026-09-27",
+            distances=("marathon",),
+            regions=("global", "eu", "de"),
+            official_url=official_url,
+            registration_url=mini_url,
+        ),
+        database_url=url,
+    )
+    fetched_urls = []
+
+    async def fake_fetch(source_url: str) -> PageSnapshot:
+        fetched_urls.append(source_url)
+        return PageSnapshot(
+            source_url=source_url,
+            final_url=source_url,
+            fetched_at=datetime(2026, 8, 31, tzinfo=UTC),
+            status_code=200,
+            content_type="text/html",
+            title="BMW BERLIN-MARATHON",
+            normalized_text="Lottery results are available.",
+            text_hash="berlin",
+            links=(),
+        )
+
+    result = asyncio.run(
+        update_registration_window(
+            event,
+            fetch_snapshot=fake_fetch,
+            store_snapshot=None,
+            database_url=url,
+        )
+    )
+
+    assert fetched_urls == [official_url]
+    assert result.registration_status == "unknown"
+    assert result.registration_url is None
+    assert result.proposed_update_id is None
+    assert "Ignored stored registration URL" in result.evidence
+    assert list_proposed_event_updates(event_id=event.id, database_url=url) == ()

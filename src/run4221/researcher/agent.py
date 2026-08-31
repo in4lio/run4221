@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from time import monotonic
 from typing import Annotated, Any, Literal, Protocol
@@ -104,6 +105,7 @@ class CapturedSnapshotEvidence(ResearchSchema):
     reference: ArtifactReference
     final_url: Annotated[str, Field(min_length=1, max_length=2_048)]
     title: Annotated[str, Field(max_length=500)] | None = None
+    fetched_at: datetime
     normalized_text: Annotated[str, Field(min_length=1, max_length=MAX_SNAPSHOT_TEXT_CHARS)]
     text_hash: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
 

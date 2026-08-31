@@ -1130,8 +1130,7 @@ def proposed_update_changed_fields(update: ProposedEventUpdateRecord) -> tuple[s
     return tuple(
         field
         for field, proposed_value in update.proposed_fields.items()
-        if proposed_value is not None
-        and proposed_value != ""
+        if proposed_value != ""
         and proposed_value != "unknown"
         and update.current_fields.get(field) != proposed_value
     )

@@ -180,7 +180,7 @@ class ResearcherService:
             )
         prepared_decision = decision.model_copy(
             update={
-                "proposed_fields": ProposedEventChanges.model_validate(changed_fields),
+                "proposed_fields": _normalized_proposed_changes(changed_fields),
             }
         )
         if not self.persist_queue:
@@ -602,6 +602,7 @@ class CapturedPage:
             reference=self.reference,
             final_url=self.snapshot.final_url,
             title=self.snapshot.title,
+            fetched_at=self.snapshot.fetched_at,
             normalized_text=self.snapshot.normalized_text,
             text_hash=self.snapshot.text_hash,
         )
@@ -644,14 +645,32 @@ def _changed_supported_fields(
 ) -> dict[str, object]:
     if decision.proposed_fields is None:
         return {}
-    proposed = decision.proposed_fields.model_dump(mode="json", exclude_none=True)
+    proposed = decision.proposed_fields.model_dump(
+        mode="json",
+        exclude={"clear_fields"},
+        exclude_none=True,
+    )
+    proposed.update({field: None for field in decision.proposed_fields.clear_fields})
     return {
         field: proposed[field]
         for field in SUPPORTED_UPDATE_FIELDS
         if field in proposed
-        and proposed[field] not in {"", "unknown"}
+        and (proposed[field] is None or proposed[field] not in {"", "unknown"})
         and proposed[field] != current_fields[field]
     }
+
+
+def _normalized_proposed_changes(
+    changed_fields: dict[str, object],
+) -> ProposedEventChanges:
+    return ProposedEventChanges.model_validate(
+        {
+            **{field: value for field, value in changed_fields.items() if value is not None},
+            "clear_fields": tuple(
+                field for field, value in changed_fields.items() if value is None
+            ),
+        }
+    )
 
 
 def _candidate_matches_capture(candidate: ResearchCandidate, snapshot: PageSnapshot) -> bool:
