@@ -14,10 +14,19 @@ from run4221.db.repository import (
     find_event,
     get_event_suggestion,
 )
+from run4221.db.seed import seed_initial_data
+from run4221.db.session import session_scope
+from tests.seed_fixtures import sample_seed_events
 
 
 def database_url(tmp_path) -> str:
     return f"sqlite:///{tmp_path / 'run4221-agent-tools.sqlite3'}"
+
+
+def initialize_sample_database(url: str) -> None:
+    initialize_database(url, seed_initial_events=False)
+    with session_scope(url) as session:
+        seed_initial_data(session, sample_seed_events())
 
 
 def suggestion_payload() -> EventSuggestionCreate:
@@ -122,7 +131,7 @@ def test_moderator_agent_tools_delete_is_disabled_without_guard_code(tmp_path) -
 
 def test_moderator_agent_tools_update_and_suggestion_queues(tmp_path) -> None:
     url = database_url(tmp_path)
-    initialize_database(url)
+    initialize_sample_database(url)
     tools = ModeratorAgentTools(database_url=url)
     event_id = find_event("berlin.42", url).id
 
@@ -158,7 +167,7 @@ def test_moderator_agent_tools_update_and_suggestion_queues(tmp_path) -> None:
 
 def test_moderator_agent_search_uses_repository_contract(tmp_path) -> None:
     url = database_url(tmp_path)
-    initialize_database(url)
+    initialize_sample_database(url)
     tools = ModeratorAgentTools(database_url=url)
 
     result = tools.search_events("berlin", limit=1)
