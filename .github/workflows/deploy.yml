@@ -65,11 +65,17 @@ jobs:
           previous_researcher_container="$(docker compose ps -q researcher 2>/dev/null || true)"
           previous_bot_image=""
           previous_researcher_image=""
+          previous_bot_rollback_tag=""
+          previous_researcher_rollback_tag=""
           if [[ -n "$previous_bot_container" ]]; then
             previous_bot_image="$(docker inspect --format '{{.Image}}' "$previous_bot_container")"
+            previous_bot_rollback_tag="run4221-bot:rollback-$previous_sha"
+            docker image tag "$previous_bot_image" "$previous_bot_rollback_tag"
           fi
           if [[ -n "$previous_researcher_container" ]]; then
             previous_researcher_image="$(docker inspect --format '{{.Image}}' "$previous_researcher_container")"
+            previous_researcher_rollback_tag="run4221-researcher:rollback-$previous_sha"
+            docker image tag "$previous_researcher_image" "$previous_researcher_rollback_tag"
           fi
           service_replaced=false
           rollback() {
@@ -77,14 +83,14 @@ jobs:
             trap - ERR
             git checkout --detach "$previous_sha"
             git reset --hard "$previous_sha"
+            if [[ -n "$previous_bot_rollback_tag" ]]; then
+              docker image tag "$previous_bot_rollback_tag" run4221-bot:latest
+            fi
+            if [[ -n "$previous_researcher_rollback_tag" ]] \
+              && grep -qx researcher <<<"$previous_services"; then
+              docker image tag "$previous_researcher_rollback_tag" run4221-researcher:latest
+            fi
             if [[ "$service_replaced" == "true" ]]; then
-              if [[ -n "$previous_bot_image" ]]; then
-                docker image tag "$previous_bot_image" run4221-bot:latest
-              fi
-              if [[ -n "$previous_researcher_image" ]] \
-                && grep -qx researcher <<<"$previous_services"; then
-                docker image tag "$previous_researcher_image" run4221-researcher:latest
-              fi
               docker compose up -d --no-build --remove-orphans --wait --wait-timeout 90
             fi
             docker compose ps
@@ -95,10 +101,10 @@ jobs:
           git checkout --detach "$DEPLOY_SHA"
           git reset --hard "$DEPLOY_SHA"
           docker compose config --quiet
-          docker compose run --rm --build bot uv run python -m run4221.health
-          docker compose run --rm --build --no-deps researcher \
+          docker compose run --rm -T --build bot uv run python -m run4221.health
+          docker compose run --rm -T --build --no-deps researcher \
             uv run run4221-researcher --check-config
-          docker compose run --rm --no-deps researcher uv run python -c \
+          docker compose run --rm -T --no-deps researcher uv run python -c \
             'from run4221.researcher.config import ResearcherSettings; s = ResearcherSettings(); assert not s.enabled and not s.discovery_enabled and not s.rendering_enabled, "researcher must deploy ready-paused"'
           service_replaced=true
           docker compose stop researcher

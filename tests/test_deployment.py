@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from run4221.db.bootstrap import initialize_database
-from run4221.health import check_database
+from run4221.health import check_database, check_runtime
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,6 +48,18 @@ def test_health_check_rejects_database_without_application_schema(tmp_path) -> N
         check_database(f"sqlite:///{database_path}")
 
 
+def test_runtime_health_rejects_unsafe_bot_configuration(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test:token")
+    monkeypatch.setenv("TELEGRAM_MODERATOR_ACCOUNTS", "@mutable-username")
+
+    with pytest.raises(RuntimeError, match="numeric user IDs"):
+        check_runtime()
+
+
 def test_deploy_runs_quality_gate_health_check_and_rollback() -> None:
     workflow = read_project_file(".github/workflows/deploy.yml")
 
@@ -55,7 +67,8 @@ def test_deploy_runs_quality_gate_health_check_and_rollback() -> None:
     assert "uv run ruff check" in workflow
     assert "uv run pytest" in workflow
     assert "--wait --wait-timeout 90" in workflow
-    assert "docker compose run --rm --build bot uv run python -m run4221.health" in workflow
+    assert "docker compose run --rm -T --build bot uv run python -m run4221.health" in workflow
+    assert workflow.count("docker compose run") == workflow.count("docker compose run --rm -T")
     assert 'if [[ "$service_replaced" == "true" ]]' in workflow
     assert "docker compose exec -T bot uv run python -m run4221.health" in workflow
     assert "trap rollback ERR" in workflow
@@ -97,6 +110,15 @@ def test_deploy_preflights_researcher_before_replacement_and_restores_topology()
     assert 'previous_services="$(docker compose config --services' in workflow
     assert 'previous_bot_image="$(docker inspect' in workflow
     assert 'previous_researcher_image="$(docker inspect' in workflow
+    assert 'previous_bot_rollback_tag="run4221-bot:rollback-$previous_sha"' in workflow
+    assert (
+        'previous_researcher_rollback_tag="run4221-researcher:rollback-$previous_sha"'
+        in workflow
+    )
+    assert workflow.index('docker image tag "$previous_bot_image"') < workflow.index(
+        "docker compose run"
+    )
+    assert 'docker image tag "$previous_bot_rollback_tag" run4221-bot:latest' in workflow
     assert "run4221-researcher --check-config" in workflow
     assert workflow.index("run4221-researcher --check-config") < workflow.index(
         "service_replaced=true"
@@ -124,6 +146,7 @@ def test_bootstrap_shares_mutation_lock_and_treats_confirmation_as_data() -> Non
     workflow = read_project_file(".github/workflows/bootstrap-production.yml")
 
     assert "group: production-mutation" in workflow
+    assert workflow.count("docker compose run") == workflow.count("docker compose run --rm -T")
     assert "--wait --wait-timeout 90" in workflow
     assert "CONFIRM_RESET: ${{ inputs.confirm_reset }}" in workflow
     assert 'if [[ "$CONFIRM_RESET" != "RESET_SUGGESTION_BOOTSTRAP" ]]' in workflow
