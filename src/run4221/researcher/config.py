@@ -76,7 +76,7 @@ class ResearcherSettings(BaseSettings):
     max_static_pages_per_job: int = Field(default=4, ge=1, le=50)
     max_rendered_pages_per_job: int = Field(default=0, ge=0, le=10)
     max_retries_per_job: int = Field(default=2, ge=0, le=10)
-    max_output_tokens_per_job: int = Field(default=4_000, ge=128, le=16_000)
+    max_output_tokens_per_job: int = Field(default=2_000, ge=128, le=16_000)
     max_wall_time_seconds_per_job: int = Field(default=90, ge=10, le=900)
     max_pending_suggestions: int = Field(
         default=RESEARCHER_MAX_PENDING_SUGGESTIONS,

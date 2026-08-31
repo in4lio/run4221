@@ -17,7 +17,7 @@ from run4221.ingestion.page_snapshot import (
     PageFetchError,
     PageSnapshot,
     blocked_page_reason,
-    fetch_enriched_page_snapshot,
+    fetch_page_snapshot,
 )
 from run4221.researcher.agent import (
     AgentRunState,
@@ -80,7 +80,7 @@ class ResearcherService:
         agent: ResearchAgent,
         trust_policy: SourceTrustPolicy,
         budget: ResearchBudget,
-        fetch_snapshot: SnapshotFetcher = fetch_enriched_page_snapshot,
+        fetch_snapshot: SnapshotFetcher = fetch_page_snapshot,
         persist_queue: bool = True,
         on_run_started: Callable[[str], None] | None = None,
     ) -> None:
