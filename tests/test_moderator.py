@@ -80,7 +80,7 @@ from run4221.bot.moderator import (
     supported_distance_codes,
     todo_keyboard,
 )
-from run4221.config import parse_moderator_accounts
+from run4221.config import Settings, parse_moderator_accounts
 from run4221.db.repository import (
     EVENT_SUGGESTION_MAX_PENDING_TOTAL,
     EventWriteError,
@@ -159,12 +159,21 @@ def test_parse_moderator_accounts_splits_ids_and_usernames() -> None:
     assert parse_moderator_accounts("42,@in4lio, In4lio, 7") == ((42, 7), ("in4lio",))
 
 
+def test_settings_reject_mutable_moderator_usernames() -> None:
+    with pytest.raises(ValueError, match="numeric user IDs"):
+        Settings(
+            _env_file=None,
+            telegram_bot_token="test-token",
+            telegram_moderator_accounts="@in4lio",
+        )
+
+
 def test_moderator_auth_checks_unified_accounts() -> None:
     accounts = ((1, 42), ("in4lio",))
 
     assert is_moderator_account(42, None, accounts)
-    assert is_moderator_account(None, "@In4lio", accounts)
-    assert is_moderator_account(7, "in4lio", accounts)
+    assert not is_moderator_account(None, "@In4lio", accounts)
+    assert not is_moderator_account(7, "in4lio", accounts)
     assert not is_moderator_account(7, "someone_else", accounts)
 
 
@@ -174,9 +183,9 @@ def test_moderator_auth_checks_configured_ids() -> None:
     assert not is_moderator_id(None, (1, 42))
 
 
-def test_moderator_auth_checks_configured_usernames() -> None:
-    assert is_moderator_username("in4lio", ("in4lio",))
-    assert is_moderator_username("@In4lio", ("in4lio",))
+def test_moderator_auth_never_authorizes_configured_usernames() -> None:
+    assert not is_moderator_username("in4lio", ("in4lio",))
+    assert not is_moderator_username("@In4lio", ("in4lio",))
     assert not is_moderator_username("someone_else", ("in4lio",))
     assert not is_moderator_username(None, ("in4lio",))
 

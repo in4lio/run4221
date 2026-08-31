@@ -156,16 +156,34 @@ def test_moderator_agent_tools_update_and_suggestion_queues(tmp_path) -> None:
     assert rejected.data["status"] == "removed"
 
 
+def test_moderator_agent_search_uses_repository_contract(tmp_path) -> None:
+    url = database_url(tmp_path)
+    initialize_database(url)
+    tools = ModeratorAgentTools(database_url=url)
+
+    result = tools.search_events("berlin", limit=1)
+
+    assert result.ok is True
+    assert len(result.data) == 1
+    assert result.data[0]["city"] == "Berlin"
+
+
 def test_moderator_agent_apply_suggestion_returns_draft_without_converting(
     tmp_path,
     monkeypatch,
 ) -> None:
     url = database_url(tmp_path)
     initialize_database(url)
-    tools = ModeratorAgentTools(database_url=url)
+    provider = object()
+    tools = ModeratorAgentTools(database_url=url, extractor_provider=provider)  # type: ignore[arg-type]
     suggestion = add_event_suggestion(suggestion_payload(), database_url=url)
 
-    async def fake_extract_event_draft_from_url(source_url: str) -> EventDraft:
+    async def fake_extract_event_draft_from_url(
+        source_url: str,
+        *,
+        extractor_provider=None,
+    ) -> EventDraft:
+        assert extractor_provider is provider
         return EventDraft(
             source_url=source_url,
             name="Agent Test Marathon",
@@ -208,3 +226,28 @@ def test_moderator_agent_create_event_can_convert_suggestion(tmp_path) -> None:
 
     assert result.ok is True
     assert get_event_suggestion(suggestion.id, database_url=url).status == "converted"
+
+
+def test_moderator_agent_create_event_requires_pending_suggestion(tmp_path) -> None:
+    url = database_url(tmp_path)
+    initialize_database(url)
+    tools = ModeratorAgentTools(database_url=url)
+
+    result = tools.create_event(event_fields(), source_suggestion_id=999)
+
+    assert result.ok is False
+    assert find_event("agent-test.42", url) is None
+
+
+def test_moderator_agent_create_event_rolls_back_suggestion_on_event_failure(tmp_path) -> None:
+    url = database_url(tmp_path)
+    initialize_database(url)
+    tools = ModeratorAgentTools(database_url=url)
+    suggestion = add_event_suggestion(suggestion_payload(), database_url=url)
+    first = tools.create_event(event_fields())
+
+    result = tools.create_event(event_fields(), source_suggestion_id=suggestion.id)
+
+    assert first.ok is True
+    assert result.ok is False
+    assert get_event_suggestion(suggestion.id, database_url=url).status == "pending"

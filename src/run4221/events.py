@@ -3,14 +3,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
 
 def normalize_query(value: str) -> str:
-    normalized = value.casefold().replace("_", " ")
+    normalized = unicodedata.normalize("NFKD", value.casefold()).replace("_", " ")
+    normalized = "".join(
+        character for character in normalized if not unicodedata.combining(character)
+    )
     normalized = re.sub(r"[-.]+", " ", normalized)
-    normalized = re.sub(r"[^a-z0-9\s]+", " ", normalized)
+    normalized = "".join(
+        character if character.isalnum() or character.isspace() else " "
+        for character in normalized
+    )
     return re.sub(r"\s+", " ", normalized).strip()
 
 

@@ -240,6 +240,18 @@ class ProposedEventUpdate(Base):
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class PendingProposalKey(Base):
+    __tablename__ = "pending_proposal_keys"
+
+    proposal_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    update_id: Mapped[int] = mapped_column(
+        ForeignKey("proposed_event_updates.id"),
+        unique=True,
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class PromptVersion(Base):
     __tablename__ = "prompt_versions"
     __table_args__ = (UniqueConstraint("prompt_key", "version"),)

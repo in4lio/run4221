@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 
-from sqlalchemy import Select, select
+from sqlalchemy import Select, delete, select
+from sqlalchemy import update as sqlalchemy_update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from run4221.db import models
@@ -316,43 +320,69 @@ def add_event(event: EventCreate, database_url: str | None = None) -> TrackedEve
     validate_event_create(event, normalized_public_id)
 
     with session_scope(database_url) as session:
-        existing = session.scalar(
-            select(models.Event).where(models.Event.public_id == normalized_public_id)
-        )
-        if existing is not None and existing.removed_at is None:
-            raise EventWriteError(f"Event ID already exists: {normalized_public_id}")
+        return add_event_in_session(session, event, normalized_public_id)
 
-        for region_tag in event.regions:
-            ensure_region(session, region_tag)
 
-        if existing is not None:
-            model = existing
-            clear_registration_windows(session, model.id)
-            clear_event_children(model)
-            session.flush()
-        else:
-            model = models.Event(id=normalized_public_id, public_id=normalized_public_id)
-            session.add(model)
+def add_event_from_suggestion(
+    event: EventCreate,
+    suggestion_id: int,
+    database_url: str | None = None,
+) -> TrackedEvent:
+    ensure_database_schema(database_url)
+    normalized_public_id = normalize_public_id(event.public_id)
+    validate_event_create(event, normalized_public_id)
 
-        model.public_id = normalized_public_id
-        model.status = "monitoring"
-        model.recurrence = "annual"
-        model.creation_source = "moderator_direct"
-        model.removed_at = None
+    with session_scope(database_url) as session:
+        suggestion = session.get(models.EventSuggestion, suggestion_id)
+        if suggestion is None or suggestion.status != "pending":
+            raise EventWriteError(f"Pending suggestion not found: #{suggestion_id}")
 
-        replace_children(model.legacy_ids, [])
-        apply_event_fields(model, event, normalized_public_id)
-        replace_children(model.collections, [])
+        result = add_event_in_session(session, event, normalized_public_id)
+        suggestion.status = "converted"
         session.flush()
+        return result
 
-        current_edition = next((edition for edition in model.editions if edition.is_current), None)
-        model.current_edition_id = current_edition.id if current_edition is not None else None
-        registration_window = apply_event_registration_fields(session, model, event)
-        result = event_to_domain(model)
-        if registration_window is not None:
-            result = event_to_domain(model, registration_window=registration_window)
 
-    return result
+def add_event_in_session(
+    session: Session,
+    event: EventCreate,
+    normalized_public_id: str,
+) -> TrackedEvent:
+    existing = session.scalar(
+        select(models.Event).where(models.Event.public_id == normalized_public_id)
+    )
+    if existing is not None and existing.removed_at is None:
+        raise EventWriteError(f"Event ID already exists: {normalized_public_id}")
+
+    for region_tag in event.regions:
+        ensure_region(session, region_tag)
+
+    if existing is not None:
+        model = existing
+        clear_registration_windows(session, model.id)
+        clear_event_children(model)
+        session.flush()
+    else:
+        model = models.Event(id=normalized_public_id, public_id=normalized_public_id)
+        session.add(model)
+
+    model.public_id = normalized_public_id
+    model.status = "monitoring"
+    model.recurrence = "annual"
+    model.creation_source = "moderator_direct"
+    model.removed_at = None
+
+    replace_children(model.legacy_ids, [])
+    apply_event_fields(model, event, normalized_public_id)
+    replace_children(model.collections, [])
+    session.flush()
+
+    current_edition = next((edition for edition in model.editions if edition.is_current), None)
+    model.current_edition_id = current_edition.id if current_edition is not None else None
+    registration_window = apply_event_registration_fields(session, model, event)
+    if registration_window is not None:
+        return event_to_domain(model, registration_window=registration_window)
+    return event_to_domain(model)
 
 
 def update_event(
@@ -565,9 +595,121 @@ def delete_event(event_id: str, database_url: str | None = None) -> TrackedEvent
                 models.ProposedEventUpdate.event_id == model.id
             )
         ).all():
+            release_pending_proposal_key(session, proposed_update.id)
             session.delete(proposed_update)
         session.delete(model)
         return result
+
+
+def proposed_update_key(update: ProposedEventUpdateCreate) -> str:
+    return proposed_update_key_for_fields(
+        event_id=update.event_id,
+        update_type=update.update_type,
+        current_fields=update.current_fields,
+        proposed_fields=update.proposed_fields,
+    )
+
+
+def proposed_update_key_for_fields(
+    *,
+    event_id: str,
+    update_type: str,
+    current_fields: dict[str, Any],
+    proposed_fields: dict[str, Any],
+) -> str:
+    payload = {
+        "event_id": normalize_event_id(event_id),
+        "update_type": update_type,
+        "current_fields": current_fields,
+        "proposed_fields": proposed_fields,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def pending_proposal_for_key(
+    session: Session,
+    proposal_key: str,
+) -> models.ProposedEventUpdate | None:
+    key_model = session.get(models.PendingProposalKey, proposal_key)
+    if key_model is None:
+        return None
+    update_model = session.get(models.ProposedEventUpdate, key_model.update_id)
+    if update_model is not None and update_model.status in {"pending", "applying"}:
+        return update_model
+    session.delete(key_model)
+    session.flush()
+    return None
+
+
+def create_proposed_event_update_in_session(
+    session: Session,
+    update: ProposedEventUpdateCreate,
+) -> models.ProposedEventUpdate:
+    event = session.get(models.Event, normalize_event_id(update.event_id))
+    if event is None or event.removed_at is not None:
+        raise EventWriteError(f"Event not found: {update.event_id}")
+
+    proposal_key = proposed_update_key(update)
+    existing = pending_proposal_for_key(session, proposal_key)
+    if existing is not None:
+        return existing
+
+    # Existing databases can contain pending proposals created before the key table
+    # was introduced. Adopt a matching legacy proposal instead of creating one
+    # duplicate on the first scan after deployment.
+    legacy_candidates = session.scalars(
+        select(models.ProposedEventUpdate).where(
+            models.ProposedEventUpdate.event_id == event.id,
+            models.ProposedEventUpdate.update_type == update.update_type,
+            models.ProposedEventUpdate.status == "pending",
+        )
+    ).all()
+    for candidate in legacy_candidates:
+        candidate_key = proposed_update_key_for_fields(
+            event_id=candidate.event_id,
+            update_type=candidate.update_type,
+            current_fields=dict(candidate.current_fields or {}),
+            proposed_fields=dict(candidate.proposed_fields or {}),
+        )
+        if candidate_key != proposal_key:
+            continue
+        session.add(
+            models.PendingProposalKey(
+                proposal_key=proposal_key,
+                update_id=candidate.id,
+            )
+        )
+        session.flush()
+        return candidate
+
+    model = models.ProposedEventUpdate(
+        event_id=event.id,
+        update_type=update.update_type,
+        current_fields=update.current_fields,
+        proposed_fields=update.proposed_fields,
+        evidence=list(update.evidence),
+        confidence=min(max(update.confidence, 0.0), 1.0),
+        change_summary=optional_text(update.change_summary),
+    )
+    session.add(model)
+    session.flush()
+    session.add(
+        models.PendingProposalKey(
+            proposal_key=proposal_key,
+            update_id=model.id,
+        )
+    )
+    session.flush()
+    return model
+
+
+def release_pending_proposal_key(session: Session, update_id: int) -> None:
+    session.execute(
+        delete(models.PendingProposalKey).where(
+            models.PendingProposalKey.update_id == update_id
+        )
+    )
 
 
 def create_proposed_event_update(
@@ -575,23 +717,16 @@ def create_proposed_event_update(
     database_url: str | None = None,
 ) -> ProposedEventUpdateRecord:
     ensure_database_schema(database_url)
-    with session_scope(database_url) as session:
-        event = session.get(models.Event, update.event_id)
-        if event is None or event.removed_at is not None:
-            raise EventWriteError(f"Event not found: {update.event_id}")
-
-        model = models.ProposedEventUpdate(
-            event_id=update.event_id,
-            update_type=update.update_type,
-            current_fields=update.current_fields,
-            proposed_fields=update.proposed_fields,
-            evidence=list(update.evidence),
-            confidence=min(max(update.confidence, 0.0), 1.0),
-            change_summary=optional_text(update.change_summary),
-        )
-        session.add(model)
-        session.flush()
-        return proposed_event_update_to_record(model)
+    try:
+        with session_scope(database_url) as session:
+            model = create_proposed_event_update_in_session(session, update)
+            return proposed_event_update_to_record(model)
+    except IntegrityError:
+        with session_scope(database_url) as session:
+            existing = pending_proposal_for_key(session, proposed_update_key(update))
+            if existing is None:
+                raise
+            return proposed_event_update_to_record(existing)
 
 
 def list_proposed_event_updates(
@@ -654,33 +789,35 @@ def approve_proposed_event_update(
     reviewer_user_id: str | None = None,
     database_url: str | None = None,
 ) -> ProposedEventUpdateApplyResult | None:
-    update = get_proposed_event_update(update_id, status="pending", database_url=database_url)
-    if update is None:
-        return None
-    if update.update_type != "registration_window":
-        raise EventWriteError(f"Unsupported proposed update type: {update.update_type}")
-
-    event = apply_registration_window_selected_fields(
-        update.event_id,
-        update.proposed_fields,
-        database_url=database_url,
-    )
-    if event is None:
-        return None
-
+    ensure_database_schema(database_url)
     with session_scope(database_url) as session:
-        model = session.get(models.ProposedEventUpdate, update_id)
-        if model is None or model.status != "pending":
+        update_model = claim_pending_proposal(session, update_id)
+        if update_model is None:
             return None
+        if update_model.update_type != "registration_window":
+            raise EventWriteError(
+                f"Unsupported proposed update type: {update_model.update_type}"
+            )
+
+        event_model = session.get(models.Event, update_model.event_id)
+        if event_model is None or event_model.removed_at is not None:
+            raise EventWriteError(f"Event not found: {update_model.event_id}")
+        ensure_proposal_is_current(update_model, event_model)
+        event = apply_registration_window_selected_fields_in_session(
+            session,
+            event_model,
+            dict(update_model.proposed_fields or {}),
+        )
 
         now = utcnow()
-        model.status = "applied"
-        model.reviewed_by_user_id = optional_text(reviewer_user_id)
-        model.reviewed_at = now
-        model.applied_at = now
+        update_model.status = "applied"
+        update_model.reviewed_by_user_id = optional_text(reviewer_user_id)
+        update_model.reviewed_at = now
+        update_model.applied_at = now
+        release_pending_proposal_key(session, update_model.id)
         session.flush()
         return ProposedEventUpdateApplyResult(
-            update=proposed_event_update_to_record(model),
+            update=proposed_event_update_to_record(update_model),
             event=event,
         )
 
@@ -692,71 +829,76 @@ def partial_apply_proposed_event_update(
     reviewer_user_id: str | None = None,
     database_url: str | None = None,
 ) -> ProposedEventUpdatePartialApplyResult | None:
-    update = get_proposed_event_update(update_id, status="pending", database_url=database_url)
-    if update is None:
-        return None
-    if update.update_type != "registration_window":
-        raise EventWriteError(f"Unsupported proposed update type: {update.update_type}")
-
-    changed_fields = proposed_update_changed_fields(update)
-    selected = tuple(field for field in selected_fields if field in changed_fields)
-    if not selected:
-        raise EventWriteError("Select at least one changed field to apply.")
-
-    selected_set = set(selected)
-    remaining = tuple(field for field in changed_fields if field not in selected_set)
-    selected_proposed_fields = {
-        field: update.proposed_fields[field]
-        for field in selected
-        if field in update.proposed_fields
-    }
-
-    event = apply_registration_window_selected_fields(
-        update.event_id,
-        selected_proposed_fields,
-        database_url=database_url,
-    )
-    if event is None:
-        return None
-
+    ensure_database_schema(database_url)
     with session_scope(database_url) as session:
-        model = session.get(models.ProposedEventUpdate, update_id)
-        if model is None or model.status != "pending":
+        update_model = claim_pending_proposal(session, update_id)
+        if update_model is None:
             return None
+        if update_model.update_type != "registration_window":
+            raise EventWriteError(
+                f"Unsupported proposed update type: {update_model.update_type}"
+            )
+
+        update = proposed_event_update_to_record(update_model)
+        changed_fields = proposed_update_changed_fields(update)
+        selected = tuple(field for field in selected_fields if field in changed_fields)
+        if not selected:
+            raise EventWriteError("Select at least one changed field to apply.")
+
+        selected_set = set(selected)
+        remaining = tuple(field for field in changed_fields if field not in selected_set)
+        selected_proposed_fields = {
+            field: update.proposed_fields[field]
+            for field in selected
+            if field in update.proposed_fields
+        }
+
+        event_model = session.get(models.Event, update.event_id)
+        if event_model is None or event_model.removed_at is not None:
+            raise EventWriteError(f"Event not found: {update.event_id}")
+        ensure_proposal_is_current(update_model, event_model)
+        event = apply_registration_window_selected_fields_in_session(
+            session,
+            event_model,
+            selected_proposed_fields,
+        )
 
         now = utcnow()
-        model.status = "applied" if not remaining else "applied_partial"
-        model.reviewed_by_user_id = optional_text(reviewer_user_id)
-        model.reviewed_at = now
-        model.applied_at = now
+        update_model.status = "applied" if not remaining else "applied_partial"
+        update_model.reviewed_by_user_id = optional_text(reviewer_user_id)
+        update_model.reviewed_at = now
+        update_model.applied_at = now
+        release_pending_proposal_key(session, update_model.id)
 
         follow_up_model = None
         if remaining:
-            follow_up_model = models.ProposedEventUpdate(
-                event_id=update.event_id,
-                update_type=update.update_type,
-                current_fields={
-                    field: update.current_fields.get(field)
-                    for field in remaining
-                    if field in update.current_fields
-                },
-                proposed_fields={
-                    field: update.proposed_fields[field]
-                    for field in remaining
-                    if field in update.proposed_fields
-                },
-                evidence=[
-                    *update.evidence,
-                    f"Created from partial apply of update #{update.id}.",
-                ],
-                confidence=update.confidence,
-                change_summary=update.change_summary,
+            follow_up_model = create_proposed_event_update_in_session(
+                session,
+                ProposedEventUpdateCreate(
+                    event_id=update.event_id,
+                    update_type=update.update_type,
+                    current_fields={
+                        field: update.current_fields.get(field)
+                        for field in remaining
+                        if field in update.current_fields
+                    },
+                    proposed_fields={
+                        field: update.proposed_fields[field]
+                        for field in remaining
+                        if field in update.proposed_fields
+                    },
+                    evidence=(
+                        *update.evidence,
+                        f"Created from partial apply of update #{update.id}.",
+                    ),
+                    confidence=update.confidence,
+                    change_summary=update.change_summary,
+                ),
             )
-            session.add(follow_up_model)
 
         session.flush()
         return ProposedEventUpdatePartialApplyResult(
-            update=proposed_event_update_to_record(model),
+            update=proposed_event_update_to_record(update_model),
             event=event,
             follow_up_update=(
                 proposed_event_update_to_record(follow_up_model)
@@ -776,15 +918,33 @@ def reject_proposed_event_update(
 ) -> ProposedEventUpdateRecord | None:
     ensure_database_schema(database_url)
     with session_scope(database_url) as session:
-        model = session.get(models.ProposedEventUpdate, update_id)
-        if model is None or model.status != "pending":
+        model = claim_pending_proposal(session, update_id)
+        if model is None:
             return None
 
         model.status = "rejected"
         model.reviewed_by_user_id = optional_text(reviewer_user_id)
         model.reviewed_at = utcnow()
+        release_pending_proposal_key(session, model.id)
         session.flush()
         return proposed_event_update_to_record(model)
+
+
+def claim_pending_proposal(
+    session: Session,
+    update_id: int,
+) -> models.ProposedEventUpdate | None:
+    claimed = session.execute(
+        sqlalchemy_update(models.ProposedEventUpdate)
+        .where(
+            models.ProposedEventUpdate.id == update_id,
+            models.ProposedEventUpdate.status == "pending",
+        )
+        .values(status="applying")
+    )
+    if claimed.rowcount != 1:
+        return None
+    return session.get(models.ProposedEventUpdate, update_id)
 
 
 def apply_registration_window_update(
@@ -828,49 +988,88 @@ def apply_registration_window_selected_fields(
         if model is None or model.removed_at is not None:
             return None
 
-        if "registration_status" in proposed_fields:
-            model.registration_status = field_text(
-                proposed_fields.get("registration_status"),
-                fallback=model.registration_status,
-            ) or "unknown"
-        if "registration_url" in proposed_fields:
-            model.registration_url = field_text(proposed_fields.get("registration_url"))
-        if "event_date" in proposed_fields:
-            model.next_event_date = field_text(proposed_fields.get("event_date"))
-
-        needs_window = any(
-            field in proposed_fields
-            for field in (
-                "registration_status",
-                "registration_open_at",
-                "registration_open_precision",
-                "registration_close_at",
-            )
+        return apply_registration_window_selected_fields_in_session(
+            session,
+            model,
+            proposed_fields,
         )
-        if needs_window:
-            current_edition = ensure_current_edition(session, model, model.next_event_date)
-            window = current_registration_window(session, model.id, current_edition)
-            if "registration_open_at" in proposed_fields:
-                window.registration_open_at = field_text(
-                    proposed_fields.get("registration_open_at")
-                )
-            if "registration_open_precision" in proposed_fields:
-                window.registration_open_precision = (
-                    field_text(
-                        proposed_fields.get("registration_open_precision"),
-                        fallback=window.registration_open_precision,
-                    )
-                    or "unknown"
-                )
-            if "registration_close_at" in proposed_fields:
-                window.registration_close_at = field_text(
-                    proposed_fields.get("registration_close_at")
-                )
-            if "registration_status" in proposed_fields:
-                window.status = model.registration_status
-            window.approved_at = utcnow()
 
-        return event_to_domain(model)
+
+def apply_registration_window_selected_fields_in_session(
+    session: Session,
+    model: models.Event,
+    proposed_fields: dict[str, Any],
+) -> TrackedEvent:
+    registration_window = None
+    if "registration_status" in proposed_fields:
+        model.registration_status = field_text(
+            proposed_fields.get("registration_status"),
+            fallback=model.registration_status,
+        ) or "unknown"
+    if "registration_url" in proposed_fields:
+        model.registration_url = field_text(proposed_fields.get("registration_url"))
+    if "event_date" in proposed_fields:
+        model.next_event_date = field_text(proposed_fields.get("event_date"))
+
+    needs_window = any(
+        field in proposed_fields
+        for field in (
+            "registration_status",
+            "registration_open_at",
+            "registration_open_precision",
+            "registration_close_at",
+        )
+    )
+    if needs_window:
+        current_edition = ensure_current_edition(session, model, model.next_event_date)
+        registration_window = current_registration_window(session, model.id, current_edition)
+        if "registration_open_at" in proposed_fields:
+            registration_window.registration_open_at = field_text(
+                proposed_fields.get("registration_open_at")
+            )
+        if "registration_open_precision" in proposed_fields:
+            registration_window.registration_open_precision = (
+                field_text(
+                    proposed_fields.get("registration_open_precision"),
+                    fallback=registration_window.registration_open_precision,
+                )
+                or "unknown"
+            )
+        if "registration_close_at" in proposed_fields:
+            registration_window.registration_close_at = field_text(
+                proposed_fields.get("registration_close_at")
+            )
+        if "registration_status" in proposed_fields:
+            registration_window.status = model.registration_status
+        registration_window.approved_at = utcnow()
+
+    session.flush()
+    return event_to_domain(model, registration_window=registration_window)
+
+
+def ensure_proposal_is_current(
+    update: models.ProposedEventUpdate,
+    event: models.Event,
+) -> None:
+    live_event = event_to_domain(event)
+    live_fields = {
+        "registration_status": live_event.registration_status,
+        "registration_open_at": live_event.registration_open_at,
+        "registration_open_precision": live_event.registration_open_precision,
+        "registration_close_at": live_event.registration_close_at,
+        "registration_url": live_event.registration_url,
+        "event_date": live_event.event_date,
+    }
+    stale_fields = tuple(
+        field
+        for field, expected_value in dict(update.current_fields or {}).items()
+        if live_fields.get(field) != expected_value
+    )
+    if stale_fields:
+        raise EventWriteError(
+            "Proposed update is stale; live event fields changed: "
+            + ", ".join(stale_fields)
+        )
 
 
 def registration_window_apply_from_proposed_fields(
@@ -1174,22 +1373,55 @@ def ensure_current_edition(
     event: models.Event,
     event_date: str | None,
 ) -> models.EventEdition | None:
+    edition_label = event_date[:4] if event_date is not None else None
     if event.current_edition_id is not None:
         edition = session.get(models.EventEdition, event.current_edition_id)
         if edition is not None:
-            if event_date is not None:
+            if event_date is None:
+                return edition
+
+            if edition.edition_label == edition_label:
                 edition.event_date = event_date
-                edition.edition_label = event_date[:4]
-                edition.edition_year = int(event_date[:4])
-            return edition
+                edition.edition_year = int(edition_label)
+                return edition
+
+            edition.is_current = False
+            next_edition = session.scalar(
+                select(models.EventEdition).where(
+                    models.EventEdition.event_id == event.id,
+                    models.EventEdition.edition_label == edition_label,
+                )
+            )
+            if next_edition is not None:
+                next_edition.event_date = event_date
+                next_edition.edition_year = int(edition_label)
+                next_edition.status = "date_announced"
+                next_edition.is_current = True
+                event.current_edition_id = next_edition.id
+                return next_edition
 
     if event_date is None:
         return None
 
+
+    existing_edition = session.scalar(
+        select(models.EventEdition).where(
+            models.EventEdition.event_id == event.id,
+            models.EventEdition.edition_label == edition_label,
+        )
+    )
+    if existing_edition is not None:
+        existing_edition.event_date = event_date
+        existing_edition.edition_year = int(edition_label)
+        existing_edition.status = "date_announced"
+        existing_edition.is_current = True
+        event.current_edition_id = existing_edition.id
+        return existing_edition
+
     edition = models.EventEdition(
         event_id=event.id,
-        edition_year=int(event_date[:4]),
-        edition_label=event_date[:4],
+        edition_year=int(edition_label),
+        edition_label=edition_label,
         event_date=event_date,
         status="date_announced",
         is_current=True,

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import json
 import re
+import socket
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -13,6 +17,8 @@ from urllib.parse import urljoin, urlparse, urlunparse
 import httpx
 
 MAX_SNAPSHOT_TEXT_CHARS = 50_000
+MAX_RESPONSE_BYTES = 2_000_000
+MAX_REDIRECTS = 5
 DEFAULT_TIMEOUT_SECONDS = 10.0
 USER_AGENT = "run4221-bot/0.1 (+https://run4221.com)"
 LINK_DISCOVERY_TERMS = (
@@ -78,6 +84,149 @@ class PageFetchError(RuntimeError):
     pass
 
 
+type HostResolver = Callable[[str], Awaitable[tuple[str, ...]]]
+
+
+async def resolve_host_addresses(hostname: str) -> tuple[str, ...]:
+    try:
+        records = await asyncio.to_thread(
+            socket.getaddrinfo,
+            hostname,
+            None,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as error:
+        raise PageFetchError(f"Could not resolve host {hostname}: {error}") from error
+    return tuple(dict.fromkeys(record[4][0] for record in records))
+
+
+async def validate_public_http_url(
+    url: str,
+    *,
+    resolve_host: HostResolver = resolve_host_addresses,
+) -> tuple[str, ...]:
+    parsed = urlparse(url)
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+        raise PageFetchError(f"Only absolute public HTTP(S) URLs are allowed: {url}")
+    if parsed.username is not None or parsed.password is not None:
+        raise PageFetchError("URLs containing credentials are not allowed.")
+
+    hostname = parsed.hostname.rstrip(".").casefold()
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise PageFetchError(f"Private or local host is not allowed: {hostname}")
+
+    try:
+        literal_address = ipaddress.ip_address(hostname)
+    except ValueError:
+        addresses = await resolve_host(hostname)
+    else:
+        addresses = (str(literal_address),)
+
+    if not addresses:
+        raise PageFetchError(f"Host did not resolve to an address: {hostname}")
+    parsed_addresses = []
+    for address in addresses:
+        try:
+            parsed_addresses.append(ipaddress.ip_address(address))
+        except ValueError as error:
+            raise PageFetchError(
+                f"Host resolved to an invalid address: {address}"
+            ) from error
+    blocked = tuple(str(address) for address in parsed_addresses if not address.is_global)
+    if blocked:
+        raise PageFetchError(f"Private or non-public address is not allowed: {blocked[0]}")
+    return tuple(
+        str(address)
+        for address in sorted(parsed_addresses, key=lambda address: address.version)
+    )
+
+
+async def fetch_public_response(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: float,
+    resolve_host: HostResolver,
+    max_response_bytes: int,
+) -> httpx.Response:
+    current_url = url
+    for redirect_count in range(MAX_REDIRECTS + 1):
+        addresses = await validate_public_http_url(current_url, resolve_host=resolve_host)
+        original_url = httpx.URL(current_url)
+        request_headers = {**headers, "Host": original_url.netloc.decode("ascii")}
+        redirect_url = None
+        last_connect_error = None
+        for address in addresses:
+            pinned_url = original_url.copy_with(host=address)
+            try:
+                async with client.stream(
+                    "GET",
+                    pinned_url,
+                    follow_redirects=False,
+                    headers=request_headers,
+                    timeout=timeout,
+                    extensions={"sni_hostname": original_url.host},
+                ) as streamed:
+                    if streamed.is_redirect:
+                        location = streamed.headers.get("location")
+                        if not location:
+                            raise PageFetchError(
+                                f"Redirect response has no Location header: {current_url}"
+                            )
+                        if redirect_count == MAX_REDIRECTS:
+                            raise PageFetchError(f"Too many redirects while fetching {url}")
+                        redirect_url = urljoin(current_url, location)
+                        break
+
+                    content_type = streamed.headers.get("content-type")
+                    if content_type:
+                        media_type = content_type.split(";", maxsplit=1)[0].strip().casefold()
+                        if not (
+                            media_type.startswith("text/")
+                            or media_type == "application/xhtml+xml"
+                        ):
+                            raise PageFetchError(f"Unsupported page content type: {media_type}")
+
+                    declared_length = streamed.headers.get("content-length")
+                    if declared_length and declared_length.isdigit():
+                        if int(declared_length) > max_response_bytes:
+                            raise PageFetchError(
+                                f"Page exceeds the {max_response_bytes}-byte response limit."
+                            )
+
+                    content = bytearray()
+                    async for chunk in streamed.aiter_bytes():
+                        content.extend(chunk)
+                        if len(content) > max_response_bytes:
+                            raise PageFetchError(
+                                f"Page exceeds the {max_response_bytes}-byte response limit."
+                            )
+                    response_headers = httpx.Headers(
+                        (name, value)
+                        for name, value in streamed.headers.raw
+                        if name.lower() not in {b"content-encoding", b"content-length"}
+                    )
+                    return httpx.Response(
+                        status_code=streamed.status_code,
+                        headers=response_headers,
+                        content=bytes(content),
+                        request=httpx.Request("GET", original_url, headers=request_headers),
+                    )
+            except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+                last_connect_error = error
+                continue
+
+        if redirect_url is not None:
+            current_url = redirect_url
+            continue
+        if last_connect_error is not None:
+            raise last_connect_error
+        raise PageFetchError(f"Could not fetch a public address for {current_url}")
+
+    raise PageFetchError(f"Too many redirects while fetching {url}")
+
+
 def blocked_page_reason(snapshot: PageSnapshot) -> str | None:
     searchable = f"{snapshot.title or ''} {snapshot.normalized_text[:2_000]}".casefold()
     has_protection_text = any(term in searchable for term in BOT_PROTECTION_TERMS)
@@ -96,6 +245,8 @@ async def fetch_page_snapshot(
     *,
     client: httpx.AsyncClient | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    resolve_host: HostResolver = resolve_host_addresses,
+    max_response_bytes: int = MAX_RESPONSE_BYTES,
 ) -> PageSnapshot:
     headers = {
         "User-Agent": USER_AGENT,
@@ -103,20 +254,30 @@ async def fetch_page_snapshot(
     }
     try:
         if client is not None:
-            response = await client.get(
+            response = await fetch_public_response(
+                client,
                 url,
-                follow_redirects=True,
                 headers=headers,
                 timeout=timeout,
+                resolve_host=resolve_host,
+                max_response_bytes=max_response_bytes,
             )
         else:
             async with httpx.AsyncClient(
-                follow_redirects=True,
+                follow_redirects=False,
                 headers=headers,
                 timeout=timeout,
+                trust_env=False,
             ) as default_client:
-                response = await default_client.get(url)
-    except httpx.HTTPError as error:
+                response = await fetch_public_response(
+                    default_client,
+                    url,
+                    headers=headers,
+                    timeout=timeout,
+                    resolve_host=resolve_host,
+                    max_response_bytes=max_response_bytes,
+                )
+    except (httpx.HTTPError, ValueError) as error:
         raise PageFetchError(f"Could not fetch {url}: {error}") from error
 
     title, normalized_text, links = extract_response_content(response.text, str(response.url))
@@ -140,6 +301,8 @@ async def fetch_enriched_page_snapshot(
     client: httpx.AsyncClient | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     max_linked_pages: int = 3,
+    resolve_host: HostResolver = resolve_host_addresses,
+    max_response_bytes: int = MAX_RESPONSE_BYTES,
 ) -> PageSnapshot:
     if client is None:
         headers = {
@@ -147,23 +310,38 @@ async def fetch_enriched_page_snapshot(
             "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
         }
         async with httpx.AsyncClient(
-            follow_redirects=True,
+            follow_redirects=False,
             headers=headers,
             timeout=timeout,
+            trust_env=False,
         ) as default_client:
             return await fetch_enriched_page_snapshot(
                 url,
                 client=default_client,
                 timeout=timeout,
                 max_linked_pages=max_linked_pages,
+                resolve_host=resolve_host,
+                max_response_bytes=max_response_bytes,
             )
 
-    root_snapshot = await fetch_page_snapshot(url, client=client, timeout=timeout)
+    root_snapshot = await fetch_page_snapshot(
+        url,
+        client=client,
+        timeout=timeout,
+        resolve_host=resolve_host,
+        max_response_bytes=max_response_bytes,
+    )
     linked_snapshots = []
     for candidate_url in same_domain_candidate_urls(root_snapshot, max_linked_pages):
         try:
             linked_snapshots.append(
-                await fetch_page_snapshot(candidate_url, client=client, timeout=timeout)
+                await fetch_page_snapshot(
+                    candidate_url,
+                    client=client,
+                    timeout=timeout,
+                    resolve_host=resolve_host,
+                    max_response_bytes=max_response_bytes,
+                )
             )
         except PageFetchError:
             continue

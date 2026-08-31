@@ -1,7 +1,13 @@
 import pytest
+from sqlalchemy import select
 
 from run4221.db.bootstrap import initialize_database
-from run4221.db.models import RegistrationWindow
+from run4221.db.models import (
+    EventEdition,
+    PendingProposalKey,
+    ProposedEventUpdate,
+    RegistrationWindow,
+)
 from run4221.db.repository import (
     EVENT_SUGGESTION_MAX_PENDING_PER_USER,
     EVENT_SUGGESTION_MAX_PENDING_TOTAL,
@@ -12,6 +18,7 @@ from run4221.db.repository import (
     ProposedEventUpdateCreate,
     add_event,
     add_event_suggestion,
+    apply_registration_window_selected_fields,
     approve_proposed_event_update,
     archive_event,
     count_event_suggestions,
@@ -22,6 +29,7 @@ from run4221.db.repository import (
     find_event_by_url,
     get_event_suggestion,
     get_events,
+    get_proposed_event_update,
     list_archived_events,
     list_event_suggestions,
     list_events,
@@ -186,6 +194,269 @@ def test_database_approves_proposed_registration_update(tmp_path) -> None:
     assert list_proposed_event_updates(database_url=url) == ()
 
 
+def test_database_deduplicates_identical_pending_proposals(tmp_path) -> None:
+    url = database_url(tmp_path)
+    event = add_event(
+        EventCreate(
+            public_id="zurich.42",
+            name="Zurich Marathon",
+            city="Zurich",
+            country="Switzerland",
+            timezone="Europe/Zurich",
+            event_date="2027-04-18",
+            distances=("marathon",),
+            regions=("global", "eu", "ch"),
+            official_url="https://example.com/zurich-marathon",
+        ),
+        database_url=url,
+    )
+    payload = ProposedEventUpdateCreate(
+        event_id=event.id,
+        update_type="registration_window",
+        current_fields={"registration_status": "unknown"},
+        proposed_fields={"registration_status": "open"},
+        evidence=("Registration is open.",),
+        confidence=0.9,
+        change_summary="Registration opened.",
+    )
+
+    first = create_proposed_event_update(payload, database_url=url)
+    duplicate = create_proposed_event_update(payload, database_url=url)
+
+    assert duplicate.id == first.id
+    assert count_proposed_event_updates(database_url=url) == 1
+
+
+def test_database_adopts_legacy_pending_proposal_for_deduplication(tmp_path) -> None:
+    url = database_url(tmp_path)
+    event = add_event(
+        EventCreate(
+            public_id="zurich.42",
+            name="Zurich Marathon",
+            city="Zurich",
+            country="Switzerland",
+            timezone="Europe/Zurich",
+            event_date="2027-04-18",
+            distances=("marathon",),
+            regions=("global", "eu", "ch"),
+            official_url="https://example.com/zurich-marathon",
+        ),
+        database_url=url,
+    )
+    payload = ProposedEventUpdateCreate(
+        event_id=event.id,
+        update_type="registration_window",
+        current_fields={"registration_status": "unknown"},
+        proposed_fields={"registration_status": "open"},
+        evidence=("Registration is open.",),
+        confidence=0.9,
+    )
+    legacy = create_proposed_event_update(payload, database_url=url)
+    with session_scope(url) as session:
+        session.query(PendingProposalKey).delete()
+
+    duplicate = create_proposed_event_update(payload, database_url=url)
+
+    assert duplicate.id == legacy.id
+    assert count_proposed_event_updates(database_url=url) == 1
+
+
+def test_database_proposal_approval_is_idempotent(tmp_path) -> None:
+    url = database_url(tmp_path)
+    event = add_event(
+        EventCreate(
+            public_id="zurich.42",
+            name="Zurich Marathon",
+            city="Zurich",
+            country="Switzerland",
+            timezone="Europe/Zurich",
+            event_date="2027-04-18",
+            distances=("marathon",),
+            regions=("global", "eu", "ch"),
+            official_url="https://example.com/zurich-marathon",
+        ),
+        database_url=url,
+    )
+    proposal = create_proposed_event_update(
+        ProposedEventUpdateCreate(
+            event_id=event.id,
+            update_type="registration_window",
+            current_fields={"registration_status": "unknown"},
+            proposed_fields={"registration_status": "open"},
+            evidence=("Registration is open.",),
+            confidence=0.9,
+        ),
+        database_url=url,
+    )
+
+    first = approve_proposed_event_update(proposal.id, database_url=url)
+    second = approve_proposed_event_update(proposal.id, database_url=url)
+
+    assert first is not None
+    assert second is None
+    assert find_event(event.id, url).registration_status == "open"
+    with session_scope(url) as session:
+        stored = session.get(ProposedEventUpdate, proposal.id)
+        assert stored is not None
+        assert stored.status == "applied"
+
+
+def test_database_releases_deduplication_key_after_rejection(tmp_path) -> None:
+    url = database_url(tmp_path)
+    event = add_event(
+        EventCreate(
+            public_id="zurich.42",
+            name="Zurich Marathon",
+            city="Zurich",
+            country="Switzerland",
+            timezone="Europe/Zurich",
+            event_date="2027-04-18",
+            distances=("marathon",),
+            regions=("global", "eu", "ch"),
+            official_url="https://example.com/zurich-marathon",
+        ),
+        database_url=url,
+    )
+    payload = ProposedEventUpdateCreate(
+        event_id=event.id,
+        update_type="registration_window",
+        current_fields={"registration_status": "unknown"},
+        proposed_fields={"registration_status": "open"},
+        evidence=("Registration is open.",),
+        confidence=0.9,
+    )
+    first = create_proposed_event_update(payload, database_url=url)
+    assert reject_proposed_event_update(first.id, database_url=url) is not None
+
+    second = create_proposed_event_update(payload, database_url=url)
+
+    assert second.id != first.id
+
+
+def test_database_rejects_stale_proposal_without_applying_it(tmp_path) -> None:
+    url = database_url(tmp_path)
+    event = add_event(
+        EventCreate(
+            public_id="zurich.42",
+            name="Zurich Marathon",
+            city="Zurich",
+            country="Switzerland",
+            timezone="Europe/Zurich",
+            event_date="2027-04-18",
+            distances=("marathon",),
+            regions=("global", "eu", "ch"),
+            official_url="https://example.com/zurich-marathon",
+        ),
+        database_url=url,
+    )
+    proposed = create_proposed_event_update(
+        ProposedEventUpdateCreate(
+            event_id=event.id,
+            update_type="registration_window",
+            current_fields={"registration_status": "unknown"},
+            proposed_fields={"registration_status": "open"},
+            evidence=("Registration is open.",),
+            confidence=0.9,
+        ),
+        database_url=url,
+    )
+    apply_registration_window_selected_fields(
+        event.id,
+        {"registration_status": "closed"},
+        database_url=url,
+    )
+
+    with pytest.raises(EventWriteError, match="stale"):
+        approve_proposed_event_update(proposed.id, database_url=url)
+
+    assert find_event(event.id, url).registration_status == "closed"
+    assert get_proposed_event_update(
+        proposed.id,
+        status="pending",
+        database_url=url,
+    ) is not None
+
+
+def test_database_accepts_current_registration_window_fields(tmp_path) -> None:
+    url = database_url(tmp_path)
+    event = add_event(
+        EventCreate(
+            public_id="zurich.42",
+            name="Zurich Marathon",
+            city="Zurich",
+            country="Switzerland",
+            timezone="Europe/Zurich",
+            event_date="2027-04-18",
+            distances=("marathon",),
+            regions=("global", "eu", "ch"),
+            official_url="https://example.com/zurich-marathon",
+            registration_status="announced",
+            registration_open_at="2026-10-01",
+            registration_open_precision="date_only",
+        ),
+        database_url=url,
+    )
+    proposal = create_proposed_event_update(
+        ProposedEventUpdateCreate(
+            event_id=event.id,
+            update_type="registration_window",
+            current_fields={
+                "registration_status": "announced",
+                "registration_open_at": "2026-10-01",
+                "registration_open_precision": "date_only",
+            },
+            proposed_fields={"registration_status": "open"},
+            evidence=("Registration is open.",),
+            confidence=0.9,
+        ),
+        database_url=url,
+    )
+
+    result = approve_proposed_event_update(proposal.id, database_url=url)
+
+    assert result is not None
+    assert result.event.registration_status == "open"
+
+
+def test_database_keeps_proposal_pending_when_event_is_archived(tmp_path) -> None:
+    url = database_url(tmp_path)
+    event = add_event(
+        EventCreate(
+            public_id="zurich.42",
+            name="Zurich Marathon",
+            city="Zurich",
+            country="Switzerland",
+            timezone="Europe/Zurich",
+            event_date="2027-04-18",
+            distances=("marathon",),
+            regions=("global", "eu", "ch"),
+            official_url="https://example.com/zurich-marathon",
+        ),
+        database_url=url,
+    )
+    proposal = create_proposed_event_update(
+        ProposedEventUpdateCreate(
+            event_id=event.id,
+            update_type="registration_window",
+            current_fields={"registration_status": "unknown"},
+            proposed_fields={"registration_status": "open"},
+            evidence=("Registration is open.",),
+            confidence=0.9,
+        ),
+        database_url=url,
+    )
+    assert archive_event(event.id, database_url=url) is not None
+
+    with pytest.raises(EventWriteError, match="Event not found"):
+        approve_proposed_event_update(proposal.id, database_url=url)
+
+    assert get_proposed_event_update(
+        proposal.id,
+        status="pending",
+        database_url=url,
+    ) is not None
+
+
 def test_database_adds_event_with_registration_window_fields(tmp_path) -> None:
     url = database_url(tmp_path)
 
@@ -219,6 +490,75 @@ def test_database_adds_event_with_registration_window_fields(tmp_path) -> None:
     assert found.registration_open_at == "2026-10-01"
     assert found.registration_open_precision == "date_only"
     assert found.registration_close_at == "2027-03-01"
+
+
+def test_database_rolls_annual_event_into_new_edition_without_losing_history(
+    tmp_path,
+) -> None:
+    url = database_url(tmp_path)
+    event = add_event(
+        EventCreate(
+            public_id="zurich.42",
+            name="Zurich Marathon",
+            city="Zurich",
+            country="Switzerland",
+            timezone="Europe/Zurich",
+            event_date="2027-04-18",
+            distances=("marathon",),
+            regions=("global", "eu", "ch"),
+            official_url="https://example.com/zurich-marathon",
+            registration_status="announced",
+            registration_open_at="2026-10-01",
+            registration_open_precision="date_only",
+        ),
+        database_url=url,
+    )
+    with session_scope(url) as session:
+        old_edition = session.scalar(
+            select(EventEdition).where(EventEdition.event_id == event.id)
+        )
+        assert old_edition is not None
+        old_edition_id = old_edition.id
+        old_window = session.scalar(
+            select(RegistrationWindow).where(
+                RegistrationWindow.event_edition_id == old_edition_id
+            )
+        )
+        assert old_window is not None
+        old_window_id = old_window.id
+
+    updated = apply_registration_window_selected_fields(
+        event.id,
+        {
+            "event_date": "2028-04-16",
+            "registration_status": "announced",
+            "registration_open_at": "2027-10-01",
+        },
+        database_url=url,
+    )
+
+    assert updated is not None
+    assert updated.event_date == "2028-04-16"
+    assert updated.registration_open_at == "2027-10-01"
+    with session_scope(url) as session:
+        editions = session.scalars(
+            select(EventEdition)
+            .where(EventEdition.event_id == event.id)
+            .order_by(EventEdition.edition_year)
+        ).all()
+        windows = session.scalars(
+            select(RegistrationWindow)
+            .where(RegistrationWindow.event_id == event.id)
+            .order_by(RegistrationWindow.id)
+        ).all()
+
+    assert [(edition.edition_year, edition.is_current) for edition in editions] == [
+        (2027, False),
+        (2028, True),
+    ]
+    assert windows[0].id == old_window_id
+    assert windows[0].event_edition_id == old_edition_id
+    assert windows[1].event_edition_id == editions[1].id
 
 
 def test_database_rejects_proposed_registration_update(tmp_path) -> None:

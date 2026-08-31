@@ -77,6 +77,37 @@ def test_search_by_city_collection_and_distance() -> None:
     assert {event.public_id for event in copied_tag_labels} == {"berlin.21"}
 
 
+def test_search_preserves_cyrillic_and_folds_accents() -> None:
+    template = sample_seed_events()[0]
+    events = (
+        replace(
+            template,
+            id="moscow.42",
+            public_id="moscow.42",
+            name="Московский марафон",
+            city="Москва",
+            country="Россия",
+            search_keywords=(),
+        ),
+        replace(
+            template,
+            id="malaga.42",
+            public_id="malaga.42",
+            name="Maratón de Málaga",
+            city="Málaga",
+            country="Spain",
+            search_keywords=(),
+        ),
+    )
+
+    assert [event.public_id for event in search_events("Москва", events)] == [
+        "moscow.42"
+    ]
+    assert [event.public_id for event in search_events("Malaga", events)] == [
+        "malaga.42"
+    ]
+
+
 def test_search_short_region_codes_match_tokens_only() -> None:
     events = sample_seed_events()
     assert {event.public_id for event in search_events("de", events)} == {
