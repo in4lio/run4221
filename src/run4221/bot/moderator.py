@@ -22,9 +22,13 @@ from run4221.ai.registration_window import (
 )
 from run4221.bot.auth import is_moderator_account, require_moderator
 from run4221.bot.formatting import (
+    bounded_html_escape,
+    format_bounded_field_line,
     format_event_detail,
     format_field_line,
     format_major_title,
+    format_researcher_source_check,
+    parse_researcher_provenance,
 )
 from run4221.bot.keyboards import (
     dialog_keyboard,
@@ -363,6 +367,7 @@ async def start_add_event_from_suggestion_record(
         state,
         suggestion.url,
         source_suggestion_id=suggestion.id,
+        source_suggestion_note=_researcher_suggestion_evidence(suggestion),
     )
 
 
@@ -372,6 +377,7 @@ async def start_add_event_from_url(
     url: str,
     *,
     source_suggestion_id: int | None = None,
+    source_suggestion_note: str | None = None,
 ) -> None:
     await warn_existing_url_events(message, url)
 
@@ -385,6 +391,7 @@ async def start_add_event_from_url(
     state_data = draft_to_state(draft)
     if source_suggestion_id is not None:
         state_data["source_suggestion_id"] = source_suggestion_id
+        state_data["source_suggestion_note"] = source_suggestion_note
     await state.update_data(**state_data)
     await message.answer(format_draft_summary(draft))
     await state.set_state(AddEventStates.name)
@@ -751,13 +758,13 @@ async def handle_add_event_registration_close_at(message: Message, state: FSMCon
         return
 
     await state.clear()
-    if source_suggestion_id is not None:
-        await message.answer(
-            "Event added. The source suggestion was removed from the pending queue.",
-            reply_markup=remove_dialog_keyboard(),
-        )
-    else:
-        await message.answer("Event added.", reply_markup=remove_dialog_keyboard())
+    await message.answer(
+        format_event_added_confirmation(
+            from_suggestion=source_suggestion_id is not None,
+            suggestion_note=optional_string(data.get("source_suggestion_note")),
+        ),
+        reply_markup=remove_dialog_keyboard(),
+    )
     await message.answer(format_event_detail(event))
     await message.answer("Running first registration scan...")
     try:
@@ -2966,6 +2973,27 @@ def format_registration_update_result(update: RegistrationWindowUpdateResult) ->
     return "\n".join(lines)
 
 
+def _append_researcher_source_check(
+    lines: list[str],
+    evidence: str | tuple[str, ...] | list[str] | None,
+) -> None:
+    block = format_researcher_source_check(parse_researcher_provenance(evidence))
+    if block:
+        lines.extend(["", block])
+
+
+def _researcher_suggestion_evidence(suggestion) -> str | None:
+    if any(
+        (
+            suggestion.submitter_user_id,
+            suggestion.submitter_username,
+            suggestion.submitter_display_name,
+        )
+    ):
+        return None
+    return suggestion.note if parse_researcher_provenance(suggestion.note) else None
+
+
 def format_evidence_for_display(evidence: str) -> str:
     formatted = evidence.strip()
     if not formatted:
@@ -3478,6 +3506,29 @@ def suggestion_show_keyboard(
 
 
 def format_suggestion_detail(suggestion, *, sequence: int | None = None) -> str:
+    researcher_evidence = _researcher_suggestion_evidence(suggestion)
+    provenance = parse_researcher_provenance(researcher_evidence)
+    if provenance is not None:
+        lines = [
+            format_major_title(f"Suggestion {format_suggestion_handle(suggestion.id)}"),
+            "",
+            format_bounded_field_line("Name", suggestion.event_name, max_html_chars=300),
+            format_bounded_field_line(
+                "URL",
+                suggestion.url or "unknown",
+                max_html_chars=600,
+            ),
+            format_bounded_field_line(
+                "Distances",
+                format_distance_input_value(suggestion.distances),
+                kind="tag",
+                max_html_chars=200,
+            ),
+            format_field_line("From", format_submitter(suggestion)),
+        ]
+        _append_researcher_source_check(lines, researcher_evidence)
+        return "\n".join(lines)
+
     lines = [
         format_major_title(f"Suggestion {format_suggestion_handle(suggestion.id)}"),
         "",
@@ -3547,6 +3598,29 @@ def format_suggestion_reject_confirmation(suggestion, *, label: str | None = Non
     if label:
         lines.append(format_field_line("Suggestion ID", label, kind="id"))
     lines.append("This will reject the suggestion and remove it from the pending queue.")
+    _append_researcher_source_check(
+        lines,
+        _researcher_suggestion_evidence(suggestion),
+    )
+    return "\n".join(lines)
+
+
+def format_event_added_confirmation(
+    *,
+    from_suggestion: bool,
+    suggestion_note: str | None = None,
+) -> str:
+    lines = [
+        (
+            "Event added. The source suggestion was removed from the pending queue."
+            if from_suggestion
+            else "Event added."
+        )
+    ]
+    _append_researcher_source_check(
+        lines,
+        suggestion_note,
+    )
     return "\n".join(lines)
 
 
@@ -3867,6 +3941,10 @@ def format_update_partial_confirmation(
     else:
         lines.append("This will apply selected fields and close the update.")
 
+    _append_researcher_source_check(
+        lines,
+        update.evidence,
+    )
     return "\n".join(lines)
 
 
@@ -3943,6 +4021,10 @@ def format_update_review_confirmation(
         format_field_line("Type", update.update_type),
     ]
     lines.append(consequence)
+    _append_researcher_source_check(
+        lines,
+        update.evidence,
+    )
     return "\n".join(lines)
 
 
@@ -4087,6 +4169,7 @@ def proposed_update_reject_confirm_callback(
 def format_proposed_update_detail(
     update: ProposedEventUpdateRecord,
 ) -> str:
+    provenance = parse_researcher_provenance(update.evidence)
     lines = [
         format_major_title(f"Update {format_update_handle(update.id)}"),
         "",
@@ -4095,20 +4178,38 @@ def format_proposed_update_detail(
         format_field_line("Confidence", f"{update.confidence:.2f}"),
     ]
     if update.change_summary and not is_generic_update_summary(update.change_summary):
-        lines.append(format_field_line("Summary", update.change_summary))
+        if provenance is None:
+            lines.append(format_field_line("Summary", update.change_summary))
+        else:
+            lines.append(
+                format_bounded_field_line(
+                    "Summary",
+                    update.change_summary,
+                    max_html_chars=400,
+                )
+            )
 
-    changes = proposed_update_changes(update)
+    changes = proposed_update_changes(
+        update,
+        max_value_html_chars=450 if provenance is not None else None,
+    )
     if changes:
         lines.extend(["", "<b>What's changed</b>"])
         lines.extend(changes)
 
-    if update.evidence:
+    if provenance is not None:
+        _append_researcher_source_check(lines, update.evidence)
+    elif update.evidence:
         lines.extend(["", format_evidence_for_display(" ".join(update.evidence))])
 
     return "\n".join(lines)
 
 
-def proposed_update_changes(update: ProposedEventUpdateRecord) -> list[str]:
+def proposed_update_changes(
+    update: ProposedEventUpdateRecord,
+    *,
+    max_value_html_chars: int | None = None,
+) -> list[str]:
     lines = []
     for field, proposed_value in update.proposed_fields.items():
         if is_empty_proposed_update_value(proposed_value):
@@ -4120,8 +4221,18 @@ def proposed_update_changes(update: ProposedEventUpdateRecord) -> list[str]:
             "\n".join(
                 [
                     f"- <b>{escape(str(field))}</b>",
-                    f"  {format_removed_json_field_value(current_value, field=field)}",
-                    f"  {format_json_field_value(proposed_value, field=field)}",
+                    "  "
+                    + format_removed_json_field_value(
+                        current_value,
+                        field=field,
+                        max_html_chars=max_value_html_chars,
+                    ),
+                    "  "
+                    + format_json_field_value(
+                        proposed_value,
+                        field=field,
+                        max_html_chars=max_value_html_chars,
+                    ),
                 ]
             )
         )
@@ -4167,7 +4278,12 @@ def is_generic_update_summary(summary: str) -> bool:
     return summary.startswith("Registration update proposed:")
 
 
-def format_json_field_value(value: object, *, field: str) -> str:
+def format_json_field_value(
+    value: object,
+    *,
+    field: str,
+    max_html_chars: int | None = None,
+) -> str:
     if value in {None, ""}:
         raw_value = "unknown"
     elif isinstance(value, tuple | list):
@@ -4175,16 +4291,30 @@ def format_json_field_value(value: object, *, field: str) -> str:
     else:
         raw_value = str(value)
 
+    rendered_value = (
+        escape(raw_value)
+        if max_html_chars is None
+        else bounded_html_escape(raw_value, max_html_chars=max_html_chars)
+    )
     kind = field_value_kind(field)
     if kind == "id":
-        return f"<code>{escape(raw_value)}</code>"
+        return f"<code>{rendered_value}</code>"
     if kind == "tag":
-        return f"<u>{escape(raw_value)}</u>"
-    return escape(raw_value)
+        return f"<u>{rendered_value}</u>"
+    return rendered_value
 
 
-def format_removed_json_field_value(value: object, *, field: str) -> str:
-    return f"<s>{format_json_field_value(value, field=field)}</s>"
+def format_removed_json_field_value(
+    value: object,
+    *,
+    field: str,
+    max_html_chars: int | None = None,
+) -> str:
+    return (
+        "<s>"
+        f"{format_json_field_value(value, field=field, max_html_chars=max_html_chars)}"
+        "</s>"
+    )
 
 
 def format_optional_code(value: str | None) -> str:
@@ -4219,6 +4349,9 @@ def format_submitter(suggestion) -> str:
         return str(suggestion.submitter_display_name)
     if suggestion.submitter_user_id:
         return str(suggestion.submitter_user_id)
+
+    if _researcher_suggestion_evidence(suggestion):
+        return "Researcher worker"
 
     return "unknown"
 

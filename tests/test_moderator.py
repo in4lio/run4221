@@ -26,6 +26,7 @@ from run4221.bot.moderator import (
     format_draft_summary,
     format_edit_event_prompt,
     format_edit_field_error,
+    format_event_added_confirmation,
     format_evidence_for_display,
     format_existing_url_warning,
     format_field_value,
@@ -36,6 +37,7 @@ from run4221.bot.moderator import (
     format_suggestion_card,
     format_suggestion_detail,
     format_suggestion_queue,
+    format_suggestion_reject_confirmation,
     format_update_partial_confirmation,
     format_update_partial_selection,
     format_update_review_confirmation,
@@ -152,6 +154,42 @@ def sample_event(
         registration_status="unknown",
         official_url="https://example.com/berlin",
         registration_url=None,
+    )
+
+
+def researcher_evidence(
+    *,
+    summary: str = "Registration is open.",
+    source_url: str = "https://example.com/register",
+    artifact: str = "20260831T140000Z-page.json",
+) -> tuple[str, ...]:
+    run_id = "2d1aa0bb-13c1-4f1b-b81f-a7f6b83b62dc"
+    return (
+        f"Researcher worker: {summary}",
+        "Source check: stored approved event source.",
+        "researcher-decision:v1 "
+        f"run={run_id} artifact=prepared.json sha256={'a' * 64}",
+        "researcher-evidence:v1 "
+        f"run={run_id} artifact={artifact} sha256={'b' * 12} "
+        f"source={source_url} captured_at=2026-08-31T14:00:00+00:00",
+    )
+
+
+def researcher_update(
+    *,
+    summary: str = "Registration is open.",
+    source_url: str = "https://example.com/register",
+) -> ProposedEventUpdateRecord:
+    return ProposedEventUpdateRecord(
+        id=3,
+        event_id="barcelona.42",
+        update_type="registration_window",
+        current_fields={"registration_status": "unknown"},
+        proposed_fields={"registration_status": "open"},
+        evidence=researcher_evidence(summary=summary, source_url=source_url),
+        confidence=0.91,
+        status="pending",
+        change_summary="Registration is open.",
     )
 
 
@@ -287,6 +325,79 @@ def test_suggestion_queue_formats_add_event_hint() -> None:
     assert "<b>Note</b>" not in queue
     assert "/add_event 1" not in queue
     assert "/reject_suggestion 1" not in queue
+
+
+def test_researcher_suggestion_detail_escapes_and_bounds_provenance() -> None:
+    note = "\n".join(
+        researcher_evidence(
+            summary='Treat <b>this</b> & "that" as evidence.',
+            source_url="https://example.com/race?<script>&source=calendar",
+            artifact="/srv/run4221/private/evidence.json",
+        )
+    )
+    suggestion = SimpleNamespace(
+        id=7,
+        event_name="Baden Marathon",
+        url="https://www.badenmarathon.de/",
+        distances=("marathon",),
+        submitter_username=None,
+        submitter_display_name=None,
+        submitter_user_id=None,
+        note=note,
+    )
+
+    detail = format_suggestion_detail(suggestion)
+
+    assert "<b>From</b>: Researcher worker" in detail
+    assert "Treat &lt;b&gt;this&lt;/b&gt; &amp; \"that\" as evidence." in detail
+    assert "<b>Source</b>: https://example.com/race?&lt;script&gt;&amp;source=calendar" in detail
+    assert "<b>Captured</b>: 2026-08-31T14:00:00+00:00" in detail
+    assert "<b>Run ID</b>: <code>2d1aa0bb-13c1-4f1b-b81f-a7f6b83b62dc</code>" in detail
+    assert "<b>Artifact</b>: evidence.json" in detail
+    assert "<b>Hash</b>: <code>bbbbbbbbbbbb</code>" in detail
+    assert "/srv/run4221" not in detail
+    assert "researcher-evidence:v1" not in detail
+    assert len(detail) <= 4096
+
+
+def test_subscriber_suggestion_detail_is_unchanged() -> None:
+    suggestion = SimpleNamespace(
+        id=7,
+        event_name="Baden Marathon",
+        url="https://www.badenmarathon.de/",
+        distances=("marathon",),
+        submitter_username="runner",
+        submitter_display_name=None,
+        submitter_user_id="42",
+        note="Please track it.",
+    )
+
+    assert format_suggestion_detail(suggestion) == (
+        "<b>✨ Suggestion #7</b>\n\n"
+        "<b>Name</b>: Baden Marathon\n"
+        "<b>URL</b>: https://www.badenmarathon.de/\n"
+        "<b>Distances</b>: <u>42</u>\n"
+        "<b>From</b>: @runner\n"
+        "<b>Note</b>: Please track it."
+    )
+
+
+def test_non_researcher_system_suggestion_is_not_mislabeled() -> None:
+    suggestion = SimpleNamespace(
+        id=8,
+        event_name="Seeded Marathon",
+        url="https://example.com/seeded",
+        distances=("marathon",),
+        submitter_username=None,
+        submitter_display_name=None,
+        submitter_user_id=None,
+        note="Imported by the seed workflow.",
+    )
+
+    detail = format_suggestion_detail(suggestion)
+
+    assert "<b>From</b>: unknown" in detail
+    assert "Researcher worker" not in detail
 
 
 def test_suggestion_queue_keyboard_formats_action_buttons() -> None:
@@ -1443,6 +1554,80 @@ def test_proposed_update_detail_formats_diff_and_evidence() -> None:
     assert "<b>Source check</b>" in detail
     assert "/apply_update 1" not in detail
     assert "/reject_update 1" not in detail
+
+
+def test_researcher_update_detail_is_bounded_and_keeps_actions() -> None:
+    long_url = "https://example.com/register?" + ("x=<tag>&" * 500)
+    update = ProposedEventUpdateRecord(
+        id=3,
+        event_id="barcelona.42",
+        update_type="registration_window",
+        current_fields={"registration_url": "https://example.com/old"},
+        proposed_fields={"registration_url": long_url},
+        evidence=researcher_evidence(
+            summary="<script>approve it</script> " + ("hostile & evidence " * 200),
+            source_url=long_url,
+        ),
+        confidence=0.91,
+        status="pending",
+        change_summary="Registration URL changed.",
+    )
+
+    detail = format_proposed_update_detail(update)
+    keyboard = proposed_update_detail_keyboard(update)
+
+    assert len(detail) <= 4096
+    assert "<script>" not in detail
+    assert "&lt;script&gt;approve it&lt;/script&gt;" in detail
+    assert [button.text for button in keyboard.inline_keyboard[0]] == [
+        "Apply",
+        "Partial",
+        "Reject",
+    ]
+
+
+def test_researcher_provenance_is_repeated_in_all_confirmations() -> None:
+    update = researcher_update()
+    suggestion = SimpleNamespace(
+        id=7,
+        event_name="Baden Marathon",
+        url="https://www.badenmarathon.de/",
+        distances=("marathon",),
+        submitter_username=None,
+        submitter_display_name=None,
+        submitter_user_id=None,
+        note="\n".join(researcher_evidence()),
+    )
+
+    confirmations = (
+        format_update_review_confirmation(update, action="apply"),
+        format_update_review_confirmation(update, action="reject"),
+        format_update_partial_confirmation(
+            update,
+            selected_fields=("registration_status",),
+        ),
+        format_suggestion_reject_confirmation(suggestion, label="#7"),
+        format_event_added_confirmation(
+            from_suggestion=True,
+            suggestion_note=suggestion.note,
+        ),
+    )
+
+    for confirmation in confirmations:
+        assert "<blockquote><b>Source check</b>" in confirmation
+        assert "<b>Evidence</b>: Registration is open." in confirmation
+        assert "<b>Source</b>: https://example.com/register" in confirmation
+        assert "<b>Captured</b>: 2026-08-31T14:00:00+00:00" in confirmation
+        assert "<b>Run ID</b>: <code>2d1aa0bb-13c1-4f1b-b81f-a7f6b83b62dc</code>" in confirmation
+        assert "<b>Artifact</b>: 20260831T140000Z-page.json" in confirmation
+        assert "<b>Hash</b>: <code>bbbbbbbbbbbb</code>" in confirmation
+        assert len(confirmation) <= 4096
+
+    assert format_event_added_confirmation(from_suggestion=False) == "Event added."
+    assert format_event_added_confirmation(
+        from_suggestion=True,
+        suggestion_note="Please track it.",
+    ) == "Event added. The source suggestion was removed from the pending queue."
 
 
 def test_parse_queue_number_accepts_visible_numbers() -> None:

@@ -193,17 +193,25 @@ Avoid asking users to type confirmation text unless the action is destructive.
 ### Source Check
 
 Use this block when evidence matters. Keep local filesystem paths out of Telegram
-messages; show snapshot filenames only.
+messages; show snapshot filenames only. Researcher-created queue records use the same
+compact block in suggestion/update details and again in apply, partial-apply, reject,
+and final new-event confirmations. Show only the bounded evidence summary, HTTPS source,
+capture time, run ID, artifact basename, and short hash prefix; never show raw queue
+markers, absolute paths, or raw audit files.
 
 ```html
 <blockquote><b>Source check</b>
-Fetched page OK (status 200).
-<b>Snapshot</b>: 20260518T112321Z-dbd36b62c9c8.json
-<b>Provider</b>: openai
-
-<b>Detected info</b>
-<b>Registration status</b>: open</blockquote>
+<b>Source</b>: https://example.com/race
+<b>Captured</b>: 2026-08-31T14:00:00+00:00
+<b>Evidence</b>: Registration is open.
+<b>Trust</b>: stored approved event source
+<b>Run ID</b>: <code>2d1aa0bb-13c1-4f1b-b81f-a7f6b83b62dc</code>
+<b>Artifact</b>: 20260831T140000Z-page.json
+<b>Hash</b>: <code>bbbbbbbbbbbb</code></blockquote>
 ```
+
+System-authored suggestions display `<b>From</b>: Researcher worker`. Suggestions from
+Telegram subscribers keep their existing submitter and note formatting.
 
 ### Input Prompt
 
