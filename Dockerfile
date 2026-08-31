@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS static-runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -22,4 +22,12 @@ RUN uv sync --frozen --no-dev
 
 RUN mkdir -p /app/data/page_snapshots
 
+FROM static-runtime AS bot
+
 CMD ["uv", "run", "python", "-m", "run4221"]
+
+FROM static-runtime AS researcher
+
+RUN uv sync --frozen --no-dev --extra researcher
+
+CMD ["uv", "run", "run4221-researcher", "--loop"]

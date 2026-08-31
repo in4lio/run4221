@@ -31,9 +31,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          uv sync --frozen --extra dev
+          uv sync --frozen --extra dev --extra researcher
           uv run ruff check
           uv run pytest
+          docker compose config --quiet
 
       - name: Configure SSH
         shell: bash
@@ -59,6 +60,17 @@ jobs:
           set -euo pipefail
           cd "$APP_DIR"
           previous_sha="$(git rev-parse HEAD)"
+          previous_services="$(docker compose config --services 2>/dev/null || true)"
+          previous_bot_container="$(docker compose ps -q bot 2>/dev/null || true)"
+          previous_researcher_container="$(docker compose ps -q researcher 2>/dev/null || true)"
+          previous_bot_image=""
+          previous_researcher_image=""
+          if [[ -n "$previous_bot_container" ]]; then
+            previous_bot_image="$(docker inspect --format '{{.Image}}' "$previous_bot_container")"
+          fi
+          if [[ -n "$previous_researcher_container" ]]; then
+            previous_researcher_image="$(docker inspect --format '{{.Image}}' "$previous_researcher_container")"
+          fi
           service_replaced=false
           rollback() {
             status="$?"
@@ -66,9 +78,14 @@ jobs:
             git checkout --detach "$previous_sha"
             git reset --hard "$previous_sha"
             if [[ "$service_replaced" == "true" ]]; then
-              docker compose up -d --build --remove-orphans --wait --wait-timeout 90
-            else
-              docker compose build bot
+              if [[ -n "$previous_bot_image" ]]; then
+                docker image tag "$previous_bot_image" run4221-bot:latest
+              fi
+              if [[ -n "$previous_researcher_image" ]] \
+                && grep -qx researcher <<<"$previous_services"; then
+                docker image tag "$previous_researcher_image" run4221-researcher:latest
+              fi
+              docker compose up -d --no-build --remove-orphans --wait --wait-timeout 90
             fi
             docker compose ps
             exit "$status"
@@ -77,10 +94,21 @@ jobs:
           git fetch --prune --tags origin '+refs/heads/*:refs/remotes/origin/*'
           git checkout --detach "$DEPLOY_SHA"
           git reset --hard "$DEPLOY_SHA"
+          docker compose config --quiet
           docker compose run --rm --build bot uv run python -m run4221.health
+          docker compose run --rm --build --no-deps researcher \
+            uv run run4221-researcher --check-config
+          docker compose run --rm --no-deps researcher uv run python -c \
+            'from run4221.researcher.config import ResearcherSettings; s = ResearcherSettings(); assert not s.enabled and not s.discovery_enabled and not s.rendering_enabled, "researcher must deploy ready-paused"'
           service_replaced=true
+          docker compose stop researcher
+          docker compose up -d --build --no-deps --wait --wait-timeout 90 bot
+          docker compose exec -T bot uv run python -m run4221.health
           docker compose up -d --build --remove-orphans --wait --wait-timeout 90
           docker compose ps
           docker compose exec -T bot uv run python -m run4221.health
+          docker compose exec -T researcher uv run python -m run4221.researcher.health
+          docker compose exec -T researcher uv run python -c \
+            'import json; state = json.load(open("data/researcher_health.json", encoding="utf-8")); assert state["mode"] == "paused" and state["activity"] == "idle"; print("researcher_consecutive_failures=" + str(state["consecutive_failures"]))'
           trap - ERR
           REMOTE
