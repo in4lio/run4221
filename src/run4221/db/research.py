@@ -27,8 +27,8 @@ from run4221.db.repository import (
 )
 from run4221.db.session import run_serialized_transaction, session_scope
 from run4221.events import TrackedEvent, normalize_event_id
+from run4221.researcher.schemas import RESEARCHER_MAX_PENDING_SUGGESTIONS
 
-RESEARCHER_MAX_PENDING_SUGGESTIONS = 20
 RESEARCHER_DEFAULT_MAX_PENDING_UPDATES = 50
 _ACTIVE_PROPOSAL_STATUSES = ("pending", "applying")
 
@@ -42,9 +42,6 @@ class ResearchSourceRecord:
     source_id: int
     event: TrackedEvent
     url: str
-    source_type: str
-    priority: int
-    last_checked_at: datetime | None
 
 
 @dataclass(frozen=True)
@@ -102,9 +99,6 @@ def list_due_sources(
                 source_id=source.id,
                 event=events_by_id[source.event_id],
                 url=source.url,
-                source_type=source.source_type,
-                priority=source.priority,
-                last_checked_at=source.last_checked_at,
             )
             for source in sources
         )
@@ -140,9 +134,6 @@ def get_research_source(
             source_id=source.id,
             event=event_to_domain(event),
             url=source.url,
-            source_type=source.source_type,
-            priority=source.priority,
-            last_checked_at=source.last_checked_at,
         )
 
 

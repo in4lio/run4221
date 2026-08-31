@@ -290,6 +290,7 @@ class ResearcherService:
         registry_captures: dict[str, CapturedPage] = {}
         pages_captured = 0
         skipped_reasons: list[str] = []
+        no_change_reasons: list[str] = []
         for candidate in scout.candidates[: self.budget.max_candidates_per_cycle]:
             if pages_captured >= self.budget.max_static_pages_per_job:
                 return self._finish_without_queue(
@@ -357,17 +358,15 @@ class ResearcherService:
                 return self._finish_agent_outcome(run_id, candidate.source_url, assessment)
             decision = assessment.decision
             required_references = tuple(item.reference for item in evidence)
+            if decision.action is DecisionAction.NO_CHANGE:
+                no_change_reasons.append(decision.summary)
+                continue
             if decision.action is not DecisionAction.SUGGEST_EVENT or decision.candidate is None:
-                outcome = (
-                    RunOutcome.NO_CHANGE
-                    if decision.action is DecisionAction.NO_CHANGE
-                    else RunOutcome.INCONCLUSIVE
-                )
                 return self._finish_without_queue(
                     run_id,
                     candidate.source_url,
-                    RunState.SUCCEEDED if outcome is RunOutcome.NO_CHANGE else RunState.SKIPPED,
-                    outcome,
+                    RunState.SKIPPED,
+                    RunOutcome.INCONCLUSIVE,
                     decision.summary,
                 )
             if not self._valid_evidence(decision, required=required_references):
@@ -472,6 +471,14 @@ class ResearcherService:
                 queue_reference=queue_reference,
             )
 
+        if no_change_reasons:
+            return self._finish_without_queue(
+                run_id,
+                scout.candidates[0].source_url,
+                RunState.SUCCEEDED,
+                RunOutcome.NO_CHANGE,
+                "; ".join(no_change_reasons)[:1_000],
+            )
         return self._finish_without_queue(
             run_id,
             scout.candidates[0].source_url,
@@ -527,7 +534,7 @@ class ResearcherService:
             return False
         required_set = set(required)
         decision_set = set(decision.evidence)
-        if not required_set.issubset(decision_set) or not decision_set.issubset(required_set):
+        if required_set != decision_set:
             return False
         try:
             for reference in decision.evidence:

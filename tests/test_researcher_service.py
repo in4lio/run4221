@@ -219,6 +219,43 @@ def test_ae2_discovery_creates_system_suggestion_and_no_event(tmp_path: Path) ->
     assert "captured_at=2026-08-31T14:00:00+00:00" in suggestions[0].note
 
 
+def test_discovery_continues_after_no_change_candidate(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    candidates = tuple(
+        ResearchCandidate(
+            source_url=f"https://official.example/{slug}",
+            title=f"Search result {slug}",
+            snippet="Possible event page.",
+        )
+        for slug in ("existing-event", "new-event")
+    )
+
+    def decide(request) -> ResearchDecision:
+        if request.evidence[0].final_url.endswith("/existing-event"):
+            return ResearchDecision(
+                action="no_change",
+                summary="The first candidate is already represented.",
+            )
+        return discovery_decision(request)
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url)
+
+    agent = FakeAgent(candidates=candidates, decide=decide)
+    result = asyncio.run(
+        service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=fetch,
+        ).discover("Germany marathon 2027")
+    )
+
+    assert result.status.outcome == "suggestion_created"
+    assert len(agent.assessment_calls) == 2
+    assert list_event_suggestions(database_url=url)[0].url == candidates[1].source_url
+
+
 def test_shadow_mode_audits_supported_finding_without_queue_write(tmp_path: Path) -> None:
     url = database_url(tmp_path)
     source = tracked_source(url)

@@ -19,7 +19,8 @@ def test_idle_states_are_healthy_and_failed_jobs_remain_visible(tmp_path: Path) 
     check_researcher_health(path, now=NOW, stale_after_seconds=60)
 
     store.set_idle(enabled=True)
-    store.start_job("pending:refresh")
+    active = store.start_job()
+    assert active.current_run_id is None
     store.finish_job("failed:inconclusive", failed=True)
 
     state = store.read()
@@ -34,7 +35,7 @@ def test_stale_active_work_is_unhealthy_but_progress_recovers(tmp_path: Path) ->
     path = tmp_path / "researcher-health.json"
     store = HealthStore(path, now=lambda: NOW)
     store.initialize(enabled=True)
-    store.start_job("pending:discovery")
+    store.start_job()
 
     with pytest.raises(RuntimeError, match="stale"):
         check_researcher_health(
@@ -57,9 +58,9 @@ def test_health_replacement_is_atomic_and_success_resets_failures(tmp_path: Path
     path = tmp_path / "researcher-health.json"
     store = HealthStore(path, now=lambda: NOW)
     store.initialize(enabled=True)
-    store.start_job("first")
+    store.start_job()
     store.finish_job("failed:inconclusive", failed=True)
-    store.start_job("second")
+    store.start_job()
     store.finish_job("succeeded:no_change", failed=False)
 
     assert store.read().consecutive_failures == 0

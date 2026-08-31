@@ -43,6 +43,7 @@ def test_researcher_settings_have_safe_independent_defaults() -> None:
         ({"openai_api_key": None}, "openai_api_key"),
         ({"interval_seconds": 0}, "interval_seconds"),
         ({"max_agent_turns_per_job": 0}, "max_agent_turns_per_job"),
+        ({"max_pending_suggestions": 21}, "max_pending_suggestions"),
     ],
 )
 def test_researcher_settings_reject_invalid_configuration_without_revealing_key(

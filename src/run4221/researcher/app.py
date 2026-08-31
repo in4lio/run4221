@@ -54,11 +54,6 @@ class CheckedConfig:
     budget: ResearchBudget
     trust_policy: SourceTrustPolicy
 
-    @property
-    def prompt_key(self) -> str:
-        return self.prompt.prompt_key
-
-
 @dataclass(frozen=True)
 class JobExecution:
     result: ResearchJobResult
@@ -74,7 +69,7 @@ class CycleResult:
 class ServiceFactory(Protocol):
     def __call__(
         self,
-        read_only: bool,
+        shadow: bool,
         on_run_started: Callable[[str], None],
     ) -> ResearcherService: ...
 
@@ -94,7 +89,7 @@ class DiscoverySchedule:
         normalized = _normalize_query(query)
         if not normalized:
             raise ValueError("Discovery query cannot be empty.")
-        query_hash = hashlib.sha256(normalized.casefold().encode()).hexdigest()
+        query_hash = _query_hash(normalized)
         window = at.astimezone(UTC).date().isoformat()
         payload = self._read()
         claims = payload["claims"]
@@ -293,7 +288,7 @@ class ResearcherWorker:
         shadow: bool,
         invoke: Callable[[ResearcherService], Awaitable[ResearchJobResult]],
     ) -> JobExecution:
-        self.health.start_job(label)
+        self.health.start_job()
         announced_run_id: str | None = None
 
         def on_run_started(run_id: str) -> None:
@@ -367,7 +362,7 @@ class ResearcherWorker:
 
     def _default_service_factory(
         self,
-        read_only: bool,
+        shadow: bool,
         on_run_started: Callable[[str], None],
     ) -> ResearcherService:
         checked = self.checked or check_config(self.settings)
@@ -384,12 +379,12 @@ class ResearcherWorker:
             agent=ResearchAgentJob(
                 instructions=checked.prompt.content,
                 prompt_reference=prompt_reference,
-                budget=self.settings.budget,
-                model=self.settings.model,
+                budget=checked.budget,
+                model=checked.model,
             ),
             trust_policy=checked.trust_policy,
-            budget=self.settings.budget,
-            persist_queue=not read_only,
+            budget=checked.budget,
+            persist_queue=not shadow,
             on_run_started=on_run_started,
         )
 
