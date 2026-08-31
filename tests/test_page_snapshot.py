@@ -1,16 +1,23 @@
 import asyncio
 import gzip
 import json
+from datetime import UTC, datetime
 
 import httpx
 import pytest
 
 from run4221.ingestion.page_snapshot import (
     PageFetchError,
+    PageLink,
+    PageSnapshot,
     fetch_enriched_page_snapshot,
     fetch_page_snapshot,
+    merge_page_snapshots,
     store_page_snapshot,
 )
+from run4221.researcher.artifacts import ResearchArtifactStore
+
+MAX_EXPECTED_SNAPSHOT_LINKS = 100
 
 
 def run(coro):
@@ -62,6 +69,164 @@ def test_fetch_page_snapshot_extracts_text_title_links_and_hash() -> None:
     assert len(snapshot.text_hash) == 64
     assert snapshot.links[0].url == "https://example.com/register"
     assert snapshot.links[0].text == "Register now"
+
+
+def test_fetch_page_snapshot_caps_links_for_bounded_audit() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        links = "".join(
+            f'<a href="/event-{index}">Event {index}</a>'
+            for index in range(MAX_EXPECTED_SNAPSHOT_LINKS + 1)
+        )
+        return httpx.Response(200, text=links, request=request)
+
+    async def fetch():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_page_snapshot(
+                "https://example.com/events",
+                client=client,
+                resolve_host=public_resolver,
+            )
+
+    snapshot = run(fetch())
+
+    assert len(snapshot.links) == MAX_EXPECTED_SNAPSHOT_LINKS
+    assert snapshot.links[-1].url == "https://example.com/event-99"
+
+
+def test_fetch_page_snapshot_keeps_late_registration_link_within_cap() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        links = "".join(
+            f'<a href="/info-{index}">Info {index}</a>'
+            for index in range(MAX_EXPECTED_SNAPSHOT_LINKS)
+        )
+        links += '<a href="/register">Register now</a>'
+        return httpx.Response(200, text=links, request=request)
+
+    async def fetch():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_page_snapshot(
+                "https://example.com/events",
+                client=client,
+                resolve_host=public_resolver,
+            )
+
+    snapshot = run(fetch())
+
+    assert len(snapshot.links) == MAX_EXPECTED_SNAPSHOT_LINKS
+    assert snapshot.links[0].url == "https://example.com/register"
+    assert all(link.url != "https://example.com/info-99" for link in snapshot.links)
+
+
+def test_fetch_page_snapshot_deduplicates_before_link_cap() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        links = '<a href="/about">About</a>' * MAX_EXPECTED_SNAPSHOT_LINKS
+        links += '<a href="/register">Register now</a>'
+        return httpx.Response(200, text=links, request=request)
+
+    async def fetch():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_page_snapshot(
+                "https://example.com/events",
+                client=client,
+                resolve_host=public_resolver,
+            )
+
+    snapshot = run(fetch())
+
+    assert [link.url for link in snapshot.links] == [
+        "https://example.com/register",
+        "https://example.com/about",
+    ]
+
+
+def test_fetched_capped_snapshot_is_accepted_by_audit_store(tmp_path) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        links = "".join(
+            f'<a href="/event-{index}">Event {index}</a>'
+            for index in range(MAX_EXPECTED_SNAPSHOT_LINKS + 1)
+        )
+        return httpx.Response(200, text=links, request=request)
+
+    async def fetch():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_page_snapshot(
+                "https://example.com/events",
+                client=client,
+                resolve_host=public_resolver,
+            )
+
+    snapshot = run(fetch())
+    store = ResearchArtifactStore(tmp_path)
+    run_id = store.create_run(job_type="refresh")
+
+    reference = store.write_page_snapshot(run_id, snapshot)
+
+    payload = store.read_artifact(reference)
+    assert len(payload["content"]["links"]) == MAX_EXPECTED_SNAPSHOT_LINKS
+
+
+def test_merge_page_snapshots_caps_combined_links_for_bounded_audit() -> None:
+    fetched_at = datetime(2026, 8, 31, 12, 0, tzinfo=UTC)
+    root = PageSnapshot(
+        source_url="https://example.com/events",
+        final_url="https://example.com/events",
+        fetched_at=fetched_at,
+        status_code=200,
+        content_type="text/html",
+        title="Events",
+        normalized_text="Events",
+        text_hash="a" * 64,
+        links=tuple(
+            PageLink(url=f"https://example.com/root-{index}", text=f"Root {index}")
+            for index in range(75)
+        ),
+    )
+    linked = PageSnapshot(
+        source_url="https://example.com/register",
+        final_url="https://example.com/register",
+        fetched_at=fetched_at,
+        status_code=200,
+        content_type="text/html",
+        title="Registration",
+        normalized_text="Registration",
+        text_hash="b" * 64,
+        links=tuple(
+            PageLink(url=f"https://example.com/linked-{index}", text=f"Linked {index}")
+            for index in range(75)
+        ),
+    )
+
+    merged = merge_page_snapshots(root, (linked,))
+
+    assert len(merged.links) == MAX_EXPECTED_SNAPSHOT_LINKS
+    assert merged.links[-1].url == "https://example.com/linked-24"
+
+
+def test_merge_page_snapshots_caps_oversized_root_without_linked_pages() -> None:
+    fetched_at = datetime(2026, 8, 31, 12, 0, tzinfo=UTC)
+    root = PageSnapshot(
+        source_url="https://example.com/events",
+        final_url="https://example.com/events",
+        fetched_at=fetched_at,
+        status_code=200,
+        content_type="text/html",
+        title="Events",
+        normalized_text="Events",
+        text_hash="a" * 64,
+        links=tuple(
+            PageLink(url=f"https://example.com/root-{index}", text=f"Root {index}")
+            for index in range(MAX_EXPECTED_SNAPSHOT_LINKS + 1)
+        ),
+    )
+
+    merged = merge_page_snapshots(root, ())
+
+    assert len(merged.links) == MAX_EXPECTED_SNAPSHOT_LINKS
+    assert merged.links[-1].url == "https://example.com/root-99"
 
 
 def test_store_page_snapshot_writes_json(tmp_path) -> None:
