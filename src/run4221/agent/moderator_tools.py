@@ -5,11 +5,15 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from run4221.ai.event_extractor import extract_event_draft_from_url
+from run4221.ai.extraction_provider import ExtractorProvider
+from run4221.ai.provider_factory import ExtractorProviderConfigError, get_extractor_provider
 from run4221.ai.registration_window import update_registration_window
+from run4221.config import get_settings
 from run4221.db.repository import (
     EventCreate,
     EventUpdate,
     EventWriteError,
+    add_event_from_suggestion,
     approve_proposed_event_update,
     count_event_suggestions,
     count_proposed_event_updates,
@@ -130,9 +134,11 @@ class ModeratorAgentTools:
         *,
         database_url: str | None = None,
         delete_confirmation_code: str | None = None,
+        extractor_provider: ExtractorProvider | None = None,
     ) -> None:
         self.database_url = database_url
         self.delete_confirmation_code = delete_confirmation_code
+        self.extractor_provider = extractor_provider
 
     def tool_specs(self) -> tuple[JsonObject, ...]:
         return moderator_agent_tool_specs()
@@ -194,7 +200,7 @@ class ModeratorAgentTools:
         return AgentToolResult.success([serialize_event(event) for event in events])
 
     def search_events(self, query: str, *, limit: int = 10) -> AgentToolResult:
-        events = search_events(query, limit=limit, database_url=self.database_url)
+        events = search_events(query, database_url=self.database_url)[:limit]
         return AgentToolResult.success([serialize_event(event) for event in events])
 
     def show_event(self, event_id: str) -> AgentToolResult:
@@ -205,7 +211,15 @@ class ModeratorAgentTools:
 
     async def discover_event_profile(self, url: str) -> AgentToolResult:
         try:
-            draft = await extract_event_draft_from_url(url)
+            provider = self.extractor_provider
+            if provider is None:
+                settings = get_settings()
+                if self.database_url is not None:
+                    settings = settings.model_copy(update={"database_url": self.database_url})
+                provider = get_extractor_provider(settings)
+            draft = await extract_event_draft_from_url(url, extractor_provider=provider)
+        except ExtractorProviderConfigError as error:
+            return AgentToolResult.failure(f"Extractor provider is not configured: {error}")
         except Exception as error:
             return AgentToolResult.failure(f"Could not discover event profile: {error}")
         return AgentToolResult.success(serialize_dataclass(draft))
@@ -217,11 +231,13 @@ class ModeratorAgentTools:
         source_suggestion_id: int | None = None,
     ) -> AgentToolResult:
         try:
-            event = repo_add_event(event_create_from_fields(fields), self.database_url)
-            if source_suggestion_id is not None:
-                update_event_suggestion_status(
+            event_create = event_create_from_fields(fields)
+            if source_suggestion_id is None:
+                event = repo_add_event(event_create, self.database_url)
+            else:
+                event = add_event_from_suggestion(
+                    event_create,
                     source_suggestion_id,
-                    "converted",
                     database_url=self.database_url,
                 )
         except (EventWriteError, KeyError, TypeError, ValueError) as error:
@@ -469,10 +485,12 @@ def create_moderator_agent_tools(
     *,
     database_url: str | None = None,
     delete_confirmation_code: str | None = None,
+    extractor_provider: ExtractorProvider | None = None,
 ) -> ModeratorAgentTools:
     return ModeratorAgentTools(
         database_url=database_url,
         delete_confirmation_code=delete_confirmation_code,
+        extractor_provider=extractor_provider,
     )
 
 

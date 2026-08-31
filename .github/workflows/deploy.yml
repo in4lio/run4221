@@ -7,7 +7,7 @@ on:
       - "v*"
 
 concurrency:
-  group: production-deploy
+  group: production-mutation
   cancel-in-progress: false
 
 jobs:
@@ -19,6 +19,22 @@ jobs:
       contents: read
 
     steps:
+      - name: Checkout selected commit
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify selected commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --frozen --extra dev
+          uv run ruff check
+          uv run pytest
+
       - name: Configure SSH
         shell: bash
         run: |
@@ -42,9 +58,22 @@ jobs:
             "DEPLOY_SHA='${{ github.sha }}' APP_DIR='${{ secrets.VPS_APP_DIR }}' bash -s" <<'REMOTE'
           set -euo pipefail
           cd "$APP_DIR"
+          previous_sha="$(git rev-parse HEAD)"
+          rollback() {
+            status="$?"
+            trap - ERR
+            git checkout --detach "$previous_sha"
+            git reset --hard "$previous_sha"
+            docker compose up -d --build --remove-orphans --wait --wait-timeout 90
+            docker compose ps
+            exit "$status"
+          }
+          trap rollback ERR
           git fetch --prune --tags origin '+refs/heads/*:refs/remotes/origin/*'
           git checkout --detach "$DEPLOY_SHA"
           git reset --hard "$DEPLOY_SHA"
-          docker compose up -d --build --remove-orphans
+          docker compose up -d --build --remove-orphans --wait --wait-timeout 90
           docker compose ps
+          docker compose exec -T bot uv run python -m run4221.health
+          trap - ERR
           REMOTE

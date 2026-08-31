@@ -23,7 +23,7 @@ on:
         type: string
 
 concurrency:
-  group: production-bootstrap
+  group: production-mutation
   cancel-in-progress: false
 
 jobs:
@@ -38,9 +38,11 @@ jobs:
       - name: Validate reset confirmation
         if: ${{ inputs.action == 'reset-and-seed-suggestions' }}
         shell: bash
+        env:
+          CONFIRM_RESET: ${{ inputs.confirm_reset }}
         run: |
           set -euo pipefail
-          if [[ "${{ inputs.confirm_reset }}" != "RESET_SUGGESTION_BOOTSTRAP" ]]; then
+          if [[ "$CONFIRM_RESET" != "RESET_SUGGESTION_BOOTSTRAP" ]]; then
             echo "reset-and-seed-suggestions requires confirm_reset=RESET_SUGGESTION_BOOTSTRAP"
             exit 1
           fi
@@ -104,7 +106,7 @@ jobs:
             bot uv run python -m run4221.db.seed_prompts \
               --prompts-dir private/prompts \
               --database-url sqlite:///data/run4221.sqlite3
-          docker compose up -d
+          docker compose up -d --wait --wait-timeout 90
           docker compose ps
           REMOTE
 
@@ -129,6 +131,6 @@ jobs:
               --database-url sqlite:///data/run4221.sqlite3 \
               --reset-sqlite \
               --confirm-reset RESET_SUGGESTION_BOOTSTRAP
-          docker compose up -d --build --remove-orphans
+          docker compose up -d --build --remove-orphans --wait --wait-timeout 90
           docker compose ps
           REMOTE

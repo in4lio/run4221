@@ -1,7 +1,7 @@
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import SecretStr
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 type ModeratorAccounts = tuple[tuple[int, ...], tuple[str, ...]]
@@ -33,8 +33,7 @@ class Settings(BaseSettings):
     openai_api_key: SecretStr | None = None
     openai_extract_model: str = "gpt-5.4-mini"
 
-    @property
-    def moderator_accounts(self) -> ModeratorAccounts:
+    def configured_moderator_accounts(self) -> ModeratorAccounts:
         combined = ",".join(
             value
             for value in (
@@ -44,7 +43,22 @@ class Settings(BaseSettings):
             )
             if value.strip()
         )
-        return parse_moderator_accounts(combined)
+        ids, usernames = parse_moderator_accounts(combined)
+        if usernames:
+            raise ValueError(
+                "Telegram moderator authorization requires immutable numeric user IDs; "
+                "usernames are not accepted. Configure TELEGRAM_MODERATOR_IDS."
+            )
+        return ids, ()
+
+    @model_validator(mode="after")
+    def validate_moderator_accounts(self) -> Self:
+        self.configured_moderator_accounts()
+        return self
+
+    @property
+    def moderator_accounts(self) -> ModeratorAccounts:
+        return self.configured_moderator_accounts()
 
     @property
     def moderator_ids(self) -> tuple[int, ...]:

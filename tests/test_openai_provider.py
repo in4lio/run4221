@@ -130,6 +130,7 @@ def test_openai_provider_parses_structured_response() -> None:
 
 def test_provider_factory_defaults_to_heuristic() -> None:
     settings = Settings(
+        _env_file=None,
         telegram_bot_token="test",
         ai_extractor_provider="heuristic",
         openai_api_key=None,
@@ -140,6 +141,7 @@ def test_provider_factory_defaults_to_heuristic() -> None:
 
 def test_provider_factory_requires_openai_api_key(tmp_path) -> None:
     settings = Settings(
+        _env_file=None,
         telegram_bot_token="test",
         database_url=database_url(tmp_path),
         ai_extractor_provider="openai",
@@ -152,6 +154,7 @@ def test_provider_factory_requires_openai_api_key(tmp_path) -> None:
 
 def test_provider_factory_requires_prompt_file_by_default(tmp_path) -> None:
     settings = Settings(
+        _env_file=None,
         telegram_bot_token="test",
         database_url=database_url(tmp_path),
         ai_extractor_provider="openai",
@@ -165,6 +168,7 @@ def test_provider_factory_requires_prompt_file_by_default(tmp_path) -> None:
 
 def test_provider_factory_requires_active_db_prompt_when_configured(tmp_path) -> None:
     settings = Settings(
+        _env_file=None,
         telegram_bot_token="test",
         database_url=database_url(tmp_path),
         ai_extractor_provider="openai",
@@ -184,6 +188,7 @@ def test_provider_factory_builds_openai_provider_from_db_prompt(tmp_path) -> Non
         database_url=url,
     )
     settings = Settings(
+        _env_file=None,
         telegram_bot_token="test",
         database_url=url,
         ai_extractor_provider="openai",
@@ -207,6 +212,7 @@ def test_provider_factory_builds_openai_provider_from_file_prompt(tmp_path) -> N
         encoding="utf-8",
     )
     settings = Settings(
+        _env_file=None,
         telegram_bot_token="test",
         database_url=database_url(tmp_path),
         ai_extractor_provider="openai",

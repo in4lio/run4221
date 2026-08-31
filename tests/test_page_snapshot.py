@@ -1,9 +1,12 @@
 import asyncio
+import gzip
 import json
 
 import httpx
+import pytest
 
 from run4221.ingestion.page_snapshot import (
+    PageFetchError,
     fetch_enriched_page_snapshot,
     fetch_page_snapshot,
     store_page_snapshot,
@@ -12,6 +15,10 @@ from run4221.ingestion.page_snapshot import (
 
 def run(coro):
     return asyncio.run(coro)
+
+
+async def public_resolver(_hostname: str) -> tuple[str, ...]:
+    return ("93.184.216.34",)
 
 
 def test_fetch_page_snapshot_extracts_text_title_links_and_hash() -> None:
@@ -38,7 +45,11 @@ def test_fetch_page_snapshot_extracts_text_title_links_and_hash() -> None:
     async def fetch():
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            return await fetch_page_snapshot("https://example.com/event", client=client)
+            return await fetch_page_snapshot(
+                "https://example.com/event",
+                client=client,
+                resolve_host=public_resolver,
+            )
 
     snapshot = run(fetch())
 
@@ -60,7 +71,11 @@ def test_store_page_snapshot_writes_json(tmp_path) -> None:
     async def fetch():
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            return await fetch_page_snapshot("https://example.com", client=client)
+            return await fetch_page_snapshot(
+                "https://example.com",
+                client=client,
+                resolve_host=public_resolver,
+            )
 
     snapshot = run(fetch())
     path = store_page_snapshot(snapshot, tmp_path)
@@ -76,7 +91,8 @@ def test_fetch_enriched_page_snapshot_fetches_same_domain_registration_page() ->
     seen_urls: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        seen_urls.append(str(request.url))
+        seen_urls.append(f"https://{request.headers['host']}{request.url.path}")
+        assert request.url.host == "93.184.216.34"
         if request.url.path == "/":
             html = """
             <html>
@@ -107,7 +123,11 @@ def test_fetch_enriched_page_snapshot_fetches_same_domain_registration_page() ->
     async def fetch():
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
-            return await fetch_enriched_page_snapshot("https://example.com/", client=client)
+            return await fetch_enriched_page_snapshot(
+                "https://example.com/",
+                client=client,
+                resolve_host=public_resolver,
+            )
 
     snapshot = run(fetch())
 
@@ -115,3 +135,100 @@ def test_fetch_enriched_page_snapshot_fetches_same_domain_registration_page() ->
     assert "Linked page: https://example.com/anmeldung." in snapshot.normalized_text
     assert "Registration opens on 2026-05-31." in snapshot.normalized_text
     assert any(link.url == "https://example.com/payment" for link in snapshot.links)
+
+
+def test_fetch_page_snapshot_rejects_private_literal_address() -> None:
+    async def fetch():
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, request=request))
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_page_snapshot("http://127.0.0.1/admin", client=client)
+
+    with pytest.raises(PageFetchError, match="Private or non-public address"):
+        run(fetch())
+
+
+def test_fetch_page_snapshot_rejects_invalid_resolver_address() -> None:
+    async def invalid_resolver(_hostname: str) -> tuple[str, ...]:
+        return ("not-an-ip-address",)
+
+    async def fetch():
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, request=request))
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_page_snapshot(
+                "https://example.com/",
+                client=client,
+                resolve_host=invalid_resolver,
+            )
+
+    with pytest.raises(PageFetchError, match="invalid address"):
+        run(fetch())
+
+
+def test_fetch_page_snapshot_revalidates_redirect_target() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            302,
+            headers={"location": "http://169.254.169.254/latest/meta-data"},
+            request=request,
+        )
+
+    async def fetch():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_page_snapshot(
+                "https://example.com/start",
+                client=client,
+                resolve_host=public_resolver,
+            )
+
+    with pytest.raises(PageFetchError, match="Private or non-public address"):
+        run(fetch())
+
+
+def test_fetch_page_snapshot_enforces_response_size_limit() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"x" * 11, request=request)
+
+    async def fetch():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_page_snapshot(
+                "https://example.com/large",
+                client=client,
+                resolve_host=public_resolver,
+                max_response_bytes=10,
+            )
+
+    with pytest.raises(PageFetchError, match="response limit"):
+        run(fetch())
+
+
+def test_fetch_page_snapshot_does_not_double_decode_compressed_body() -> None:
+    html = b"<html><title>Compressed</title><p>Readable body.</p></html>"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        compressed = gzip.compress(html)
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "text/html; charset=utf-8",
+                "content-encoding": "gzip",
+                "content-length": str(len(compressed)),
+            },
+            content=compressed,
+            request=request,
+        )
+
+    async def fetch():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_page_snapshot(
+                "https://example.com/compressed",
+                client=client,
+                resolve_host=public_resolver,
+            )
+
+    snapshot = run(fetch())
+
+    assert snapshot.title == "Compressed"
+    assert "Readable body." in snapshot.normalized_text

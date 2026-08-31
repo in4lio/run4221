@@ -43,6 +43,7 @@ from run4221.db.repository import (
     EventWriteError,
     ProposedEventUpdateRecord,
     add_event,
+    add_event_from_suggestion,
     approve_proposed_event_update,
     archive_event,
     count_event_suggestions,
@@ -720,24 +721,27 @@ async def handle_add_event_registration_close_at(message: Message, state: FSMCon
     await state.update_data(registration_close_at=registration_close_at)
     data = await state.get_data()
     try:
-        event = add_event(
-            EventCreate(
-                public_id=data["public_id"],
-                name=data["name"],
-                city=data["city"],
-                country=data["country"],
-                timezone=data["timezone"],
-                event_date=data["event_date"],
-                distances=data["distances"],
-                regions=data["regions"],
-                official_url=data["official_url"],
-                registration_url=optional_string(data.get("registration_url")),
-                registration_status=str(data["registration_status"]),
-                registration_open_at=optional_string(data.get("registration_open_at")),
-                registration_open_precision=str(data["registration_open_precision"]),
-                registration_close_at=registration_close_at,
-            )
+        event_create = EventCreate(
+            public_id=data["public_id"],
+            name=data["name"],
+            city=data["city"],
+            country=data["country"],
+            timezone=data["timezone"],
+            event_date=data["event_date"],
+            distances=data["distances"],
+            regions=data["regions"],
+            official_url=data["official_url"],
+            registration_url=optional_string(data.get("registration_url")),
+            registration_status=str(data["registration_status"]),
+            registration_open_at=optional_string(data.get("registration_open_at")),
+            registration_open_precision=str(data["registration_open_precision"]),
+            registration_close_at=registration_close_at,
         )
+        source_suggestion_id = data.get("source_suggestion_id")
+        if source_suggestion_id is None:
+            event = add_event(event_create)
+        else:
+            event = add_event_from_suggestion(event_create, int(source_suggestion_id))
     except EventWriteError as error:
         await state.clear()
         await message.answer(
@@ -745,10 +749,6 @@ async def handle_add_event_registration_close_at(message: Message, state: FSMCon
             reply_markup=remove_dialog_keyboard(),
         )
         return
-
-    source_suggestion_id = data.get("source_suggestion_id")
-    if source_suggestion_id is not None:
-        update_event_suggestion_status(int(source_suggestion_id), "converted")
 
     await state.clear()
     if source_suggestion_id is not None:
