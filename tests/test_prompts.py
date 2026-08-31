@@ -3,6 +3,7 @@ import pytest
 from run4221.db import models
 from run4221.db.prompts import (
     DISCOVER_EVENT_PROFILE_PROMPT,
+    RESEARCH_AGENT_PROMPT,
     PromptConfigError,
     get_file_prompt,
     get_runtime_prompt,
@@ -142,16 +143,22 @@ def test_seed_prompts_from_private_style_text_files(tmp_path) -> None:
         "Registration prompt.",
         encoding="utf-8",
     )
+    (prompts_dir / "research_agent.instructions.txt").write_text(
+        "Research agent prompt.",
+        encoding="utf-8",
+    )
 
     seed_records = load_prompt_seed_dir(prompts_dir)
     prompt_versions = seed_prompts_from_dir(prompts_dir, database_url=url)
 
     assert [record.prompt_key for record in seed_records] == [
         "discover_event_profile",
+        RESEARCH_AGENT_PROMPT,
         "update_registration_window",
     ]
     assert [record.prompt_key for record in prompt_versions] == [
         "discover_event_profile",
+        RESEARCH_AGENT_PROMPT,
         "update_registration_window",
     ]
     assert get_runtime_prompt("discover_event_profile", database_url=url).content == (

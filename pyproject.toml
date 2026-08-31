@@ -25,6 +25,9 @@ dev = [
     "pytest>=8.3,<9",
     "ruff>=0.9,<1",
 ]
+researcher = [
+    "openai-agents>=0.20,<0.21",
+]
 
 [project.scripts]
 run4221-bot = "run4221.bot.app:run"
