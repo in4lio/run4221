@@ -160,6 +160,18 @@ def test_bootstrap_shares_mutation_lock_and_treats_confirmation_as_data() -> Non
     assert 'if [[ "${{ inputs.confirm_reset }}"' not in workflow
 
 
+def test_bootstrap_restores_owner_only_private_file_permissions_after_sync() -> None:
+    workflow = read_project_file(".github/workflows/bootstrap-production.yml")
+    sync_step = workflow[
+        workflow.index("      - name: Sync private data to VPS") :
+        workflow.index("      - name: Seed prompts")
+    ]
+
+    assert "chmod 700 '$remote_private_dir'" in sync_step
+    assert "'$remote_private_dir/data' '$remote_private_dir/prompts'" in sync_step
+    assert "-type f -exec chmod 600 {} +" in sync_step
+
+
 def test_bootstrap_stops_both_writers_and_checkpoints_wal_before_reset() -> None:
     workflow = read_project_file(".github/workflows/bootstrap-production.yml")
     reset_step = workflow[workflow.index("      - name: Reset database and seed suggestions") :]

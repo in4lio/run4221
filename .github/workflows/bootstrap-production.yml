@@ -87,7 +87,13 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \
             "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
-            "mkdir -p '$remote_private_dir' && tar -C '$remote_private_dir' -xzf -"
+            "umask 077 \
+              && mkdir -p '$remote_private_dir' \
+              && tar -C '$remote_private_dir' -xzf - \
+              && chmod 700 '$remote_private_dir' \
+                '$remote_private_dir/data' '$remote_private_dir/prompts' \
+              && find '$remote_private_dir/data' '$remote_private_dir/prompts' \
+                -type f -exec chmod 600 {} +"
 
       - name: Seed prompts
         if: ${{ inputs.action == 'seed-prompts' }}
