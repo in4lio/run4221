@@ -101,10 +101,10 @@ jobs:
           git checkout --detach "$DEPLOY_SHA"
           git reset --hard "$DEPLOY_SHA"
           docker compose config --quiet
-          docker compose run --rm -T --build bot uv run python -m run4221.health
-          docker compose run --rm -T --build --no-deps researcher \
+          docker compose run --rm -T --interactive=false --build bot uv run python -m run4221.health
+          docker compose run --rm -T --interactive=false --build --no-deps researcher \
             uv run run4221-researcher --check-config
-          docker compose run --rm -T --no-deps researcher uv run python -c \
+          docker compose run --rm -T --interactive=false --no-deps researcher uv run python -c \
             'from run4221.researcher.config import ResearcherSettings; s = ResearcherSettings(); assert not s.enabled and not s.discovery_enabled and not s.rendering_enabled, "researcher must deploy ready-paused"'
           service_replaced=true
           docker compose stop researcher
