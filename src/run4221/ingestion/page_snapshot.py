@@ -5,7 +5,7 @@ import ipaddress
 import json
 import re
 import socket
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -17,6 +17,7 @@ from urllib.parse import urljoin, urlparse, urlunparse
 import httpx
 
 MAX_SNAPSHOT_TEXT_CHARS = 50_000
+MAX_SNAPSHOT_LINKS = 100
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_REDIRECTS = 5
 DEFAULT_TIMEOUT_SECONDS = 10.0
@@ -388,7 +389,7 @@ def extract_response_content(
 
     title = normalize_text(" ".join(parser.title_parts)) or None
     body_text = normalize_text(" ".join(parser.text_parts))
-    links = tuple(
+    links = select_snapshot_links(
         PageLink(url=url, text=text)
         for url, text in parser.links
         if url
@@ -426,12 +427,12 @@ def merge_page_snapshots(
     root_snapshot: PageSnapshot,
     linked_snapshots: tuple[PageSnapshot, ...],
 ) -> PageSnapshot:
-    if not linked_snapshots:
+    root_links = select_snapshot_links(root_snapshot.links)
+    if not linked_snapshots and root_links == root_snapshot.links:
         return root_snapshot
 
     text_parts = [root_snapshot.normalized_text]
-    links = [*root_snapshot.links]
-    seen_links = {(link.url, link.text) for link in links}
+    combined_links = [*root_snapshot.links]
     for linked_snapshot in linked_snapshots:
         text_parts.append(
             " ".join(
@@ -444,11 +445,7 @@ def merge_page_snapshots(
                 if part
             )
         )
-        for link in linked_snapshot.links:
-            key = (link.url, link.text)
-            if key not in seen_links:
-                links.append(link)
-                seen_links.add(key)
+        combined_links.extend(linked_snapshot.links)
 
     normalized_text = normalize_text(" ".join(text_parts))[:MAX_SNAPSHOT_TEXT_CHARS]
     return PageSnapshot(
@@ -460,8 +457,32 @@ def merge_page_snapshots(
         title=root_snapshot.title,
         normalized_text=normalized_text,
         text_hash=hash_text(normalized_text),
-        links=tuple(links),
+        links=select_snapshot_links(combined_links),
     )
+
+
+def select_snapshot_links(links: Iterable[PageLink]) -> tuple[PageLink, ...]:
+    """Keep a bounded, useful, auditable set of unique public-page links."""
+
+    unique: dict[str, PageLink] = {}
+    relevant: set[str] = set()
+    for link in links:
+        parsed = urlparse(link.url)
+        if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+            continue
+        key = normalize_fetch_url(link.url)
+        is_relevant = any(
+            term in f"{link.text} {link.url}".casefold()
+            for term in LINK_DISCOVERY_TERMS
+        )
+        if key not in unique or (is_relevant and key not in relevant):
+            unique[key] = link
+        if is_relevant:
+            relevant.add(key)
+
+    ordered_keys = [key for key in unique if key in relevant]
+    ordered_keys.extend(key for key in unique if key not in relevant)
+    return tuple(unique[key] for key in ordered_keys[:MAX_SNAPSHOT_LINKS])
 
 
 def normalize_fetch_url(value: str) -> str:
