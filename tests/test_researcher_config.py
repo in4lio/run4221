@@ -33,6 +33,7 @@ def test_researcher_settings_have_safe_independent_defaults() -> None:
     assert settings.enabled is False
     assert settings.discovery_enabled is False
     assert settings.rendering_enabled is False
+    assert settings.max_output_tokens_per_job == 4_000
     assert settings.budget == ResearchBudget()
     assert "telegram_bot_token" not in type(settings).model_fields
 
