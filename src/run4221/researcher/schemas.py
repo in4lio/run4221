@@ -34,6 +34,10 @@ class ResearchCandidate(ResearchSchema):
     title: ShortText
     snippet: EvidenceText
     discovery_query: Annotated[str, Field(min_length=1, max_length=500)] | None = None
+    event_date: Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")] | None = None
+    location: Annotated[str, Field(min_length=1, max_length=240)] | None = None
+    region_tags: Annotated[tuple[ShortText, ...], Field(max_length=12)] = ()
+    distances: Annotated[tuple[ShortText, ...], Field(max_length=12)] = ()
 
     _validate_source_url = field_validator("source_url")(validate_http_url)
 

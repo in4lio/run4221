@@ -225,6 +225,28 @@ class ResearchArtifactStore:
             queue_reference=queue_reference,
         )
 
+    def finalize_uncommitted(
+        self,
+        prepared_reference: ArtifactReference,
+        *,
+        status: ResearchRunStatus,
+    ) -> ArtifactReference:
+        """Record a truthful terminal after a queue admission rejects the attempt."""
+
+        prepared = self._read_prepared(prepared_reference)
+        if status.outcome in {
+            RunOutcome.SUGGESTION_CREATED,
+            RunOutcome.PROPOSAL_CREATED,
+        }:
+            raise ArtifactLifecycleError(
+                "An uncommitted decision cannot report a queue-created outcome."
+            )
+        return self._write_terminal(
+            prepared,
+            queue_state=QueueResolutionState.ABSENT,
+            status=status,
+        )
+
     def finalize_without_queue(
         self,
         run_id: str,
