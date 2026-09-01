@@ -109,12 +109,12 @@ jobs:
           service_replaced=true
           docker compose stop researcher
           docker compose up -d --build --no-deps --wait --wait-timeout 90 bot
-          docker compose exec -T bot uv run python -m run4221.health
+          docker compose exec -T --interactive=false bot uv run python -m run4221.health
           docker compose up -d --build --remove-orphans --wait --wait-timeout 90
           docker compose ps
-          docker compose exec -T bot uv run python -m run4221.health
-          docker compose exec -T researcher uv run python -m run4221.researcher.health
-          docker compose exec -T researcher uv run python -c \
+          docker compose exec -T --interactive=false bot uv run python -m run4221.health
+          docker compose exec -T --interactive=false researcher uv run python -m run4221.researcher.health
+          docker compose exec -T --interactive=false researcher uv run python -c \
             'import json; state = json.load(open("data/researcher_health.json", encoding="utf-8")); assert state["mode"] == "paused" and state["activity"] == "idle"; print("researcher_consecutive_failures=" + str(state["consecutive_failures"]))'
           trap - ERR
           REMOTE

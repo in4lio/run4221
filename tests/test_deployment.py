@@ -75,7 +75,13 @@ def test_deploy_runs_quality_gate_health_check_and_rollback() -> None:
         "docker compose run --rm -T --interactive=false"
     )
     assert 'if [[ "$service_replaced" == "true" ]]' in workflow
-    assert "docker compose exec -T bot uv run python -m run4221.health" in workflow
+    assert workflow.count("docker compose exec") == workflow.count(
+        "docker compose exec -T --interactive=false"
+    )
+    assert (
+        "docker compose exec -T --interactive=false bot "
+        "uv run python -m run4221.health"
+    ) in workflow
     assert "trap rollback ERR" in workflow
 
 
@@ -131,7 +137,8 @@ def test_deploy_preflights_researcher_before_replacement_and_restores_topology()
     assert "docker image tag" in workflow
     assert "--remove-orphans" in workflow
     assert (
-        "docker compose exec -T researcher uv run python -m run4221.researcher.health"
+        "docker compose exec -T --interactive=false researcher "
+        "uv run python -m run4221.researcher.health"
         in workflow
     )
     assert "down -v" not in workflow
