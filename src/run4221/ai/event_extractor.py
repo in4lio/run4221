@@ -681,9 +681,9 @@ def conflicts_with_event_identity(
     tokens = event_identity_tokens(url, text)
     if any(term in tokens for term in NON_PRIMARY_EVENT_TERMS):
         return True
-    if "marathon" in distances:
+    if "marathon" in distances and "half_marathon" not in distances:
         return any(term in tokens for term in HALF_MARATHON_TERMS)
-    if "half_marathon" in distances:
+    if "half_marathon" in distances and "marathon" not in distances:
         return any(term in tokens for term in FULL_MARATHON_TERMS)
     return False
 

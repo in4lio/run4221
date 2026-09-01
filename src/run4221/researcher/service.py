@@ -5,11 +5,13 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from typing import Protocol
+from urllib.parse import urlparse
 
 from run4221.ai.event_extractor import (
     conflicts_with_event_identity,
     event_identity_tokens,
 )
+from run4221.db.models import RESEARCH_DECISION_MARKER_PREFIX
 from run4221.db.research import (
     EventSuggestionCreate,
     ProposedEventUpdateCreate,
@@ -38,7 +40,11 @@ from run4221.researcher.artifacts import ResearchArtifactStore
 from run4221.researcher.policy import SourceTrustPolicy, source_domain
 from run4221.researcher.schemas import (
     ArtifactReference,
+    AssessmentVerdict,
     DecisionAction,
+    EventUpdateField,
+    EvidenceRequest,
+    EvidenceRequestPurpose,
     ProposedEventChanges,
     ResearchBudget,
     ResearchCandidate,
@@ -49,15 +55,113 @@ from run4221.researcher.schemas import (
 )
 
 AUDIT_SOURCE_URL = "https://run4221.invalid/researcher"
-MAX_REFRESH_FOLLOWUP_PAGES = 2
-SUPPORTED_UPDATE_FIELDS = (
-    "registration_status",
-    "registration_open_at",
-    "registration_open_precision",
-    "registration_close_at",
-    "registration_url",
-    "event_date",
+MAX_REFRESH_CONTINUATIONS = 2
+MAX_REFRESH_CAPTURES = 4
+MAX_REFRESH_WEB_SEARCHES = 2
+
+_ALTERNATIVE_ENTRY_LINK_TERMS = frozenset(
+    {
+        "10k",
+        "5k",
+        "charity",
+        "children",
+        "extras",
+        "handbike",
+        "handbiker",
+        "inline",
+        "inlineskating",
+        "jubilee",
+        "junior",
+        "kid",
+        "kids",
+        "mini",
+        "relay",
+        "school",
+        "skating",
+        "tour",
+        "wheelchair",
+        "youth",
+    }
 )
+
+_REFRESH_LINK_TERM_WEIGHTS = {
+    EvidenceRequestPurpose.REGISTRATION_STATUS: {
+        "registration": 100,
+        "register": 90,
+        "status": 60,
+        "information": 50,
+        "info": 50,
+        "results": 40,
+        "lottery": 40,
+        "entry": 35,
+        "waitlist": 35,
+        "sold": 35,
+    },
+    EvidenceRequestPurpose.REGISTRATION_TIMING: {
+        "registration": 100,
+        "register": 90,
+        "deadline": 70,
+        "dates": 60,
+        "date": 60,
+        "information": 50,
+        "info": 50,
+        "lottery": 40,
+        "entry": 35,
+    },
+    EvidenceRequestPurpose.REGISTRATION_URL: {
+        "registration": 100,
+        "register": 90,
+        "signup": 70,
+        "application": 60,
+        "entry": 50,
+        "information": 40,
+        "info": 40,
+        "lottery": 25,
+    },
+    EvidenceRequestPurpose.EVENT_DATE: {
+        "date": 100,
+        "dates": 100,
+        "calendar": 90,
+        "schedule": 90,
+        "information": 50,
+        "info": 50,
+        "event": 30,
+        "race": 30,
+    },
+    EvidenceRequestPurpose.EVENT_IDENTITY: {
+        "information": 70,
+        "info": 70,
+        "about": 60,
+        "event": 50,
+        "race": 40,
+        "marathon": 30,
+    },
+    EvidenceRequestPurpose.EVENT_EDITION: {
+        "edition": 100,
+        "information": 60,
+        "info": 60,
+        "event": 50,
+        "race": 40,
+        "marathon": 30,
+    },
+    EvidenceRequestPurpose.DISTANCE_CATEGORY: {
+        "distance": 100,
+        "course": 80,
+        "marathon": 60,
+        "race": 40,
+        "information": 30,
+        "info": 30,
+    },
+    EvidenceRequestPurpose.CONFLICT_RESOLUTION: {
+        "information": 70,
+        "info": 70,
+        "results": 60,
+        "status": 60,
+        "event": 40,
+        "race": 40,
+        "marathon": 30,
+    },
+}
 
 
 class SnapshotFetcher(Protocol):
@@ -164,40 +268,218 @@ class ResearcherService:
                 RunOutcome.INCONCLUSIVE,
                 f"Approved source was unusable: {reason}.",
             )
+        if not _same_source_domain(captured.snapshot.final_url, source.url):
+            return self._finish_without_queue(
+                run_id,
+                source.url,
+                RunState.SKIPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Approved source redirected outside its stored domain.",
+            )
 
         captures = [captured]
-        if self._refresh_search_enabled():
-            scout = await self.agent.scout(
-                ScoutRequest(
+        context = _event_context(frozen_event, source.url)
+        captured_final_urls = {normalize_url(captured.snapshot.final_url)}
+        completed_purposes: set[EvidenceRequestPurpose] = set()
+        normalized_queries: set[str] = set()
+        successful_captures = 1
+        completed_web_searches = 0
+
+        while True:
+            assessment = await self.agent.assess(
+                AssessmentRequest(
                     mode="refresh",
-                    query=_refresh_search_query(frozen_event, source.url),
-                    approved_source_url=source.url,
-                    context=_event_context(frozen_event, source.url),
+                    context=context,
+                    evidence=tuple(item.as_agent_evidence() for item in captures),
                 )
             )
-            self._record_scout(run_id, source.url, scout)
-            if scout.state is AgentRunState.SUCCEEDED:
-                await self._capture_refresh_followups(
+            self._record_assessment(run_id, source.url, assessment)
+            if assessment.state is not AgentRunState.SUCCEEDED:
+                return self._finish_agent_outcome(run_id, source.url, assessment)
+            if assessment.decision is not None:
+                try:
+                    decision = ResearchDecision.model_validate(
+                        assessment.decision.model_dump(mode="python")
+                    )
+                except Exception:
+                    return self._finish_without_queue(
+                        run_id,
+                        source.url,
+                        RunState.SKIPPED,
+                        RunOutcome.INCONCLUSIVE,
+                        "Terminal decision failed host schema validation.",
+                    )
+                break
+
+            evidence_request = assessment.evidence_request
+            if not isinstance(evidence_request, EvidenceRequest):
+                return self._finish_without_queue(
                     run_id,
-                    source,
-                    frozen_event,
+                    source.url,
+                    RunState.SKIPPED,
+                    RunOutcome.INCONCLUSIVE,
+                    "Assessment returned neither a terminal decision nor a valid evidence request.",
+                )
+            normalized_query = _normalize_refresh_query(evidence_request.query)
+            purpose = evidence_request.purpose
+            if len(completed_purposes) >= MAX_REFRESH_CONTINUATIONS:
+                return self._finish_without_queue(
+                    run_id,
+                    source.url,
+                    RunState.CAPPED,
+                    RunOutcome.INCONCLUSIVE,
+                    "Refresh continuation budget was exhausted.",
+                )
+            if normalized_query in normalized_queries or purpose in completed_purposes:
+                return self._finish_without_queue(
+                    run_id,
+                    source.url,
+                    RunState.SKIPPED,
+                    RunOutcome.INCONCLUSIVE,
+                    "Assessment repeated an already completed evidence query or purpose.",
+                )
+            capture_limit = min(
+                MAX_REFRESH_CAPTURES,
+                self.budget.max_static_pages_per_job,
+            )
+            if successful_captures >= capture_limit:
+                return self._finish_without_queue(
+                    run_id,
+                    source.url,
+                    RunState.CAPPED,
+                    RunOutcome.INCONCLUSIVE,
+                    "Refresh page-capture budget was exhausted.",
+            )
+
+            normalized_queries.add(normalized_query)
+            linked_candidate_urls = _refresh_link_candidate_urls(
+                tuple(captures),
+                request=evidence_request,
+                event=frozen_event,
+                approved_source_url=source.url,
+                captured_final_urls=frozenset(captured_final_urls),
+            )
+            candidate_urls = linked_candidate_urls
+            if not candidate_urls:
+                if completed_web_searches >= min(
+                    MAX_REFRESH_WEB_SEARCHES,
+                    self.budget.max_web_searches_per_job,
+                ):
+                    return self._finish_without_queue(
+                        run_id,
+                        source.url,
+                        RunState.CAPPED,
+                        RunOutcome.INCONCLUSIVE,
+                        "Refresh web-search budget was exhausted.",
+                    )
+                scout = await self.agent.scout(
+                    ScoutRequest(
+                        mode="refresh",
+                        query=_targeted_refresh_query(
+                            frozen_event,
+                            source.url,
+                            evidence_request,
+                        ),
+                        approved_source_url=source.url,
+                        context=context,
+                    )
+                )
+                self._record_scout(run_id, source.url, scout)
+                if scout.state is not AgentRunState.SUCCEEDED:
+                    return self._finish_agent_outcome(run_id, source.url, scout)
+                if scout.metadata.web_search_calls > 1:
+                    return self._finish_without_queue(
+                        run_id,
+                        source.url,
+                        RunState.CAPPED,
+                        RunOutcome.INCONCLUSIVE,
+                        "Refresh scout exceeded its one-search provider cap.",
+                    )
+                completed_web_searches += scout.metadata.web_search_calls
+                candidate_urls = _refresh_candidate_urls(
                     scout.candidates,
-                    captures,
+                    event=frozen_event,
+                    approved_source_url=source.url,
+                )
+            if not candidate_urls:
+                return self._finish_without_queue(
+                    run_id,
+                    source.url,
+                    RunState.SKIPPED,
+                    RunOutcome.INCONCLUSIVE,
+                    "No same-domain qualified search or captured-link candidate URL was found.",
                 )
 
-        assessment = await self.agent.assess(
-            AssessmentRequest(
-                mode="refresh",
-                context=_event_context(frozen_event, source.url),
-                evidence=tuple(item.as_agent_evidence() for item in captures),
-            )
-        )
-        self._record_assessment(run_id, source.url, assessment)
-        if assessment.state is not AgentRunState.SUCCEEDED or assessment.decision is None:
-            return self._finish_agent_outcome(run_id, source.url, assessment)
+            qualified: CapturedPage | None = None
+            rejected_candidates: list[str] = []
+            for candidate_url in candidate_urls:
+                if successful_captures >= capture_limit:
+                    return self._finish_without_queue(
+                        run_id,
+                        source.url,
+                        RunState.CAPPED,
+                        RunOutcome.INCONCLUSIVE,
+                        "Refresh page-capture budget was exhausted.",
+                    )
+                try:
+                    followup = await self._capture(
+                        run_id,
+                        candidate_url,
+                        allowed_origin=source.url,
+                    )
+                except PageFetchError as error:
+                    rejected_candidates.append(
+                        f"capture failed ({type(error).__name__})"
+                    )
+                    continue
+                successful_captures += 1
+                if reason := blocked_page_reason(followup.snapshot):
+                    rejected_candidates.append(f"page unusable ({reason})")
+                    continue
+                if not _same_source_domain(followup.snapshot.final_url, source.url):
+                    rejected_candidates.append("cross-domain redirect")
+                    continue
+                normalized_final_url = normalize_url(followup.snapshot.final_url)
+                if normalized_final_url in captured_final_urls:
+                    rejected_candidates.append("duplicate final URL")
+                    continue
+                if _conflicts_with_tracked_event(followup.snapshot, frozen_event):
+                    rejected_candidates.append("wrong event or distance/category")
+                    continue
+                if not _matches_tracked_event_identity(followup.snapshot, frozen_event):
+                    rejected_candidates.append("wrong event identity or edition")
+                    continue
+                qualified = followup
+                break
+            if qualified is None:
+                return self._finish_without_queue(
+                    run_id,
+                    source.url,
+                    RunState.SKIPPED,
+                    RunOutcome.INCONCLUSIVE,
+                    (
+                        "Targeted search produced no new qualified captured evidence: "
+                        + "; ".join(rejected_candidates)[:700]
+                    ),
+                )
 
-        decision = assessment.decision
+            captures.append(qualified)
+            captured_final_urls.add(normalize_url(qualified.snapshot.final_url))
+            completed_purposes.add(purpose)
+
         if decision.action in {DecisionAction.NO_CHANGE, DecisionAction.INCONCLUSIVE}:
+            if decision.action is DecisionAction.NO_CHANGE and not self._valid_refresh_no_change(
+                decision,
+                captures=tuple(captures),
+                event=frozen_event,
+            ):
+                return self._finish_without_queue(
+                    run_id,
+                    source.url,
+                    RunState.SKIPPED,
+                    RunOutcome.INCONCLUSIVE,
+                    "No-change decision lacked confirmed applicable current-field evidence.",
+                )
             outcome = (
                 RunOutcome.NO_CHANGE
                 if decision.action is DecisionAction.NO_CHANGE
@@ -210,17 +492,6 @@ class ResearcherService:
                 outcome,
                 decision.summary,
             )
-        if not self._valid_evidence(
-            decision,
-            required=tuple(item.reference for item in captures),
-        ):
-            return self._finish_without_queue(
-                run_id,
-                source.url,
-                RunState.SKIPPED,
-                RunOutcome.INCONCLUSIVE,
-                "Decision did not cite exactly captured approved-source evidence.",
-            )
         if decision.action is not DecisionAction.PROPOSE_UPDATE:
             return self._finish_without_queue(
                 run_id,
@@ -228,6 +499,14 @@ class ResearcherService:
                 RunState.SKIPPED,
                 RunOutcome.INCONCLUSIVE,
                 "Refresh decisions cannot create new-event suggestions.",
+            )
+        if not self._valid_refresh_references(decision, captures=tuple(captures)):
+            return self._finish_without_queue(
+                run_id,
+                source.url,
+                RunState.SKIPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Update decision referenced uncaptured or unverifiable evidence.",
             )
 
         changed_fields = _changed_supported_fields(decision, frozen_fields)
@@ -239,11 +518,20 @@ class ResearcherService:
                 RunOutcome.NO_CHANGE,
                 "No supported tracked-event field changed.",
             )
-        prepared_decision = decision.model_copy(
-            update={
-                "proposed_fields": _normalized_proposed_changes(changed_fields),
-            }
+        prepared_decision = self._validated_refresh_update(
+            decision,
+            captures=tuple(captures),
+            event=frozen_event,
+            changed_fields=changed_fields,
         )
+        if prepared_decision is None:
+            return self._finish_without_queue(
+                run_id,
+                source.url,
+                RunState.SKIPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Update decision failed captured support, applicability, or conflict validation.",
+            )
         if not self.persist_queue:
             return self._finish_without_queue(
                 run_id,
@@ -262,15 +550,17 @@ class ResearcherService:
             decision=prepared_decision,
             committed_status=committed_status,
         )
+        cited_captures = _decision_captures(prepared_decision, tuple(captures))
         evidence_lines = _moderation_evidence(
             decision.summary,
-            tuple(captures),
+            cited_captures,
             trust_reason=(
-                "stored approved event source plus same-domain official search results"
+                "stored approved event source plus same-domain official captured evidence"
                 if len(captures) > 1
                 else "stored approved event source"
             ),
             prepared=prepared,
+            decision=prepared_decision,
         )
         try:
             admission = admit_proposed_update(
@@ -326,6 +616,19 @@ class ResearcherService:
             metadata={"query": clean_query},
         )
         self._announce_run(run_id)
+        try:
+            async with asyncio.timeout(self.budget.max_wall_time_seconds_per_job):
+                return await self._discover_started(run_id, clean_query)
+        except TimeoutError:
+            return self._finish_without_queue(
+                run_id,
+                AUDIT_SOURCE_URL,
+                RunState.CAPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Discovery wall-time budget was exhausted.",
+            )
+
+    async def _discover_started(self, run_id: str, clean_query: str) -> ResearchJobResult:
         scout = await self.agent.scout(ScoutRequest(mode="discovery", query=clean_query))
         self._record_scout(
             run_id,
@@ -537,54 +840,6 @@ class ResearcherService:
             "; ".join(skipped_reasons)[:1_000] or "No trusted candidate was captured.",
         )
 
-    async def _capture_refresh_followups(
-        self,
-        run_id: str,
-        source: ResearchSourceRecord,
-        event: TrackedEvent,
-        candidates: tuple[ResearchCandidate, ...],
-        captures: list[CapturedPage],
-    ) -> None:
-        followup_limit = min(
-            MAX_REFRESH_FOLLOWUP_PAGES,
-            self.budget.max_static_pages_per_job - 1,
-        )
-        followup_pages_captured = 0
-        captured_final_urls = {normalize_url(captures[0].snapshot.final_url)}
-        for candidate_url in _refresh_candidate_urls(
-            candidates,
-            event=event,
-            approved_source_url=source.url,
-        ):
-            if followup_pages_captured >= followup_limit:
-                break
-            try:
-                followup = await self._capture(
-                    run_id,
-                    candidate_url,
-                    allowed_origin=source.url,
-                )
-            except PageFetchError:
-                continue
-            followup_pages_captured += 1
-            if blocked_page_reason(followup.snapshot) is not None:
-                continue
-            if not _same_source_domain(followup.snapshot.final_url, source.url):
-                continue
-            if conflicts_with_event_identity(
-                followup.snapshot.final_url,
-                (f"{followup.snapshot.title or ''} {followup.snapshot.normalized_text[:2_000]}"),
-                event.distances,
-            ):
-                continue
-            if not _matches_tracked_event_identity(followup.snapshot, event):
-                continue
-            normalized_final_url = normalize_url(followup.snapshot.final_url)
-            if normalized_final_url in captured_final_urls:
-                continue
-            captures.append(followup)
-            captured_final_urls.add(normalized_final_url)
-
     async def _capture(
         self,
         run_id: str,
@@ -600,9 +855,6 @@ class ResearcherService:
             raise PageFetchError("Page capture failed.") from error
         reference = self.artifacts.write_page_snapshot(run_id, snapshot)
         return CapturedPage(snapshot=snapshot, reference=reference)
-
-    def _refresh_search_enabled(self) -> bool:
-        return self.budget.max_web_searches_per_job > 0 and self.budget.max_static_pages_per_job > 1
 
     def _record_scout(
         self,
@@ -645,10 +897,90 @@ class ResearcherService:
                 "decision": (
                     result.decision.model_dump(mode="json") if result.decision is not None else None
                 ),
+                "evidence_request": (
+                    result.evidence_request.model_dump(mode="json")
+                    if result.evidence_request is not None
+                    else None
+                ),
                 "error_code": result.error_code,
                 "detail": result.detail,
             },
         )
+
+    def _valid_refresh_no_change(
+        self,
+        decision: ResearchDecision,
+        *,
+        captures: tuple[CapturedPage, ...],
+        event: TrackedEvent,
+    ) -> bool:
+        if decision.conflicts or not self._valid_refresh_references(decision, captures=captures):
+            return False
+        cited = set(decision.evidence)
+        qualified = _qualified_capture_references(captures, event)
+        return any(
+            item.evidence in cited
+            and item.evidence in qualified
+            and item.event_identity is AssessmentVerdict.CONFIRMED
+            and item.event_edition is AssessmentVerdict.CONFIRMED
+            and item.distance_category is AssessmentVerdict.CONFIRMED
+            and bool(item.applicable_fields)
+            for item in decision.applicability
+        )
+
+    def _validated_refresh_update(
+        self,
+        decision: ResearchDecision,
+        *,
+        captures: tuple[CapturedPage, ...],
+        event: TrackedEvent,
+        changed_fields: dict[str, object],
+    ) -> ResearchDecision | None:
+        retained_support = tuple(
+            item for item in decision.field_support if item.field.value in changed_fields
+        )
+        if set(item.field.value for item in retained_support) != set(changed_fields):
+            return None
+        cited = set(decision.evidence)
+        if not cited or any(
+            not set(item.evidence).issubset(cited) for item in retained_support
+        ):
+            return None
+        qualified = _qualified_capture_references(captures, event)
+        if any(not set(item.evidence).issubset(qualified) for item in retained_support):
+            return None
+        try:
+            return ResearchDecision.model_validate(
+                {
+                    **decision.model_dump(mode="python"),
+                    "proposed_fields": _normalized_proposed_changes(changed_fields),
+                    "field_support": retained_support,
+                }
+            )
+        except Exception:
+            return None
+
+    def _valid_refresh_references(
+        self,
+        decision: ResearchDecision,
+        *,
+        captures: tuple[CapturedPage, ...],
+    ) -> bool:
+        captured_references = {item.reference for item in captures}
+        referenced = set(decision.evidence)
+        referenced.update(item.evidence for item in decision.applicability)
+        for support in decision.field_support:
+            referenced.update(support.evidence)
+        for conflict in decision.conflicts:
+            referenced.update(conflict.evidence)
+        if not referenced or not referenced.issubset(captured_references):
+            return False
+        try:
+            for reference in referenced:
+                self.artifacts.verify_artifact(reference)
+        except Exception:
+            return False
+        return True
 
     def _valid_evidence(
         self,
@@ -730,6 +1062,8 @@ class CapturedPage:
             title=self.snapshot.title,
             fetched_at=self.snapshot.fetched_at,
             normalized_text=self.snapshot.normalized_text,
+            primary_text=self.snapshot.primary_text,
+            chrome_text=self.snapshot.chrome_text,
             text_hash=self.snapshot.text_hash,
         )
 
@@ -765,14 +1099,24 @@ def _event_context(event: TrackedEvent, approved_source_url: str) -> tuple[Froze
     return tuple(FrozenContextField(name=name, value=str(value)) for name, value in values.items())
 
 
-def _refresh_search_query(event: TrackedEvent, approved_source_url: str) -> str:
+def _targeted_refresh_query(
+    event: TrackedEvent,
+    approved_source_url: str,
+    request: EvidenceRequest,
+) -> str:
     year = event.event_date[:4] if event.event_date else "current"
     distances = " ".join(event.distances).replace("_", " ")
+    requested_query = " ".join(request.query.split())[:180]
+    gap = " ".join(request.gap.split())[:160]
     query = (
         f'site:{source_domain(approved_source_url)} "{event.name}" {year} {distances} '
-        "standard public registration lottery status opening closing dates"
+        f"{request.purpose.value} {requested_query} {gap}"
     )
     return query[:500]
+
+
+def _normalize_refresh_query(query: str) -> str:
+    return " ".join(query.casefold().split())
 
 
 def _refresh_candidate_urls(
@@ -795,9 +1139,11 @@ def _refresh_candidate_urls(
             continue
         if conflicts_with_event_identity(
             candidate.source_url,
-            f"{candidate.title} {candidate.snippet}",
+            "",
             event.distances,
         ):
+            continue
+        if event_identity_tokens(candidate.source_url, "") & _ALTERNATIVE_ENTRY_LINK_TERMS:
             continue
         normalized = normalize_url(candidate.source_url)
         if normalized in selected_normalized:
@@ -805,6 +1151,43 @@ def _refresh_candidate_urls(
         selected.append(candidate.source_url)
         selected_normalized.add(normalized)
     return tuple(selected)
+
+
+def _refresh_link_candidate_urls(
+    captures: tuple[CapturedPage, ...],
+    *,
+    request: EvidenceRequest,
+    event: TrackedEvent,
+    approved_source_url: str,
+    captured_final_urls: frozenset[str],
+) -> tuple[str, ...]:
+    weights = _REFRESH_LINK_TERM_WEIGHTS[request.purpose]
+    ranked: list[tuple[int, int, str]] = []
+    seen = set(captured_final_urls)
+    order = 0
+    for capture in captures:
+        for link in capture.snapshot.links:
+            order += 1
+            if not _same_source_domain(link.url, approved_source_url):
+                continue
+            normalized = normalize_url(link.url)
+            if normalized in seen:
+                continue
+            tokens = event_identity_tokens(link.url, link.text)
+            if tokens & _ALTERNATIVE_ENTRY_LINK_TERMS:
+                continue
+            if conflicts_with_event_identity(link.url, link.text, event.distances):
+                continue
+            score = sum(weight for term, weight in weights.items() if term in tokens)
+            if score <= 0:
+                continue
+            path = urlparse(link.url).path.casefold()
+            if "/registration/" in path or "/register/" in path:
+                score += 30
+            ranked.append((-score, order, link.url))
+            seen.add(normalized)
+    ranked.sort()
+    return tuple(url for _, _, url in ranked)
 
 
 def _same_source_domain(candidate_url: str, approved_source_url: str) -> bool:
@@ -826,16 +1209,11 @@ _GENERIC_EVENT_IDENTITY_TERMS = frozenset(
 
 
 def _matches_tracked_event_identity(snapshot: PageSnapshot, event: TrackedEvent) -> bool:
-    searchable = f"{snapshot.title or ''} {snapshot.normalized_text[:2_000]}"
+    searchable = f"{snapshot.title or ''} {_snapshot_primary_text(snapshot)[:2_000]}"
     captured_tokens = event_identity_tokens(snapshot.final_url, searchable)
     expected_tokens = event_identity_tokens("", event.name) - _GENERIC_EVENT_IDENTITY_TERMS
     event_year = event.event_date[:4] if event.event_date else None
-    explicit_identity_years = frozenset(
-        re.findall(
-            r"\b20\d{2}\b",
-            f"{snapshot.final_url} {snapshot.title or ''}",
-        )
-    )
+    explicit_identity_years = _explicit_identity_years(snapshot)
     if (
         event_year is not None
         and explicit_identity_years
@@ -848,6 +1226,43 @@ def _matches_tracked_event_identity(snapshot: PageSnapshot, event: TrackedEvent)
 
     captured_years = frozenset(re.findall(r"\b20\d{2}\b", searchable))
     return event_year is not None and event_year in captured_years
+
+
+def _conflicts_with_tracked_event(snapshot: PageSnapshot, event: TrackedEvent) -> bool:
+    return bool(
+        event_identity_tokens(snapshot.final_url, "") & _ALTERNATIVE_ENTRY_LINK_TERMS
+    ) or conflicts_with_event_identity(
+        snapshot.final_url,
+        f"{snapshot.title or ''} {_snapshot_primary_text(snapshot)[:2_000]}",
+        event.distances,
+    )
+
+
+def _snapshot_primary_text(snapshot: PageSnapshot) -> str:
+    return snapshot.primary_text or snapshot.normalized_text
+
+
+def _qualified_capture_references(
+    captures: tuple[CapturedPage, ...],
+    event: TrackedEvent,
+) -> frozenset[ArtifactReference]:
+    return frozenset(
+        capture.reference
+        for capture in captures
+        if not _conflicts_with_tracked_event(capture.snapshot, event)
+        and _matches_tracked_event_identity(capture.snapshot, event)
+    )
+
+
+def _explicit_identity_years(snapshot: PageSnapshot) -> frozenset[str]:
+    years = re.findall(r"\b20\d{2}\b", f"{snapshot.final_url} {snapshot.title or ''}")
+    primary_text = _snapshot_primary_text(snapshot)[:2_000]
+    for pattern in (
+        r"\b(20\d{2})\s+(?:edition|event|race)\b",
+        r"\b(?:edition|event|race)\s+(?:of\s+)?(20\d{2})\b",
+    ):
+        years.extend(re.findall(pattern, primary_text, flags=re.IGNORECASE))
+    return frozenset(years)
 
 
 def _changed_supported_fields(
@@ -863,11 +1278,11 @@ def _changed_supported_fields(
     )
     proposed.update({field: None for field in decision.proposed_fields.clear_fields})
     return {
-        field: proposed[field]
-        for field in SUPPORTED_UPDATE_FIELDS
-        if field in proposed
-        and (proposed[field] is None or proposed[field] not in {"", "unknown"})
-        and proposed[field] != current_fields[field]
+        field.value: proposed[field.value]
+        for field in EventUpdateField
+        if field in decision.proposed_fields.changed_fields
+        and (proposed[field.value] is None or proposed[field.value] not in {"", "unknown"})
+        and proposed[field.value] != current_fields[field.value]
     }
 
 
@@ -892,16 +1307,29 @@ def _candidate_matches_capture(candidate: ResearchCandidate, snapshot: PageSnaps
     }
 
 
+def _decision_captures(
+    decision: ResearchDecision,
+    captures: tuple[CapturedPage, ...],
+) -> tuple[CapturedPage, ...]:
+    referenced = set(decision.evidence)
+    for support in decision.field_support:
+        referenced.update(support.evidence)
+    for conflict in decision.conflicts:
+        referenced.update(conflict.evidence)
+    return tuple(capture for capture in captures if capture.reference in referenced)
+
+
 def _moderation_evidence(
     summary: str,
     captures: tuple[CapturedPage, ...],
     *,
     trust_reason: str,
     prepared: ArtifactReference,
+    decision: ResearchDecision | None = None,
 ) -> tuple[str, ...]:
     lines = [
-        f"Researcher worker: {summary[:500]}",
-        f"Source check: {trust_reason[:120]}.",
+        f"Researcher worker: {_single_line(summary, 500)}",
+        f"Source check: {_single_line(trust_reason, 120)}.",
         decision_queue_marker(prepared),
     ]
     lines.extend(
@@ -912,12 +1340,44 @@ def _moderation_evidence(
         f"captured_at={capture.snapshot.fetched_at.isoformat()}"
         for capture in captures
     )
+    if decision is not None:
+        lines.extend(_field_support_evidence_lines(decision))
+        lines.extend(_conflict_evidence_lines(decision))
     return tuple(lines)
+
+
+def _field_support_evidence_lines(decision: ResearchDecision) -> tuple[str, ...]:
+    return tuple(
+        "Researcher field support: "
+        f"{support.field.value} <- "
+        + ", ".join(
+            f"{reference.artifact_name}#{reference.content_hash[:12]}"
+            for reference in support.evidence
+        )
+        for support in decision.field_support
+    )
+
+
+def _conflict_evidence_lines(decision: ResearchDecision) -> tuple[str, ...]:
+    return tuple(
+        "Researcher conflict: "
+        f"{conflict.field.value if conflict.field is not None else 'general'} <- "
+        + ", ".join(
+            f"{reference.artifact_name}#{reference.content_hash[:12]}"
+            for reference in conflict.evidence
+        )
+        + f" | {_single_line(conflict.summary, 300)}"
+        for conflict in decision.conflicts
+    )
+
+
+def _single_line(value: str, max_length: int) -> str:
+    return " ".join(value.split())[:max_length]
 
 
 def decision_queue_marker(prepared: ArtifactReference) -> str:
     return (
-        "researcher-decision:v1 "
-        f"run={prepared.run_id} artifact={prepared.artifact_name} "
+        RESEARCH_DECISION_MARKER_PREFIX
+        + f"run={prepared.run_id} artifact={prepared.artifact_name} "
         f"sha256={prepared.content_hash}"
     )

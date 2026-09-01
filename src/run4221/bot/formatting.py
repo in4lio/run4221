@@ -7,9 +7,13 @@ from run4221.events import TrackedEvent
 
 RESEARCHER_WORKER_PREFIX = "Researcher worker:"
 RESEARCHER_SOURCE_CHECK_PREFIX = "Source check:"
+RESEARCHER_FIELD_SUPPORT_PREFIX = "Researcher field support:"
+RESEARCHER_CONFLICT_PREFIX = "Researcher conflict:"
 RESEARCHER_DECISION_PREFIX = "researcher-decision:v1 "
 RESEARCHER_EVIDENCE_PREFIX = "researcher-evidence:v1 "
 MAX_RESEARCHER_CAPTURED_SOURCES = 3
+MAX_RESEARCHER_FIELD_SUPPORT = 6
+MAX_RESEARCHER_CONFLICTS = 4
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,8 @@ class ResearcherProvenance:
     artifact_name: str
     hash_prefix: str
     additional_sources: tuple[ResearcherCapturedSource, ...] = ()
+    field_support: tuple[str, ...] = ()
+    conflicts: tuple[str, ...] = ()
 
     @property
     def captured_sources(self) -> tuple[ResearcherCapturedSource, ...]:
@@ -70,6 +76,8 @@ def parse_researcher_provenance(
     trust_reason = ""
     decision: dict[str, str] = {}
     captured: list[dict[str, str]] = []
+    field_support: list[str] = []
+    conflicts: list[str] = []
     for value in values:
         for raw_line in str(value).splitlines():
             line = raw_line.strip()
@@ -77,6 +85,18 @@ def parse_researcher_provenance(
                 summary = line.removeprefix(RESEARCHER_WORKER_PREFIX).strip()
             elif line.startswith(RESEARCHER_SOURCE_CHECK_PREFIX):
                 trust_reason = line.removeprefix(RESEARCHER_SOURCE_CHECK_PREFIX).strip()
+            elif (
+                line.startswith(RESEARCHER_FIELD_SUPPORT_PREFIX)
+                and len(field_support) < MAX_RESEARCHER_FIELD_SUPPORT
+            ):
+                field_support.append(
+                    line.removeprefix(RESEARCHER_FIELD_SUPPORT_PREFIX).strip()
+                )
+            elif (
+                line.startswith(RESEARCHER_CONFLICT_PREFIX)
+                and len(conflicts) < MAX_RESEARCHER_CONFLICTS
+            ):
+                conflicts.append(line.removeprefix(RESEARCHER_CONFLICT_PREFIX).strip())
             elif line.startswith(RESEARCHER_DECISION_PREFIX):
                 decision = _parse_researcher_marker(line, RESEARCHER_DECISION_PREFIX)
             elif (
@@ -99,6 +119,8 @@ def parse_researcher_provenance(
         artifact_name=primary.artifact_name,
         hash_prefix=primary.hash_prefix,
         additional_sources=captured_sources[1:],
+        field_support=tuple(item for item in field_support if item),
+        conflicts=tuple(item for item in conflicts if item),
     )
 
 
@@ -159,14 +181,18 @@ def _researcher_captured_source(
     )
 
 
-def format_researcher_source_check(provenance: ResearcherProvenance | None) -> str:
+def format_researcher_source_check(
+    provenance: ResearcherProvenance | None,
+    *,
+    max_html_chars: int | None = None,
+) -> str:
     if provenance is None:
         return ""
 
-    fields: list[tuple[str, object, int, str]] = []
+    source_fields: list[tuple[str, object, int, str]] = []
     for index, source in enumerate(provenance.captured_sources, start=1):
         suffix = "" if index == 1 else f" {index}"
-        fields.extend(
+        source_fields.extend(
             [
                 (f"Source{suffix}", source.source_url, 500, "text"),
                 (f"Captured{suffix}", source.captured_at, 100, "text"),
@@ -174,16 +200,90 @@ def format_researcher_source_check(provenance: ResearcherProvenance | None) -> s
                 (f"Hash{suffix}", source.hash_prefix, 32, "id"),
             ]
         )
-    fields.append(("Evidence", provenance.summary, 400, "text"))
+    optional_fields = [*source_fields, ("Evidence", provenance.summary, 400, "text")]
     if provenance.trust_reason:
-        fields.append(("Trust", provenance.trust_reason, 200, "text"))
+        optional_fields.append(("Trust", provenance.trust_reason, 200, "text"))
+    critical_fields = [
+        ("Run ID", provenance.run_id, 160, "id"),
+        *(
+            ("Field support", support, 300, "text")
+            for support in provenance.field_support
+        ),
+        *(("Conflict", conflict, 350, "text") for conflict in provenance.conflicts),
+    ]
+    fields = [*optional_fields]
+    fields.extend(
+        ("Field support", support, 300, "text")
+        for support in provenance.field_support
+    )
+    fields.extend(
+        ("Conflict", conflict, 350, "text") for conflict in provenance.conflicts
+    )
     fields.append(("Run ID", provenance.run_id, 160, "id"))
+    if max_html_chars is not None:
+        return _format_bounded_source_check(
+            critical_fields,
+            optional_fields,
+            max_html_chars=max_html_chars,
+        )
+
     lines = ["<blockquote><b>Source check</b>"]
     lines.extend(
         format_bounded_field_line(label, value, max_html_chars=limit, kind=kind)
         for label, value, limit, kind in fields
     )
     lines[-1] += "</blockquote>"
+    return "\n".join(lines)
+
+
+def _format_bounded_source_check(
+    critical_fields: list[tuple[str, object, int, str]],
+    optional_fields: list[tuple[str, object, int, str]],
+    *,
+    max_html_chars: int,
+) -> str:
+    header = "<blockquote><b>Source check</b>"
+    footer = "</blockquote>"
+    if max_html_chars < len(header) + len(footer):
+        return ""
+
+    line_budget = (
+        max_html_chars - len(header) - len(footer) - len(critical_fields)
+    ) // max(1, len(critical_fields))
+    lines = [header]
+    for label, value, desired_limit, kind in critical_fields:
+        structural = len(f"<b>{escape(label)}</b>: ") + (13 if kind == "id" else 0)
+        lines.append(
+            format_bounded_field_line(
+                label,
+                value,
+                max_html_chars=max(1, min(desired_limit, line_budget - structural)),
+                kind=kind,
+            )
+        )
+    if len("\n".join(lines)) + len(footer) > max_html_chars:
+        return ""
+
+    omitted = False
+    for label, value, desired_limit, kind in optional_fields:
+        structural = len(f"<b>{escape(label)}</b>: ") + (13 if kind == "id" else 0)
+        available = max_html_chars - len("\n".join(lines)) - len(footer) - 1 - structural
+        if available < 16:
+            omitted = True
+            continue
+        lines.append(
+            format_bounded_field_line(
+                label,
+                value,
+                max_html_chars=min(desired_limit, available),
+                kind=kind,
+            )
+        )
+
+    omission_line = "<i>Additional provenance is stored with the update.</i>"
+    if omitted and len("\n".join([*lines, omission_line])) + len(footer) <= max_html_chars:
+        lines.append(omission_line)
+    lines[-1] += footer
     return "\n".join(lines)
 
 

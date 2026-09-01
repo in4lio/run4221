@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,8 @@ from run4221.bot.moderator import (
     archive_show_callback,
     archived_event_card_keyboard,
     archived_event_detail_keyboard,
+    channel_draft_keyboard,
+    channel_reconciliation_keyboard,
     delete_event_callback,
     delete_event_confirm_callback,
     delete_event_preview_keyboard,
@@ -1501,6 +1504,68 @@ def test_todo_keyboard_links_to_pending_work() -> None:
     assert suggestion_button.callback_data == suggestion_list_callback()
 
 
+def test_todo_includes_channel_drafts_when_present() -> None:
+    status = format_moderator_status(
+        pending_updates=0,
+        pending_suggestions=0,
+        pending_channel_messages=2,
+    )
+    keyboard = todo_keyboard(
+        pending_updates=0,
+        pending_suggestions=0,
+        pending_channel_messages=2,
+    )
+
+    assert "<b>Channel drafts</b>: 2" in status
+    assert keyboard is not None
+    assert keyboard.inline_keyboard[0][0].text == "Channel drafts"
+    assert keyboard.inline_keyboard[0][0].callback_data == "channel:list"
+
+
+def test_ambiguous_channel_draft_requires_explicit_reconciliation() -> None:
+    keyboard = channel_draft_keyboard(17, status="ambiguous")
+
+    assert len(keyboard.inline_keyboard) == 1
+    assert keyboard.inline_keyboard[0][0].text == "Reconcile delivery"
+    assert keyboard.inline_keyboard[0][0].callback_data == "channel:reconcile:17"
+
+    reconciliation = channel_reconciliation_keyboard(17)
+    assert [row[0].text for row in reconciliation.inline_keyboard] == [
+        "Confirmed absent — retry",
+        "Already published",
+    ]
+    assert [row[0].callback_data for row in reconciliation.inline_keyboard] == [
+        "channel:retry_confirmed:17",
+        "channel:mark_published:17",
+    ]
+
+
+def test_todo_reads_channel_queue_from_configured_database(monkeypatch) -> None:
+    async def allow(_message):
+        return True
+
+    seen: list[str | None] = []
+
+    def count_channel(*, database_url=None):
+        seen.append(database_url)
+        return 0
+
+    monkeypatch.setattr(moderator, "require_moderator", allow)
+    monkeypatch.setattr(
+        moderator,
+        "get_settings",
+        lambda: SimpleNamespace(database_url="sqlite:///configured.sqlite3"),
+    )
+    monkeypatch.setattr(moderator, "count_proposed_event_updates", lambda **_kwargs: 0)
+    monkeypatch.setattr(moderator, "count_event_suggestions", lambda **_kwargs: 0)
+    monkeypatch.setattr(moderator, "count_actionable_channel_messages", count_channel)
+    message = FakeMessage()
+
+    asyncio.run(moderator.handle_todo(message))
+
+    assert seen == ["sqlite:///configured.sqlite3"]
+
+
 def test_manual_update_event_runs_registration_scan(monkeypatch) -> None:
     event = TrackedEvent(
         id="barcelona.42",
@@ -1628,6 +1693,104 @@ def test_researcher_update_detail_is_bounded_and_keeps_actions() -> None:
         "Partial",
         "Reject",
     ]
+
+
+def test_researcher_update_detail_shows_validated_field_support_and_conflicts() -> None:
+    update = researcher_update()
+    update = replace(
+        update,
+        evidence=update.evidence
+        + (
+            "Researcher field support: registration_status <- "
+            "page_snapshot-status.json#bbbbbbbbbbbb",
+            "Researcher conflict: event_date <- "
+            "page_snapshot-overview.json#cccccccccccc, "
+            "page_snapshot-status.json#bbbbbbbbbbbb | "
+            "Overview and registration page use different date wording.",
+        ),
+    )
+
+    detail = format_proposed_update_detail(update)
+
+    assert (
+        "<b>Field support</b>: registration_status &lt;- "
+        "page_snapshot-status.json#bbbbbbbbbbbb"
+    ) in detail
+    assert (
+        "<b>Conflict</b>: event_date &lt;- "
+        "page_snapshot-overview.json#cccccccccccc, "
+        "page_snapshot-status.json#bbbbbbbbbbbb | "
+        "Overview and registration page use different date wording."
+    ) in detail
+
+
+def test_researcher_update_detail_bounds_complete_maximal_provenance() -> None:
+    run_id = "2d1aa0bb-13c1-4f1b-b81f-a7f6b83b62dc"
+    fields = (
+        "registration_status",
+        "registration_open_at",
+        "registration_open_precision",
+        "registration_close_at",
+        "registration_url",
+        "event_date",
+    )
+    evidence = list(
+        researcher_evidence(
+            summary="Official evidence " * 100,
+            source_url="https://example.com/register?" + "source=official&" * 100,
+        )
+    )
+    evidence.extend(
+        "researcher-evidence:v1 "
+        f"run={run_id} artifact=evidence-{index}.json sha256={'c' * 64} "
+        f"source=https://example.com/evidence/{index}?{'x=1&' * 100} "
+        f"captured_at=2026-08-31T14:0{index}:00+00:00"
+        for index in (1, 2)
+    )
+    evidence.extend(
+        f"Researcher field support: {field} <- E{index}.json#{str(index) * 12}"
+        for index, field in enumerate(fields, start=1)
+    )
+    evidence.extend(
+        f"Researcher conflict: unrelated-{index} <- E1.json#111111111111, "
+        f"E2.json#222222222222 | {'conflicting context ' * 40}"
+        for index in range(4)
+    )
+    update = ProposedEventUpdateRecord(
+        id=99,
+        event_id="badenmarathon.42",
+        update_type="registration_window",
+        current_fields={
+            "registration_status": "unknown",
+            "registration_open_at": "2026-01-01",
+            "registration_open_precision": "unknown",
+            "registration_close_at": "2026-02-01",
+            "registration_url": "https://example.com/old?" + "old=1&" * 100,
+            "event_date": "2026-09-20",
+        },
+        proposed_fields={
+            "registration_status": "closed",
+            "registration_open_at": "2026-05-01",
+            "registration_open_precision": "date_only",
+            "registration_close_at": "2026-11-01",
+            "registration_url": "https://example.com/new?" + "new=1&" * 100,
+            "event_date": "2027-09-19",
+        },
+        evidence=tuple(evidence),
+        confidence=0.97,
+        status="pending",
+        change_summary="Registration fields were refreshed from official sources.",
+    )
+
+    detail = format_proposed_update_detail(update)
+
+    assert len(detail) <= 4_096
+    assert detail.count("<blockquote>") == detail.count("</blockquote>") == 1
+    assert detail.count("<code>") == detail.count("</code>")
+    assert detail.count("<b>Field support</b>") == len(fields)
+    for index, field in enumerate(fields, start=1):
+        assert f"{field} &lt;- E{index}.json#{str(index) * 12}" in detail
+    assert f"<b>Run ID</b>: <code>{run_id}</code>" in detail
 
 
 def test_researcher_provenance_is_repeated_in_all_confirmations() -> None:

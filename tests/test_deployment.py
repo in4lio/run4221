@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -204,3 +207,172 @@ def test_example_keeps_researcher_paused_with_a_dedicated_credential() -> None:
     assert "RESEARCHER_ENABLED=false" in example
     assert "RESEARCHER_DISCOVERY_ENABLED=false" in example
     assert "RESEARCHER_RENDERING_ENABLED=false" in example
+
+
+def test_dockerignore_excludes_private_material_while_runtime_mounts_remain() -> None:
+    dockerignore = read_project_file(".dockerignore").splitlines()
+    compose = read_project_file("compose.yaml")
+
+    assert "private" in dockerignore
+    assert "private-source" in dockerignore
+    assert "private/runtime/bot.env" in compose
+    assert "private/runtime/researcher.env" in compose
+
+
+def test_example_env_does_not_leak_operational_status() -> None:
+    example = read_project_file(".env.example")
+
+    assert "canary" not in example.casefold()
+    assert "Keep disabled by default." in example
+
+
+def test_bootstrap_and_deploy_declare_failure_recovery_traps() -> None:
+    bootstrap = read_project_file(".github/workflows/bootstrap-production.yml")
+    deploy = read_project_file(".github/workflows/deploy.yml")
+
+    assert "trap restart_services ERR" in bootstrap
+    assert "trap recover_reset ERR" in bootstrap
+    assert bootstrap.count("docker compose up -d --no-build --wait --wait-timeout 90") == 2
+    assert "No previous bot image to roll back to;" in deploy
+
+
+def remote_script(workflow_text: str, step_name: str) -> str:
+    step_start = workflow_text.index(f"- name: {step_name}")
+    heredoc_start = workflow_text.index("<<'REMOTE'", step_start)
+    body_start = workflow_text.index("\n", heredoc_start) + 1
+    body_end = workflow_text.index("\n          REMOTE", body_start)
+    return textwrap.dedent(workflow_text[body_start:body_end])
+
+
+def run_remote_script(
+    script: str,
+    tmp_path: Path,
+    *,
+    docker_stub: str,
+    git_stub: str | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "docker").write_text("#!/bin/bash\n" + docker_stub, encoding="utf-8")
+    (bin_dir / "docker").chmod(0o755)
+    if git_stub is not None:
+        (bin_dir / "git").write_text("#!/bin/bash\n" + git_stub, encoding="utf-8")
+        (bin_dir / "git").chmod(0o755)
+    app_dir = tmp_path / "app"
+    app_dir.mkdir(exist_ok=True)
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}:{os.environ['PATH']}",
+        "APP_DIR": str(app_dir),
+        "CALL_LOG": str(tmp_path / "calls.log"),
+        **(extra_env or {}),
+    }
+    return subprocess.run(
+        ["bash", "-s"],
+        input=script,
+        text=True,
+        capture_output=True,
+        env=env,
+        cwd=tmp_path,
+    )
+
+
+def read_call_log(tmp_path: Path) -> str:
+    log_path = tmp_path / "calls.log"
+    return log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+
+
+def test_bootstrap_seed_prompts_failure_restarts_stopped_services(tmp_path: Path) -> None:
+    script = remote_script(
+        read_project_file(".github/workflows/bootstrap-production.yml"),
+        "Seed prompts",
+    )
+    docker_stub = """
+    echo "docker $*" >> "$CALL_LOG"
+    case "$*" in
+      "compose run"*) exit 1 ;;
+    esac
+    exit 0
+    """
+
+    result = run_remote_script(script, tmp_path, docker_stub=textwrap.dedent(docker_stub))
+
+    assert result.returncode != 0
+    assert "Prompt seeding failed; restarting stopped services." in result.stderr
+    log = read_call_log(tmp_path)
+    assert "docker compose stop bot researcher" in log
+    assert "docker compose up -d --no-build --wait --wait-timeout 90" in log
+
+
+def test_bootstrap_reset_failure_restores_backup_and_restarts_services(
+    tmp_path: Path,
+) -> None:
+    script = remote_script(
+        read_project_file(".github/workflows/bootstrap-production.yml"),
+        "Reset database and seed suggestions",
+    )
+    app_data = tmp_path / "app" / "data"
+    app_data.mkdir(parents=True)
+    (app_data / "run4221.sqlite3").write_text("original-db", encoding="utf-8")
+    docker_stub = """
+    echo "docker $*" >> "$CALL_LOG"
+    case "$*" in
+      *seed_suggestions*)
+        echo "partial reset" > data/run4221.sqlite3
+        exit 1
+        ;;
+      *"--no-deps bot uv run python -c"*)
+        backup_path=${@:$#}
+        cp data/run4221.sqlite3 "$backup_path"
+        exit 0
+        ;;
+    esac
+    exit 0
+    """
+
+    result = run_remote_script(script, tmp_path, docker_stub=textwrap.dedent(docker_stub))
+
+    assert result.returncode != 0
+    assert "Restoring pre-reset database backup." in result.stderr
+    assert (app_data / "run4221.sqlite3").read_text(encoding="utf-8") == "original-db"
+    log = read_call_log(tmp_path)
+    assert "docker compose up -d --no-build --wait --wait-timeout 90" in log
+
+
+def test_deploy_rollback_without_previous_image_leaves_stack_stopped(
+    tmp_path: Path,
+) -> None:
+    script = remote_script(
+        read_project_file(".github/workflows/deploy.yml"),
+        "Deploy selected commit",
+    )
+    docker_stub = """
+    echo "docker $*" >> "$CALL_LOG"
+    case "$*" in
+      "compose config --services") printf 'bot\\nresearcher\\n' ;;
+      "compose up -d --build --no-deps --wait --wait-timeout 90 bot") exit 1 ;;
+    esac
+    exit 0
+    """
+    git_stub = """
+    echo "git $*" >> "$CALL_LOG"
+    case "$*" in
+      "rev-parse HEAD") echo "previouscafe123" ;;
+    esac
+    exit 0
+    """
+
+    result = run_remote_script(
+        script,
+        tmp_path,
+        docker_stub=textwrap.dedent(docker_stub),
+        git_stub=textwrap.dedent(git_stub),
+        extra_env={"DEPLOY_SHA": "newdeadbeef456"},
+    )
+
+    assert result.returncode != 0
+    assert "No previous bot image to roll back to;" in result.stderr
+    log = read_call_log(tmp_path)
+    assert "docker compose up -d --build --no-deps --wait --wait-timeout 90 bot" in log
+    assert "docker compose up -d --no-build --remove-orphans" not in log

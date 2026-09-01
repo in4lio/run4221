@@ -2,22 +2,27 @@ import asyncio
 import gzip
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 import httpx
 import pytest
 
 from run4221.ingestion.page_snapshot import (
+    MAX_SNAPSHOT_TEXT_CHARS,
     PageFetchError,
     PageLink,
     PageSnapshot,
+    blocked_page_reason,
     fetch_enriched_page_snapshot,
     fetch_page_snapshot,
+    hash_text,
     merge_page_snapshots,
     store_page_snapshot,
 )
 from run4221.researcher.artifacts import ResearchArtifactStore
 
 MAX_EXPECTED_SNAPSHOT_LINKS = 100
+FIXTURE_DIR = Path(__file__).parent / "fixtures" / "researcher"
 
 
 def run(coro):
@@ -26,6 +31,31 @@ def run(coro):
 
 async def public_resolver(_hostname: str) -> tuple[str, ...]:
     return ("93.184.216.34",)
+
+
+def fetch_snapshot_from_content(
+    content: str,
+    *,
+    content_type: str = "text/html; charset=utf-8",
+) -> PageSnapshot:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": content_type},
+            text=content,
+            request=request,
+        )
+
+    async def fetch() -> PageSnapshot:
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_page_snapshot(
+                "https://example.com/event",
+                client=client,
+                resolve_host=public_resolver,
+            )
+
+    return run(fetch())
 
 
 def test_fetch_page_snapshot_extracts_text_title_links_and_hash() -> None:
@@ -74,6 +104,123 @@ def test_fetch_page_snapshot_extracts_text_title_links_and_hash() -> None:
     assert snapshot.links[0].text == "Register now"
     assert len(requested_urls) == 1
     assert requested_urls[0].endswith("/event")
+
+
+def test_fetch_page_snapshot_separates_main_content_from_navigation_noise() -> None:
+    snapshot = fetch_snapshot_from_content(
+        (FIXTURE_DIR / "berlin-navigation-noise.html").read_text(encoding="utf-8")
+    )
+
+    assert "BMW Berlin Marathon" in snapshot.primary_text
+    assert "Kids & Youth Mini Marathon" not in snapshot.primary_text
+    assert "Kids & Youth Mini Marathon" in snapshot.chrome_text
+    assert "BMW Berlin Marathon" in snapshot.normalized_text
+    assert "Kids & Youth Mini Marathon" in snapshot.normalized_text
+
+
+def test_fetch_page_snapshot_keeps_mini_marathon_main_as_primary_content() -> None:
+    snapshot = fetch_snapshot_from_content(
+        (FIXTURE_DIR / "baden-mini-marathon.html").read_text(encoding="utf-8")
+    )
+
+    assert "Baden Mini Marathon" in snapshot.primary_text
+    assert "Young runners complete a 4.2 km course." in snapshot.primary_text
+    assert "Baden Mini Marathon" not in snapshot.chrome_text
+
+
+def test_fetch_page_snapshot_falls_back_to_body_without_chrome() -> None:
+    snapshot = fetch_snapshot_from_content(
+        """
+        <html>
+          <head><title>Race calendar</title></head>
+          <body>
+            <header>All city races</header>
+            <nav>Kids &amp; Youth Mini Marathon</nav>
+            <section><h1>Baden Marathon</h1><p>Registration opens in May.</p></section>
+            <aside>Related relay race</aside>
+            <footer>Race organizer</footer>
+          </body>
+        </html>
+        """
+    )
+
+    assert snapshot.primary_text == "Baden Marathon Registration opens in May."
+    assert "Kids & Youth Mini Marathon" in snapshot.chrome_text
+    assert "Related relay race" in snapshot.chrome_text
+    assert "Race calendar" not in snapshot.primary_text
+
+
+def test_fetch_page_snapshot_falls_back_when_main_is_empty() -> None:
+    snapshot = fetch_snapshot_from_content(
+        """
+        <html><body>
+          <nav>Kids &amp; Youth Mini Marathon</nav>
+          <main></main>
+          <section><h1>Baden Marathon</h1><p>Registration is closed.</p></section>
+        </body></html>
+        """
+    )
+
+    assert snapshot.primary_text == "Baden Marathon Registration is closed."
+    assert "Kids & Youth Mini Marathon" not in snapshot.primary_text
+
+
+def test_fetch_page_snapshot_ignores_strong_content_nested_in_chrome() -> None:
+    snapshot = fetch_snapshot_from_content(
+        """
+        <html><body>
+          <aside><article>Related Mini Marathon registration</article></aside>
+          <section><h1>Baden Marathon</h1><p>Lottery registration is closed.</p></section>
+        </body></html>
+        """
+    )
+
+    assert snapshot.primary_text == "Baden Marathon Lottery registration is closed."
+    assert "Related Mini Marathon" not in snapshot.primary_text
+
+
+@pytest.mark.parametrize(
+    "opening_tag",
+    ("<main>", "<article>", '<section role="main">'),
+)
+def test_fetch_page_snapshot_recognizes_strong_content_zones(opening_tag: str) -> None:
+    closing_tag = f"</{opening_tag[1:].split(maxsplit=1)[0].rstrip('>')}>"
+    snapshot = fetch_snapshot_from_content(
+        f"""
+        <html><body>
+          <nav>Mini Marathon registration</nav>
+          {opening_tag}<h1>Baden Marathon</h1><p>Registration is closed.</p>{closing_tag}
+        </body></html>
+        """
+    )
+
+    assert snapshot.primary_text == "Baden Marathon Registration is closed."
+    assert "Mini Marathon" not in snapshot.primary_text
+
+
+@pytest.mark.parametrize(
+    ("content", "content_type", "expected"),
+    (
+        (
+            "Official race registration is open.",
+            "text/plain; charset=utf-8",
+            "Official race registration is open.",
+        ),
+        (
+            "<main><h1>Broken Marathon<p>Registration is open",
+            "text/html; charset=utf-8",
+            "Broken Marathon Registration is open",
+        ),
+    ),
+)
+def test_fetch_page_snapshot_keeps_primary_evidence_for_parseable_content(
+    content: str,
+    content_type: str,
+    expected: str,
+) -> None:
+    snapshot = fetch_snapshot_from_content(content, content_type=content_type)
+
+    assert snapshot.primary_text == expected
 
 
 def test_fetch_page_snapshot_caps_links_for_bounded_audit() -> None:
@@ -172,6 +319,8 @@ def test_fetched_capped_snapshot_is_accepted_by_audit_store(tmp_path) -> None:
 
     payload = store.read_artifact(reference)
     assert len(payload["content"]["links"]) == MAX_EXPECTED_SNAPSHOT_LINKS
+    assert payload["content"]["primary_text"] == snapshot.primary_text
+    assert payload["content"]["chrome_text"] == snapshot.chrome_text
 
 
 def test_merge_page_snapshots_caps_combined_links_for_bounded_audit() -> None:
@@ -183,12 +332,14 @@ def test_merge_page_snapshots_caps_combined_links_for_bounded_audit() -> None:
         status_code=200,
         content_type="text/html",
         title="Events",
-        normalized_text="Events",
+        normalized_text="Root full " + "r" * 35_000,
         text_hash="a" * 64,
         links=tuple(
             PageLink(url=f"https://example.com/root-{index}", text=f"Root {index}")
             for index in range(75)
         ),
+        primary_text="Root primary " + "p" * 35_000,
+        chrome_text="Root chrome " + "c" * 35_000,
     )
     linked = PageSnapshot(
         source_url="https://example.com/register",
@@ -197,18 +348,30 @@ def test_merge_page_snapshots_caps_combined_links_for_bounded_audit() -> None:
         status_code=200,
         content_type="text/html",
         title="Registration",
-        normalized_text="Registration",
+        normalized_text="Linked full " + "l" * 35_000,
         text_hash="b" * 64,
         links=tuple(
             PageLink(url=f"https://example.com/linked-{index}", text=f"Linked {index}")
             for index in range(75)
         ),
+        primary_text="Linked primary " + "q" * 35_000,
+        chrome_text="Linked chrome " + "d" * 35_000,
     )
 
     merged = merge_page_snapshots(root, (linked,))
 
     assert len(merged.links) == MAX_EXPECTED_SNAPSHOT_LINKS
     assert merged.links[-1].url == "https://example.com/linked-24"
+    assert merged.normalized_text.startswith("Root full ")
+    assert "Linked page: https://example.com/register." in merged.normalized_text
+    assert merged.primary_text.startswith("Root primary ")
+    assert "Linked primary " in merged.primary_text
+    assert merged.chrome_text.startswith("Root chrome ")
+    assert "Linked chrome " in merged.chrome_text
+    assert len(merged.normalized_text) == MAX_SNAPSHOT_TEXT_CHARS
+    assert len(merged.primary_text) == MAX_SNAPSHOT_TEXT_CHARS
+    assert len(merged.chrome_text) == MAX_SNAPSHOT_TEXT_CHARS
+    assert merged.text_hash == hash_text(merged.normalized_text)
 
 
 def test_merge_page_snapshots_caps_oversized_root_without_linked_pages() -> None:
@@ -255,6 +418,8 @@ def test_store_page_snapshot_writes_json(tmp_path) -> None:
     assert payload["source_url"] == "https://example.com"
     assert payload["title"] == "Test"
     assert payload["text_hash"] == snapshot.text_hash
+    assert payload["primary_text"] == "Hello"
+    assert payload["chrome_text"] == ""
 
 
 def test_fetch_enriched_page_snapshot_fetches_same_domain_registration_page() -> None:
@@ -516,3 +681,70 @@ def test_fetch_page_snapshot_rejects_compressed_body() -> None:
 
     with pytest.raises(PageFetchError, match="Compressed page responses"):
         run(fetch())
+
+
+def status_snapshot(status_code: int, *, text: str = "Event page.") -> PageSnapshot:
+    return PageSnapshot(
+        source_url="https://example.com/event",
+        final_url="https://example.com/event",
+        fetched_at=datetime(2026, 8, 31, 14, 0, tzinfo=UTC),
+        status_code=status_code,
+        content_type="text/html",
+        title="Event",
+        normalized_text=text,
+        text_hash=hash_text(text),
+        links=(),
+    )
+
+
+def test_blocked_page_reason_rejects_every_http_error_status() -> None:
+    assert blocked_page_reason(status_snapshot(404)) == "unusable HTTP status 404"
+    assert blocked_page_reason(status_snapshot(500)) == "unusable HTTP status 500"
+    assert blocked_page_reason(status_snapshot(301)) == "unusable HTTP status 301"
+    assert blocked_page_reason(status_snapshot(403)) == "blocked HTTP status 403"
+    assert blocked_page_reason(status_snapshot(200)) is None
+    assert blocked_page_reason(status_snapshot(204)) is None
+
+
+def test_fetch_enriched_page_snapshot_drops_linked_page_redirecting_off_origin() -> None:
+    seen_hosts: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen_hosts.append(request.headers["host"])
+        if request.headers["host"] == "evil.example":
+            return httpx.Response(
+                200, text="<html><body>Third-party capture</body></html>", request=request
+            )
+        if request.url.path == "/":
+            html = """
+            <html>
+              <head><title>Badenmarathon</title></head>
+              <body>
+                <h1>Badenmarathon</h1>
+                <a href="/anmeldung">Anmeldung</a>
+              </body>
+            </html>
+            """
+            return httpx.Response(200, text=html, request=request)
+        if request.url.path == "/anmeldung":
+            return httpx.Response(
+                302,
+                headers={"location": "https://evil.example/capture"},
+                request=request,
+            )
+        return httpx.Response(404, request=request)
+
+    async def fetch():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_enriched_page_snapshot(
+                "https://example.com/",
+                client=client,
+                resolve_host=public_resolver,
+            )
+
+    snapshot = run(fetch())
+
+    assert "evil.example" not in seen_hosts
+    assert "Third-party capture" not in snapshot.normalized_text
+    assert "Badenmarathon" in snapshot.normalized_text

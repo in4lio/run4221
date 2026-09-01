@@ -108,6 +108,15 @@ jobs:
             "APP_DIR='${{ secrets.VPS_APP_DIR }}' bash -s" <<'REMOTE'
           set -euo pipefail
           cd "$APP_DIR"
+          restart_services() {
+            status="$?"
+            trap - ERR
+            echo "Prompt seeding failed; restarting stopped services." >&2
+            docker compose up -d --no-build --wait --wait-timeout 90 || true
+            docker compose ps || true
+            exit "$status"
+          }
+          trap restart_services ERR
           docker compose stop bot researcher
           docker compose run --rm -T --interactive=false \
             -v "$PWD/private:/app/private:ro" \
@@ -115,6 +124,7 @@ jobs:
               --prompts-dir private/prompts \
               --database-url sqlite:///data/run4221.sqlite3
           docker compose up -d --wait --wait-timeout 90
+          trap - ERR
           docker compose ps
           REMOTE
 
@@ -131,6 +141,22 @@ jobs:
             "APP_DIR='${{ secrets.VPS_APP_DIR }}' bash -s" <<'REMOTE'
           set -euo pipefail
           cd "$APP_DIR"
+          backup_path=""
+          restore_needed=false
+          recover_reset() {
+            status="$?"
+            trap - ERR
+            echo "Reset bootstrap failed; recovering services." >&2
+            if [[ "$restore_needed" == "true" && -s "$backup_path" ]]; then
+              echo "Restoring pre-reset database backup." >&2
+              cp -f "$backup_path" data/run4221.sqlite3 || true
+              rm -f data/run4221.sqlite3-wal data/run4221.sqlite3-shm || true
+            fi
+            docker compose up -d --no-build --wait --wait-timeout 90 || true
+            docker compose ps || true
+            exit "$status"
+          }
+          trap recover_reset ERR
           docker compose stop bot researcher
           mkdir -p data/backups
           if [[ -f data/run4221.sqlite3 ]]; then
@@ -140,6 +166,7 @@ jobs:
               "$backup_path"
             test -s "$backup_path"
             test ! -s data/run4221.sqlite3-wal
+            restore_needed=true
             rm -f data/run4221.sqlite3-wal data/run4221.sqlite3-shm
           fi
           docker compose run --rm -T --interactive=false \
@@ -149,6 +176,8 @@ jobs:
               --database-url sqlite:///data/run4221.sqlite3 \
               --reset-sqlite \
               --confirm-reset RESET_SUGGESTION_BOOTSTRAP
+          restore_needed=false
           docker compose up -d --build --remove-orphans --wait --wait-timeout 90
+          trap - ERR
           docker compose ps
           REMOTE

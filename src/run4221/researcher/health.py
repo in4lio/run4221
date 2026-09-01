@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Literal
 from uuid import uuid4
 
+from run4221.researcher.artifacts import fsync_directory
+
 WorkerMode = Literal["paused", "enabled"]
 WorkerActivity = Literal["idle", "active"]
 
@@ -127,7 +129,7 @@ class HealthStore:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
-            _fsync_directory(self.path.parent)
+            fsync_directory(self.path.parent)
         finally:
             if descriptor is not None:
                 os.close(descriptor)
@@ -165,14 +167,6 @@ def _parse_timestamp(value: str) -> datetime:
     if parsed.tzinfo is None:
         raise ValueError("Timestamp must be timezone-aware.")
     return parsed.astimezone(UTC)
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def main() -> None:

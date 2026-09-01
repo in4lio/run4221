@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from run4221.ai.event_extractor import (
+    conflicts_with_event_identity,
     draft_from_page_snapshot,
     extract_event_draft_from_url,
     select_registration_url_for_distances,
@@ -464,3 +465,26 @@ def test_extractor_falls_back_to_url_text_when_fetch_fails() -> None:
     assert draft.public_id == "berlin.42"
     assert draft.confidence == 0.05
     assert "Page fetch failed" in draft.evidence
+
+
+def test_mixed_distance_event_accepts_its_own_half_and_full_pages() -> None:
+    distances = ("marathon", "half_marathon")
+
+    assert not conflicts_with_event_identity(
+        "https://race.example/halbmarathon/anmeldung", "Halbmarathon", distances
+    )
+    assert not conflicts_with_event_identity(
+        "https://race.example/marathon/anmeldung", "42 km Marathon", distances
+    )
+    assert conflicts_with_event_identity(
+        "https://race.example/mini-marathon", "Mini Marathon", distances
+    )
+
+
+def test_single_distance_event_still_rejects_other_distance_pages() -> None:
+    assert conflicts_with_event_identity(
+        "https://race.example/halbmarathon", "", ("marathon",)
+    )
+    assert conflicts_with_event_identity(
+        "https://race.example/42km", "", ("half_marathon",)
+    )

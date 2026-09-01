@@ -16,18 +16,49 @@ from run4221.researcher.artifacts import (
     QueueResolutionState,
     ResearchArtifactStore,
 )
-from run4221.researcher.schemas import ResearchDecision, ResearchRunStatus
+from run4221.researcher.schemas import (
+    ArtifactReference,
+    ResearchDecision,
+    ResearchRunStatus,
+)
 
 SOURCE_URL = "https://example.com/marathon"
 
 
-def decision() -> ResearchDecision:
+def decision(evidence: ArtifactReference) -> ResearchDecision:
     return ResearchDecision(
         action="propose_update",
         summary="Registration is open on the captured official page.",
         confidence=0.9,
         proposed_fields={"registration_status": "open"},
-        evidence=[],
+        evidence=[evidence],
+        applicability=[
+            {
+                "evidence": evidence,
+                "event_identity": "confirmed",
+                "event_edition": "confirmed",
+                "distance_category": "confirmed",
+                "applicable_fields": ["registration_status"],
+            }
+        ],
+        field_support=[
+            {
+                "field": "registration_status",
+                "evidence": [evidence],
+            }
+        ],
+    )
+
+
+def write_registration_evidence(
+    store: ResearchArtifactStore,
+    run_id: str,
+) -> ArtifactReference:
+    return store.write_artifact(
+        run_id,
+        artifact_type="evidence",
+        source_url=SOURCE_URL,
+        content={"text": "Registration is open."},
     )
 
 
@@ -182,22 +213,11 @@ def test_prepared_decision_requires_committed_evidence_and_refuses_overwrite(
 ) -> None:
     store = ResearchArtifactStore(tmp_path)
     run_id = store.create_run(job_type="refresh")
-    evidence = store.write_artifact(
-        run_id,
-        artifact_type="evidence",
-        source_url=SOURCE_URL,
-        content={"text": "Registration is open."},
-    )
+    evidence = write_registration_evidence(store, run_id)
     prepared = store.prepare_decision(
         run_id,
         source_url=SOURCE_URL,
-        decision=ResearchDecision(
-            action="propose_update",
-            summary="Registration is open.",
-            confidence=0.9,
-            proposed_fields={"registration_status": "open"},
-            evidence=[evidence],
-        ),
+        decision=decision(evidence),
         committed_status=committed_status(),
     )
 
@@ -206,13 +226,7 @@ def test_prepared_decision_requires_committed_evidence_and_refuses_overwrite(
         store.prepare_decision(
             run_id,
             source_url=SOURCE_URL,
-            decision=ResearchDecision(
-                action="propose_update",
-                summary="Registration is open.",
-                confidence=0.9,
-                proposed_fields={"registration_status": "open"},
-                evidence=[evidence],
-            ),
+            decision=decision(evidence),
             committed_status=committed_status(),
         )
 
@@ -222,10 +236,11 @@ def test_reconcile_absent_prepared_decision_records_truthful_terminal(
 ) -> None:
     store = ResearchArtifactStore(tmp_path)
     run_id = store.create_run(job_type="refresh")
+    evidence = write_registration_evidence(store, run_id)
     prepared = store.prepare_decision(
         run_id,
         source_url=SOURCE_URL,
-        decision=decision(),
+        decision=decision(evidence),
         committed_status=committed_status(),
     )
 
@@ -268,10 +283,11 @@ def test_reconcile_committed_after_finalize_crash_records_one_terminal(
 ) -> None:
     store = ResearchArtifactStore(tmp_path)
     run_id = store.create_run(job_type="refresh")
+    evidence = write_registration_evidence(store, run_id)
     prepared = store.prepare_decision(
         run_id,
         source_url=SOURCE_URL,
-        decision=decision(),
+        decision=decision(evidence),
         committed_status=committed_status(),
     )
     real_link = os.link
@@ -312,10 +328,11 @@ def test_reconcile_committed_after_finalize_crash_records_one_terminal(
 def test_inconclusive_reconciliation_does_not_invent_terminal_state(tmp_path: Path) -> None:
     store = ResearchArtifactStore(tmp_path)
     run_id = store.create_run(job_type="refresh")
+    evidence = write_registration_evidence(store, run_id)
     store.prepare_decision(
         run_id,
         source_url=SOURCE_URL,
-        decision=decision(),
+        decision=decision(evidence),
         committed_status=committed_status(),
     )
 
