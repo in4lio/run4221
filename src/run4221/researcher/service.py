@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from typing import Protocol
 
+from run4221.ai.event_extractor import conflicts_with_event_identity
 from run4221.db.research import (
     EventSuggestionCreate,
     ProposedEventUpdateCreate,
@@ -29,7 +30,7 @@ from run4221.researcher.agent import (
     ScoutRunResult,
 )
 from run4221.researcher.artifacts import ResearchArtifactStore
-from run4221.researcher.policy import SourceTrustPolicy
+from run4221.researcher.policy import SourceTrustPolicy, source_domain
 from run4221.researcher.schemas import (
     ArtifactReference,
     DecisionAction,
@@ -43,6 +44,7 @@ from run4221.researcher.schemas import (
 )
 
 AUDIT_SOURCE_URL = "https://run4221.invalid/researcher"
+MAX_REFRESH_FOLLOWUP_PAGES = 2
 SUPPORTED_UPDATE_FIELDS = (
     "registration_status",
     "registration_open_at",
@@ -127,11 +129,60 @@ class ResearcherService:
                 f"Approved source was unusable: {reason}.",
             )
 
+        captures = [captured]
+        if self._refresh_search_enabled():
+            scout = await self.agent.scout(
+                ScoutRequest(
+                    mode="refresh",
+                    query=_refresh_search_query(frozen_event, source.url),
+                    approved_source_url=source.url,
+                    context=_event_context(frozen_event, source.url),
+                )
+            )
+            self._record_scout(run_id, source.url, scout)
+            if scout.state is not AgentRunState.SUCCEEDED:
+                return self._finish_agent_outcome(run_id, source.url, scout)
+
+            followup_limit = min(
+                MAX_REFRESH_FOLLOWUP_PAGES,
+                self.budget.max_static_pages_per_job - 1,
+            )
+            captured_final_urls = {normalize_url(captured.snapshot.final_url)}
+            for candidate_url in _refresh_candidate_urls(
+                scout.candidates,
+                event=frozen_event,
+                approved_source_url=source.url,
+            ):
+                if len(captures) - 1 >= followup_limit:
+                    break
+                try:
+                    followup = await self._capture(run_id, candidate_url)
+                except PageFetchError:
+                    continue
+                if blocked_page_reason(followup.snapshot) is not None:
+                    continue
+                if not _same_source_domain(
+                    followup.snapshot.final_url,
+                    source.url,
+                ):
+                    continue
+                if conflicts_with_event_identity(
+                    followup.snapshot.final_url,
+                    followup.snapshot.title or "",
+                    frozen_event.distances,
+                ):
+                    continue
+                normalized_final_url = normalize_url(followup.snapshot.final_url)
+                if normalized_final_url in captured_final_urls:
+                    continue
+                captures.append(followup)
+                captured_final_urls.add(normalized_final_url)
+
         assessment = await self.agent.assess(
             AssessmentRequest(
                 mode="refresh",
                 context=_event_context(frozen_event, source.url),
-                evidence=(captured.as_agent_evidence(),),
+                evidence=tuple(item.as_agent_evidence() for item in captures),
             )
         )
         self._record_assessment(run_id, source.url, assessment)
@@ -152,7 +203,10 @@ class ResearcherService:
                 outcome,
                 decision.summary,
             )
-        if not self._valid_evidence(decision, required=(captured.reference,)):
+        if not self._valid_evidence(
+            decision,
+            required=tuple(item.reference for item in captures),
+        ):
             return self._finish_without_queue(
                 run_id,
                 source.url,
@@ -203,8 +257,12 @@ class ResearcherService:
         )
         evidence_lines = _moderation_evidence(
             decision.summary,
-            (captured,),
-            trust_reason="stored approved event source",
+            tuple(captures),
+            trust_reason=(
+                "stored approved event source plus same-domain official search results"
+                if len(captures) > 1
+                else "stored approved event source"
+            ),
             prepared=prepared,
         )
         try:
@@ -264,17 +322,10 @@ class ResearcherService:
         scout = await self.agent.scout(
             ScoutRequest(mode="discovery", query=clean_query)
         )
-        self.artifacts.write_artifact(
+        self._record_scout(
             run_id,
-            artifact_type="search_summary",
-            source_url=(scout.candidates[0].source_url if scout.candidates else AUDIT_SOURCE_URL),
-            content={
-                "state": scout.state.value,
-                "metadata": asdict(scout.metadata),
-                "candidates": [candidate.model_dump(mode="json") for candidate in scout.candidates],
-                "error_code": scout.error_code,
-                "detail": scout.detail,
-            },
+            scout.candidates[0].source_url if scout.candidates else AUDIT_SOURCE_URL,
+            scout,
         )
         if scout.state is not AgentRunState.SUCCEEDED:
             return self._finish_agent_outcome(run_id, AUDIT_SOURCE_URL, scout)
@@ -497,6 +548,33 @@ class ResearcherService:
         reference = self.artifacts.write_page_snapshot(run_id, snapshot)
         return CapturedPage(snapshot=snapshot, reference=reference)
 
+    def _refresh_search_enabled(self) -> bool:
+        return (
+            self.budget.max_web_searches_per_job > 0
+            and self.budget.max_static_pages_per_job > 1
+        )
+
+    def _record_scout(
+        self,
+        run_id: str,
+        source_url: str,
+        result: ScoutRunResult,
+    ) -> ArtifactReference:
+        return self.artifacts.write_artifact(
+            run_id,
+            artifact_type="search_summary",
+            source_url=source_url,
+            content={
+                "state": result.state.value,
+                "metadata": asdict(result.metadata),
+                "candidates": [
+                    candidate.model_dump(mode="json") for candidate in result.candidates
+                ],
+                "error_code": result.error_code,
+                "detail": result.detail,
+            },
+        )
+
     def _announce_run(self, run_id: str) -> None:
         if self.on_run_started is not None:
             self.on_run_started(run_id)
@@ -637,6 +715,52 @@ def _event_context(event: TrackedEvent, approved_source_url: str) -> tuple[Froze
         "approved_source_url": approved_source_url,
     }
     return tuple(FrozenContextField(name=name, value=str(value)) for name, value in values.items())
+
+
+def _refresh_search_query(event: TrackedEvent, approved_source_url: str) -> str:
+    year = event.event_date[:4] if event.event_date else "current"
+    distances = " ".join(event.distances).replace("_", " ")
+    query = (
+        f'site:{source_domain(approved_source_url)} "{event.name}" {year} {distances} '
+        "standard public registration lottery status opening closing dates"
+    )
+    return query[:500]
+
+
+def _refresh_candidate_urls(
+    candidates: tuple[ResearchCandidate, ...],
+    *,
+    event: TrackedEvent,
+    approved_source_url: str,
+) -> tuple[str, ...]:
+    approved = normalize_url(approved_source_url)
+    selected: list[str] = []
+    selected_normalized: set[str] = {approved}
+    for candidate in candidates:
+        if not _same_source_domain(candidate.source_url, approved_source_url):
+            continue
+        if (
+            event.event_date is not None
+            and candidate.event_date is not None
+            and candidate.event_date != event.event_date
+        ):
+            continue
+        if conflicts_with_event_identity(
+            candidate.source_url,
+            f"{candidate.title} {candidate.snippet}",
+            event.distances,
+        ):
+            continue
+        normalized = normalize_url(candidate.source_url)
+        if normalized in selected_normalized:
+            continue
+        selected.append(candidate.source_url)
+        selected_normalized.add(normalized)
+    return tuple(selected)
+
+
+def _same_source_domain(candidate_url: str, approved_source_url: str) -> bool:
+    return source_domain(candidate_url) == source_domain(approved_source_url)
 
 
 def _changed_supported_fields(

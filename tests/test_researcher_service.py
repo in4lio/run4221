@@ -19,7 +19,12 @@ from run4221.db.repository import (
     list_proposed_event_updates,
 )
 from run4221.db.research import list_due_sources
-from run4221.ingestion.page_snapshot import PageLink, PageSnapshot, fetch_page_snapshot
+from run4221.ingestion.page_snapshot import (
+    PageFetchError,
+    PageLink,
+    PageSnapshot,
+    fetch_page_snapshot,
+)
 from run4221.researcher.agent import (
     AgentRunMetadata,
     AgentRunState,
@@ -56,14 +61,17 @@ def snapshot(
     *,
     text: str = "Registration is open.",
     links: tuple[PageLink, ...] = (),
+    final_url: str | None = None,
+    title: str = "Example Marathon",
+    status_code: int = 200,
 ) -> PageSnapshot:
     return PageSnapshot(
         source_url=url,
-        final_url=url,
+        final_url=final_url or url,
         fetched_at=datetime(2026, 8, 31, 14, 0, tzinfo=UTC),
-        status_code=200,
+        status_code=status_code,
         content_type="text/html",
-        title="Example Marathon",
+        title=title,
         normalized_text=text,
         text_hash="a" * 64,
         links=links,
@@ -143,6 +151,7 @@ def service(
     fetch,
     trusted_domains=("baden.example", "official.example"),
     trusted_registry_urls=(),
+    budget: ResearchBudget | None = None,
 ) -> ResearcherService:
     return ResearcherService(
         database_url=url,
@@ -152,7 +161,7 @@ def service(
             trusted_domains=frozenset(trusted_domains),
             trusted_registry_urls=tuple(trusted_registry_urls),
         ),
-        budget=ResearchBudget(max_wall_time_seconds_per_job=10),
+        budget=budget or ResearchBudget(max_wall_time_seconds_per_job=10),
         fetch_snapshot=fetch,
     )
 
@@ -192,6 +201,370 @@ def test_ae1_refresh_creates_proposal_without_mutating_event(tmp_path: Path) -> 
     assert any("researcher-decision:v1" in line for line in updates[0].evidence)
     assert any("stored approved event source" in line for line in updates[0].evidence)
     assert any("captured_at=2026-08-31T14:00:00+00:00" in line for line in updates[0].evidence)
+
+
+def test_refresh_searches_and_captures_bounded_official_followups(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    source = tracked_source(url)
+    registration_url = "https://baden.example/registration/information"
+    lottery_url = "https://baden.example/registration/lottery"
+    agent = FakeAgent(
+        candidates=(
+            ResearchCandidate(
+                source_url="https://other.example/registration",
+                title="Unrelated registration",
+                snippet="A different organizer.",
+            ),
+            ResearchCandidate(
+                source_url="https://baden.example/kids-and-youth/mini-marathon",
+                title="Mini Marathon registration",
+                snippet="Registration for children.",
+            ),
+            ResearchCandidate(
+                source_url=registration_url,
+                title="Baden Marathon registration",
+                snippet="The standard public marathon registration dates.",
+            ),
+            ResearchCandidate(
+                source_url=lottery_url,
+                title="Baden Marathon lottery",
+                snippet="Lottery results and closing date.",
+            ),
+        ),
+        decide=lambda request: ResearchDecision(
+            action="propose_update",
+            summary="The standard marathon lottery closed after the published deadline.",
+            confidence=0.98,
+            proposed_fields={"registration_status": "closed"},
+            evidence=[item.reference for item in request.evidence],
+        ),
+    )
+    fetched_urls: list[str] = []
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        fetched_urls.append(source_url)
+        texts = {
+            source.url: "Baden Marathon 2027.",
+            registration_url: "Lottery registration was open until November 6, 2026.",
+            lottery_url: "Lottery results were sent at the end of November 2026.",
+        }
+        return snapshot(source_url, text=texts[source_url])
+
+    result = asyncio.run(
+        service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=fetch,
+            budget=ResearchBudget(
+                max_candidates_per_cycle=4,
+                max_static_pages_per_job=3,
+                max_wall_time_seconds_per_job=10,
+            ),
+        ).refresh(source)
+    )
+
+    assert result.status.outcome == "proposal_created"
+    assert fetched_urls == [source.url, registration_url, lottery_url]
+    assert len(agent.scout_calls) == 1
+    assert agent.scout_calls[0].mode == "refresh"
+    assert agent.scout_calls[0].approved_source_url == source.url
+    assert "Baden Marathon" in agent.scout_calls[0].query
+    assert "2027" in agent.scout_calls[0].query
+    assert len(agent.assessment_calls[0].evidence) == 3
+    update = list_proposed_event_updates(event_id=source.event.id, database_url=url)[0]
+    assert update.proposed_fields == {"registration_status": "closed"}
+    assert sum("researcher-evidence:v1" in line for line in update.evidence) == 3
+
+
+def test_refresh_search_authority_stays_with_stored_source_host(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    source = tracked_source(url)
+    redirected_host_candidate = "https://registration-platform.example/baden"
+    stored_host_candidate = "https://baden.example/registration"
+    agent = FakeAgent(
+        candidates=(
+            ResearchCandidate(
+                source_url=redirected_host_candidate,
+                title="Baden Marathon registration",
+                snippet="Registration details.",
+            ),
+            ResearchCandidate(
+                source_url=stored_host_candidate,
+                title="Baden Marathon registration",
+                snippet="Registration details.",
+            ),
+        ),
+        decide=lambda request: ResearchDecision(
+            action="no_change",
+            summary="The captured pages do not support a change.",
+            evidence=[item.reference for item in request.evidence],
+        ),
+    )
+    fetched_urls: list[str] = []
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        fetched_urls.append(source_url)
+        if source_url == source.url:
+            return snapshot(
+                source_url,
+                final_url="https://registration-platform.example/baden",
+            )
+        return snapshot(source_url)
+
+    result = asyncio.run(
+        service(tmp_path, url=url, agent=agent, fetch=fetch).refresh(source)
+    )
+
+    assert result.status.outcome == "no_change"
+    assert agent.scout_calls[0].approved_source_url == source.url
+    assert fetched_urls == [source.url, stored_host_candidate]
+
+
+def test_refresh_revalidates_identity_after_same_host_redirect(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    source = tracked_source(url)
+    candidate_url = "https://baden.example/registration"
+    agent = FakeAgent(
+        candidates=(
+            ResearchCandidate(
+                source_url=candidate_url,
+                title="Baden Marathon registration",
+                snippet="Registration details for the standard marathon.",
+            ),
+        ),
+        decide=lambda request: ResearchDecision(
+            action="no_change",
+            summary="The approved event page does not support a change.",
+            evidence=[item.reference for item in request.evidence],
+        ),
+    )
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        if source_url == candidate_url:
+            return snapshot(
+                source_url,
+                final_url="https://baden.example/kids-and-youth/mini-marathon",
+                title="mini-MARATHON for kids and youth",
+            )
+        return snapshot(source_url, title="Baden Marathon")
+
+    result = asyncio.run(
+        service(tmp_path, url=url, agent=agent, fetch=fetch).refresh(source)
+    )
+
+    assert result.status.outcome == "no_change"
+    assert len(agent.assessment_calls[0].evidence) == 1
+
+
+def test_refresh_rejects_cross_host_followup_redirect_and_keeps_searching(
+    tmp_path: Path,
+) -> None:
+    url = database_url(tmp_path)
+    source = tracked_source(url)
+    redirected_url = "https://baden.example/registration/redirect"
+    working_url = "https://baden.example/registration/lottery"
+    agent = FakeAgent(
+        candidates=tuple(
+            ResearchCandidate(
+                source_url=candidate_url,
+                title="Baden Marathon registration",
+                snippet="Registration details for the standard marathon.",
+            )
+            for candidate_url in (redirected_url, working_url)
+        ),
+        decide=lambda request: ResearchDecision(
+            action="no_change",
+            summary="The accepted official evidence is current.",
+            evidence=[item.reference for item in request.evidence],
+        ),
+    )
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        if source_url == redirected_url:
+            return snapshot(
+                source_url,
+                final_url="https://registration-platform.example/baden",
+            )
+        return snapshot(source_url, title="Baden Marathon registration")
+
+    result = asyncio.run(
+        service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=fetch,
+            budget=ResearchBudget(
+                max_static_pages_per_job=2,
+                max_wall_time_seconds_per_job=10,
+            ),
+        ).refresh(source)
+    )
+
+    assert result.status.outcome == "no_change"
+    assert len(agent.assessment_calls[0].evidence) == 2
+    assert agent.assessment_calls[0].evidence[1].final_url == working_url
+
+
+def test_refresh_tries_later_candidate_after_followup_fetch_failure(
+    tmp_path: Path,
+) -> None:
+    url = database_url(tmp_path)
+    source = tracked_source(url)
+    failing_url = "https://baden.example/registration/temporary"
+    working_url = "https://baden.example/registration/lottery"
+    agent = FakeAgent(
+        candidates=tuple(
+            ResearchCandidate(
+                source_url=candidate_url,
+                title="Baden Marathon registration",
+                snippet="Registration details for the standard marathon.",
+            )
+            for candidate_url in (failing_url, working_url)
+        ),
+        decide=lambda request: ResearchDecision(
+            action="no_change",
+            summary="The captured registration evidence is current.",
+            evidence=[item.reference for item in request.evidence],
+        ),
+    )
+    fetched_urls: list[str] = []
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        fetched_urls.append(source_url)
+        if source_url == failing_url:
+            raise PageFetchError("temporary fetch failure")
+        return snapshot(source_url, title="Baden Marathon registration")
+
+    result = asyncio.run(
+        service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=fetch,
+            budget=ResearchBudget(
+                max_static_pages_per_job=2,
+                max_wall_time_seconds_per_job=10,
+            ),
+        ).refresh(source)
+    )
+
+    assert result.status.outcome == "no_change"
+    assert fetched_urls == [source.url, failing_url, working_url]
+    assert len(agent.assessment_calls[0].evidence) == 2
+
+
+def test_refresh_rejects_incomplete_followup_evidence_set(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    source = tracked_source(url)
+    registration_url = "https://baden.example/registration"
+    agent = FakeAgent(
+        candidates=(
+            ResearchCandidate(
+                source_url=registration_url,
+                title="Baden Marathon registration",
+                snippet="Registration details for the standard marathon.",
+            ),
+        ),
+        decide=lambda request: ResearchDecision(
+            action="propose_update",
+            summary="Registration is closed.",
+            proposed_fields={"registration_status": "closed"},
+            evidence=[request.evidence[0].reference],
+        ),
+    )
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url, title="Baden Marathon registration")
+
+    result = asyncio.run(
+        service(tmp_path, url=url, agent=agent, fetch=fetch).refresh(source)
+    )
+
+    assert result.status.outcome == "inconclusive"
+    assert count_proposed_event_updates(database_url=url) == 0
+
+
+def test_refresh_without_search_budget_preserves_single_page_assessment(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    source = tracked_source(url)
+    agent = FakeAgent(decide=refresh_decision)
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url)
+
+    result = asyncio.run(
+        service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=fetch,
+            budget=ResearchBudget(
+                max_web_searches_per_job=0,
+                max_wall_time_seconds_per_job=10,
+            ),
+        ).refresh(source)
+    )
+
+    assert result.status.outcome == "proposal_created"
+    assert agent.scout_calls == []
+    assert len(agent.assessment_calls[0].evidence) == 1
+
+
+def test_refresh_single_page_budget_skips_search(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    source = tracked_source(url)
+    agent = FakeAgent(decide=refresh_decision)
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url)
+
+    result = asyncio.run(
+        service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=fetch,
+            budget=ResearchBudget(
+                max_web_searches_per_job=2,
+                max_static_pages_per_job=1,
+                max_wall_time_seconds_per_job=10,
+            ),
+        ).refresh(source)
+    )
+
+    assert result.status.outcome == "proposal_created"
+    assert agent.scout_calls == []
+    assert len(agent.assessment_calls[0].evidence) == 1
+
+
+def test_refresh_search_failure_is_inconclusive_without_assessment(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    source = tracked_source(url)
+
+    class FailingScoutAgent(FakeAgent):
+        async def scout(self, request):
+            self.scout_calls.append(request)
+            return ScoutRunResult(
+                state=AgentRunState.FAILED,
+                metadata=metadata(),
+                error_code="provider_error",
+                detail="The provider request failed.",
+            )
+
+    agent = FailingScoutAgent(decide=refresh_decision)
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url)
+
+    result = asyncio.run(
+        service(tmp_path, url=url, agent=agent, fetch=fetch).refresh(source)
+    )
+
+    assert result.status.status == "failed"
+    assert result.status.outcome == "inconclusive"
+    assert agent.assessment_calls == []
+    assert count_proposed_event_updates(database_url=url) == 0
 
 
 def test_refresh_can_explicitly_clear_invalid_registration_url(tmp_path: Path) -> None:
