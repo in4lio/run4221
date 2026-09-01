@@ -67,6 +67,8 @@ class PageSnapshot:
     normalized_text: str
     text_hash: str
     links: tuple[PageLink, ...]
+    primary_text: str = ""
+    chrome_text: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -77,6 +79,8 @@ class PageSnapshot:
             "content_type": self.content_type,
             "title": self.title,
             "normalized_text": self.normalized_text,
+            "primary_text": self.primary_text,
+            "chrome_text": self.chrome_text,
             "text_hash": self.text_hash,
             "links": [link.to_dict() for link in self.links],
         }
@@ -279,6 +283,8 @@ def blocked_page_reason(snapshot: PageSnapshot) -> str | None:
         return f"blocked HTTP status {snapshot.status_code}"
     if has_protection_text:
         return "site protection challenge page"
+    if not 200 <= snapshot.status_code < 300:
+        return f"unusable HTTP status {snapshot.status_code}"
 
     return None
 
@@ -327,7 +333,10 @@ async def fetch_page_snapshot(
     except (httpx.HTTPError, ValueError) as error:
         raise PageFetchError(f"Could not fetch {url}: {error}") from error
 
-    title, normalized_text, links = extract_response_content(response.text, str(response.url))
+    title, normalized_text, primary_text, chrome_text, links = extract_response_content(
+        response.text,
+        str(response.url),
+    )
     stored_text = normalized_text[:MAX_SNAPSHOT_TEXT_CHARS]
     return PageSnapshot(
         source_url=url,
@@ -339,6 +348,8 @@ async def fetch_page_snapshot(
         normalized_text=stored_text,
         text_hash=hash_text(stored_text),
         links=links,
+        primary_text=primary_text[:MAX_SNAPSHOT_TEXT_CHARS],
+        chrome_text=chrome_text[:MAX_SNAPSHOT_TEXT_CHARS],
     )
 
 
@@ -389,6 +400,7 @@ async def fetch_enriched_page_snapshot(
                     timeout=timeout,
                     resolve_host=resolve_host,
                     max_response_bytes=max_response_bytes,
+                    allowed_origin=root_snapshot.final_url,
                 )
             )
         except PageFetchError:
@@ -400,18 +412,28 @@ async def fetch_enriched_page_snapshot(
 def extract_response_content(
     content: str,
     base_url: str,
-) -> tuple[str | None, str, tuple[PageLink, ...]]:
+) -> tuple[str | None, str, str, str, tuple[PageLink, ...]]:
     parser = SnapshotHTMLParser(base_url)
     parser.feed(content)
     parser.close()
 
     title = normalize_text(" ".join(parser.title_parts)) or None
     body_text = normalize_text(" ".join(parser.text_parts))
+    primary_parts = (
+        parser.primary_parts
+        if parser.primary_parts
+        else parser.body_fallback_parts
+        if parser.has_body
+        else parser.fragment_fallback_parts
+    )
+    primary_text = normalize_text(" ".join(primary_parts))
+    chrome_text = normalize_text(" ".join(parser.chrome_parts))
     links = select_snapshot_links(PageLink(url=url, text=text) for url, text in parser.links if url)
     if body_text:
-        return title, body_text, links
+        return title, body_text, primary_text, chrome_text, links
 
-    return title, normalize_text(content), links
+    plain_text = normalize_text(content)
+    return title, plain_text, primary_text, chrome_text, links
 
 
 def same_domain_candidate_urls(snapshot: PageSnapshot, limit: int) -> tuple[str, ...]:
@@ -442,10 +464,19 @@ def merge_page_snapshots(
     linked_snapshots: tuple[PageSnapshot, ...],
 ) -> PageSnapshot:
     root_links = select_snapshot_links(root_snapshot.links)
-    if not linked_snapshots and root_links == root_snapshot.links:
+    bounded_primary_text = root_snapshot.primary_text[:MAX_SNAPSHOT_TEXT_CHARS]
+    bounded_chrome_text = root_snapshot.chrome_text[:MAX_SNAPSHOT_TEXT_CHARS]
+    if (
+        not linked_snapshots
+        and root_links == root_snapshot.links
+        and bounded_primary_text == root_snapshot.primary_text
+        and bounded_chrome_text == root_snapshot.chrome_text
+    ):
         return root_snapshot
 
     text_parts = [root_snapshot.normalized_text]
+    primary_parts = [root_snapshot.primary_text]
+    chrome_parts = [root_snapshot.chrome_text]
     combined_links = [*root_snapshot.links]
     for linked_snapshot in linked_snapshots:
         text_parts.append(
@@ -459,9 +490,13 @@ def merge_page_snapshots(
                 if part
             )
         )
+        primary_parts.append(linked_snapshot.primary_text)
+        chrome_parts.append(linked_snapshot.chrome_text)
         combined_links.extend(linked_snapshot.links)
 
     normalized_text = normalize_text(" ".join(text_parts))[:MAX_SNAPSHOT_TEXT_CHARS]
+    primary_text = normalize_text(" ".join(primary_parts))[:MAX_SNAPSHOT_TEXT_CHARS]
+    chrome_text = normalize_text(" ".join(chrome_parts))[:MAX_SNAPSHOT_TEXT_CHARS]
     return PageSnapshot(
         source_url=root_snapshot.source_url,
         final_url=root_snapshot.final_url,
@@ -472,6 +507,8 @@ def merge_page_snapshots(
         normalized_text=normalized_text,
         text_hash=hash_text(normalized_text),
         links=select_snapshot_links(combined_links),
+        primary_text=primary_text,
+        chrome_text=chrome_text,
     )
 
 
@@ -514,41 +551,104 @@ def normalize_fetch_url(value: str) -> str:
 
 
 class SnapshotHTMLParser(HTMLParser):
+    STRONG_CONTENT_TAGS = {"main", "article"}
+    CHROME_TAGS = {"nav", "header", "footer", "aside"}
+    SKIPPED_TAGS = {"script", "style", "noscript"}
+    VOID_TAGS = {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+
     def __init__(self, base_url: str) -> None:
         super().__init__(convert_charrefs=True)
         self.base_url = base_url
         self.title_parts: list[str] = []
         self.text_parts: list[str] = []
+        self.primary_parts: list[str] = []
+        self.chrome_parts: list[str] = []
+        self.body_fallback_parts: list[str] = []
+        self.fragment_fallback_parts: list[str] = []
         self.links: list[tuple[str, str]] = []
+        self.has_body = False
         self._skip_depth = 0
         self._title_depth = 0
+        self._strong_depth = 0
+        self._chrome_depth = 0
+        self._body_depth = 0
+        self._open_elements: list[tuple[str, bool, bool, bool, bool, bool]] = []
         self._link_stack: list[tuple[str, list[str]]] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         normalized_tag = tag.casefold()
-        if normalized_tag in {"script", "style", "noscript"}:
+        attributes = {name.casefold(): value or "" for name, value in attrs}
+        roles = {role.casefold() for role in attributes.get("role", "").split()}
+        is_strong = normalized_tag in self.STRONG_CONTENT_TAGS or "main" in roles
+        is_chrome = normalized_tag in self.CHROME_TAGS
+        is_body = normalized_tag == "body"
+        is_skipped = normalized_tag in self.SKIPPED_TAGS
+        is_title = normalized_tag == "title"
+
+        if is_strong:
+            self._strong_depth += 1
+        if is_chrome:
+            self._chrome_depth += 1
+        if is_body:
+            self.has_body = True
+            self._body_depth += 1
+        if is_skipped:
             self._skip_depth += 1
-            return
-        if normalized_tag == "title":
+        if is_title:
             self._title_depth += 1
-            return
+
+        if normalized_tag not in self.VOID_TAGS:
+            self._open_elements.append(
+                (normalized_tag, is_strong, is_chrome, is_body, is_skipped, is_title)
+            )
         if normalized_tag == "a":
-            href = dict(attrs).get("href")
+            href = attributes.get("href")
             if href:
                 self._link_stack.append((urljoin(self.base_url, href), []))
 
     def handle_endtag(self, tag: str) -> None:
         normalized_tag = tag.casefold()
-        if normalized_tag in {"script", "style", "noscript"} and self._skip_depth:
-            self._skip_depth -= 1
-            return
-        if normalized_tag == "title" and self._title_depth:
-            self._title_depth -= 1
-            return
         if normalized_tag == "a" and self._link_stack:
             url, text_parts = self._link_stack.pop()
             text = normalize_text(" ".join(text_parts))
             self.links.append((url, text))
+
+        if self._open_elements and self._open_elements[-1][0] == normalized_tag:
+            closed_elements = [self._open_elements.pop()]
+        else:
+            closed_elements = []
+            for index in range(len(self._open_elements) - 1, -1, -1):
+                if self._open_elements[index][0] != normalized_tag:
+                    continue
+                closed_elements = self._open_elements[index:]
+                del self._open_elements[index:]
+                break
+        if closed_elements:
+            for _, is_strong, is_chrome, is_body, is_skipped, is_title in closed_elements:
+                self._strong_depth -= int(is_strong)
+                self._chrome_depth -= int(is_chrome)
+                self._body_depth -= int(is_body)
+                self._skip_depth -= int(is_skipped)
+                self._title_depth -= int(is_title)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
 
     def handle_data(self, data: str) -> None:
         if self._skip_depth:
@@ -558,6 +658,15 @@ class SnapshotHTMLParser(HTMLParser):
             self.title_parts.append(data)
 
         self.text_parts.append(data)
+        if self._chrome_depth:
+            self.chrome_parts.append(data)
+        elif not self._title_depth:
+            if self._body_depth:
+                self.body_fallback_parts.append(data)
+            elif not self.has_body:
+                self.fragment_fallback_parts.append(data)
+            if self._strong_depth:
+                self.primary_parts.append(data)
         if self._link_stack:
             self._link_stack[-1][1].append(data)
 

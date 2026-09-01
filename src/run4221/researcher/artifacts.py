@@ -37,6 +37,14 @@ TRUNCATION_MARKER = "...[truncated]"
 _ARTIFACT_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 
 
+def fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class ArtifactError(RuntimeError):
     """Base error for the append-only artifact store."""
 
@@ -500,22 +508,11 @@ class ResearchArtifactStore:
                 os.link(temporary, path)
             except FileExistsError as error:
                 raise ArtifactExistsError(f"Artifact already exists: {path.name}") from error
-            self._fsync_directory(path.parent)
+            fsync_directory(path.parent)
         finally:
             if descriptor is not None:
                 os.close(descriptor)
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-
-    @staticmethod
-    def _fsync_directory(directory: Path) -> None:
-        descriptor = os.open(directory, os.O_RDONLY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+            temporary.unlink(missing_ok=True)
 
     def _reference_from_path(self, path: Path) -> ArtifactReference:
         raw = path.read_bytes()

@@ -1,20 +1,26 @@
 from functools import lru_cache
 from typing import Literal, Self
 
-from pydantic import SecretStr, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 type ModeratorAccounts = tuple[tuple[int, ...], tuple[str, ...]]
 
 
-class Settings(BaseSettings):
-    """Application settings loaded from environment variables or local .env."""
+class TelegramChannelSettings(BaseSettings):
+    """Channel settings that can be loaded without requiring the bot token."""
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    telegram_channel_id: str = "@run4221"
+
+
+class Settings(TelegramChannelSettings):
+    """Application settings loaded from environment variables or local .env."""
 
     app_env: Literal["local", "production", "test"] = "local"
     log_level: str = "INFO"
@@ -23,7 +29,8 @@ class Settings(BaseSettings):
 
     telegram_bot_token: SecretStr
     telegram_bot_username: str = "@run4221bot"
-    telegram_channel_id: str = "@run4221"
+    telegram_channel_posting_enabled: bool = False
+    telegram_channel_poll_seconds: int = Field(default=60, ge=5, le=3600)
     telegram_moderator_accounts: str = ""
     telegram_moderator_ids: str = ""
     telegram_moderator_usernames: str = ""
@@ -96,3 +103,8 @@ def normalize_username(value: str | None) -> str:
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+@lru_cache(maxsize=1)
+def get_telegram_channel_settings() -> TelegramChannelSettings:
+    return TelegramChannelSettings()

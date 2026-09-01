@@ -11,3 +11,5 @@ data
 dist
 build
 *.egg-info
+private
+private-source

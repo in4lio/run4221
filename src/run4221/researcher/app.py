@@ -30,6 +30,7 @@ from run4221.researcher.artifacts import (
     QueueResolution,
     ReconciliationResult,
     ResearchArtifactStore,
+    fsync_directory,
 )
 from run4221.researcher.config import ResearcherSettings, load_researcher_prompt
 from run4221.researcher.health import HealthStore, check_researcher_health
@@ -132,7 +133,7 @@ class DiscoverySchedule:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, self.path)
-            _fsync_directory(self.path.parent)
+            fsync_directory(self.path.parent)
         finally:
             if descriptor is not None:
                 os.close(descriptor)
@@ -471,10 +472,3 @@ def _query_hash(query: str) -> str:
         raise ValueError("Discovery query cannot be empty.")
     return hashlib.sha256(normalized.casefold().encode()).hexdigest()
 
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)

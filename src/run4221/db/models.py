@@ -20,6 +20,11 @@ def utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+# Reconciliation treats this marker as a unique key binding one queue row to one
+# prepared researcher decision, so cloned evidence must never carry it.
+RESEARCH_DECISION_MARKER_PREFIX = "researcher-decision:v1 "
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -220,6 +225,53 @@ class RegistrationWindow(Base):
     event_edition: Mapped[EventEdition | None] = relationship(
         back_populates="registration_windows",
     )
+
+
+class ChannelMessage(Base):
+    __tablename__ = "channel_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_id: Mapped[str] = mapped_column(String(140), index=True)
+    registration_window_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    message_type: Mapped[str] = mapped_column(String(40), index=True)
+    target_chat_id: Mapped[str] = mapped_column(String(120))
+    idempotency_key: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(40), default="pending_review", index=True)
+    text: Mapped[str] = mapped_column(Text)
+    source_url: Mapped[str] = mapped_column(Text)
+    scheduled_for: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
+    approved_by_user_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    telegram_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+
+class ChannelMessageReconciliation(Base):
+    __tablename__ = "channel_message_reconciliations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    channel_message_id: Mapped[int] = mapped_column(Integer, index=True)
+    decision: Mapped[str] = mapped_column(String(40))
+    reviewer_user_id: Mapped[str] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class ProposedEventUpdate(Base):

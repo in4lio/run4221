@@ -38,8 +38,10 @@ def test_configure_bot_commands_sets_default_and_moderator_scopes() -> None:
     moderator_commands, moderator_kwargs = bot.calls[1]
     moderator_command_names = [command.command for command in moderator_commands]
     assert "show_event" in moderator_command_names
-    assert moderator_command_names[-19:] == [
+    assert moderator_command_names[-21:] == [
         "todo",
+        "channel_drafts",
+        "channel_correction",
         "add_event",
         "archive_event",
         "delete_event",

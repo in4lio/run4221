@@ -76,6 +76,19 @@ from run4221.events import (
     TrackedEvent,
     normalize_event_id,
 )
+from run4221.posting.ledger import (
+    ChannelMessageRecord,
+    approve_channel_message,
+    cancel_channel_message,
+    count_actionable_channel_messages,
+    get_channel_message,
+    list_actionable_channel_messages,
+    list_channel_messages,
+    prepare_event_correction,
+    reconcile_ambiguous_channel_message,
+    retry_channel_message,
+)
+from run4221.posting.publisher import publish_channel_message
 
 router = Router(name="moderator")
 
@@ -112,6 +125,12 @@ SUGGESTION_LIST_CALLBACK_PREFIX = "suggestion:list:"
 SUGGESTION_SHOW_CALLBACK_PREFIX = "suggestion:show:"
 SUGGESTION_REMOVE_CALLBACK_PREFIX = "suggestion:remove:"
 SUGGESTION_REMOVE_CONFIRM_CALLBACK_PREFIX = "suggestion:confirm_remove:"
+CHANNEL_LIST_CALLBACK = "channel:list"
+CHANNEL_PUBLISH_CALLBACK_PREFIX = "channel:publish:"
+CHANNEL_CANCEL_CALLBACK_PREFIX = "channel:cancel:"
+CHANNEL_RECONCILE_CALLBACK_PREFIX = "channel:reconcile:"
+CHANNEL_RETRY_CONFIRMED_CALLBACK_PREFIX = "channel:retry_confirmed:"
+CHANNEL_MARK_PUBLISHED_CALLBACK_PREFIX = "channel:mark_published:"
 
 
 class AddEventStates(StatesGroup):
@@ -767,6 +786,16 @@ async def handle_add_event_registration_close_at(message: Message, state: FSMCon
         reply_markup=remove_dialog_keyboard(),
     )
     await message.answer(format_event_detail(event))
+    announcement = next(
+        (
+            item
+            for item in list_channel_messages(event_id=event.id, status="pending_review")
+            if item.message_type == "event_announced"
+        ),
+        None,
+    )
+    if announcement is not None:
+        await send_channel_draft_preview(message, announcement)
     await message.answer("Running first registration scan...")
     try:
         registration_update = await update_registration_window(event)
@@ -1660,18 +1689,59 @@ async def handle_todo(message: Message) -> None:
     if not await require_moderator(message):
         return
 
-    pending_updates = count_proposed_event_updates()
-    pending_suggestions = count_event_suggestions()
+    database_url = get_settings().database_url
+    pending_updates = count_proposed_event_updates(database_url=database_url)
+    pending_suggestions = count_event_suggestions(database_url=database_url)
+    pending_channel_messages = count_actionable_channel_messages(database_url=database_url)
     await message.answer(
         format_moderator_status(
             pending_updates=pending_updates,
             pending_suggestions=pending_suggestions,
+            pending_channel_messages=pending_channel_messages,
         ),
         reply_markup=todo_keyboard(
             pending_updates=pending_updates,
             pending_suggestions=pending_suggestions,
+            pending_channel_messages=pending_channel_messages,
         ),
     )
+
+
+@router.message(Command("channel_drafts"))
+async def handle_channel_drafts(message: Message) -> None:
+    if not await require_moderator(message):
+        return
+
+    drafts = list_actionable_channel_messages(
+        limit=10,
+        database_url=get_settings().database_url,
+    )
+    if not drafts:
+        await message.answer("No pending channel drafts.")
+        return
+    await message.answer(format_major_title("Channel drafts"))
+    for draft in drafts:
+        await send_channel_draft_preview(message, draft)
+
+
+@router.message(Command("channel_correction"))
+async def handle_channel_correction(message: Message, command: CommandObject) -> None:
+    if not await require_moderator(message):
+        return
+
+    event_id = normalize_event_id(command.args or "")
+    if not event_id:
+        await message.answer("Usage: <code>/channel_correction event.id</code>")
+        return
+    draft = prepare_event_correction(
+        event_id,
+        database_url=get_settings().database_url,
+    )
+    if draft is None:
+        await message.answer(f"Active event not found: <code>{escape(event_id)}</code>.")
+        return
+    await message.answer("Correction draft prepared for public review.")
+    await send_channel_draft_preview(message, draft)
 
 
 @router.message(Command("list_updates"))
@@ -2159,6 +2229,7 @@ async def apply_update_by_record_id(
         f"Applied update{label_text} to <b>{escape(result.event.name)}</b>."
     )
     await message.answer(format_event_detail(result.event))
+    await send_channel_draft_preview(message, getattr(result, "channel_message", None))
 
 
 async def apply_update_by_record_id_in_place(
@@ -2194,6 +2265,7 @@ async def apply_update_by_record_id_in_place(
         ),
         reply_markup=None,
     )
+    await send_channel_draft_preview(message, getattr(result, "channel_message", None))
 
 
 async def partial_apply_update_by_record_id_in_place(
@@ -2224,6 +2296,7 @@ async def partial_apply_update_by_record_id_in_place(
         format_partial_apply_result(result),
         reply_markup=None,
     )
+    await send_channel_draft_preview(message, getattr(result, "channel_message", None))
 
 
 async def reject_update_by_record_id(
@@ -2769,6 +2842,211 @@ async def handle_update_review_cancel_callback(callback: CallbackQuery) -> None:
     await callback.answer("Cancelled.")
     if callback.message is not None:
         await callback.message.answer("Cancelled.")
+
+
+@router.callback_query(F.data == CHANNEL_LIST_CALLBACK)
+async def handle_channel_list_callback(callback: CallbackQuery) -> None:
+    if not await require_moderator_callback(callback):
+        return
+    if callback.message is None:
+        await callback.answer("Message is not available.", show_alert=True)
+        return
+
+    drafts = list_actionable_channel_messages(
+        limit=10,
+        database_url=get_settings().database_url,
+    )
+    await callback.answer()
+    if not drafts:
+        await callback.message.edit_text("No pending channel drafts.", reply_markup=None)
+        return
+    await callback.message.edit_text(format_major_title("Channel drafts"), reply_markup=None)
+    for draft in drafts:
+        await send_channel_draft_preview(callback.message, draft)
+
+
+@router.callback_query(F.data.startswith(CHANNEL_PUBLISH_CALLBACK_PREFIX))
+async def handle_channel_publish_callback(callback: CallbackQuery) -> None:
+    if not await require_moderator_callback(callback):
+        return
+    if callback.message is None:
+        await callback.answer("Message is not available.", show_alert=True)
+        return
+    message_id = parse_channel_message_callback(
+        callback.data or "", CHANNEL_PUBLISH_CALLBACK_PREFIX
+    )
+    if message_id is None:
+        await callback.answer("Channel draft button is invalid.", show_alert=True)
+        return
+    settings = get_settings()
+    if not settings.telegram_channel_posting_enabled:
+        await callback.answer("Channel publishing is disabled.", show_alert=True)
+        return
+
+    current = get_channel_message(message_id, database_url=settings.database_url)
+    if current is None:
+        await callback.answer("Channel draft not found.", show_alert=True)
+        return
+    if current.status == "ambiguous":
+        await callback.answer(
+            "Reconcile the unknown Telegram outcome before retrying.",
+            show_alert=True,
+        )
+        return
+    if current.status == "failed":
+        approved = retry_channel_message(
+            message_id,
+            reviewer_user_id=str(callback.from_user.id),
+            database_url=settings.database_url,
+        )
+    else:
+        approved = approve_channel_message(
+            message_id,
+            reviewer_user_id=str(callback.from_user.id),
+            database_url=settings.database_url,
+        )
+    if approved is None:
+        await callback.answer("Channel draft not found.", show_alert=True)
+        return
+    result = await publish_channel_message(
+        callback.bot,
+        message_id,
+        database_url=settings.database_url,
+    )
+    await callback.answer()
+    if result is None:
+        await callback.message.edit_text("Channel draft not found.", reply_markup=None)
+        return
+    await callback.message.edit_text(
+        format_channel_delivery_result(result),
+        reply_markup=None,
+    )
+
+
+@router.callback_query(F.data.startswith(CHANNEL_RECONCILE_CALLBACK_PREFIX))
+async def handle_channel_reconcile_callback(callback: CallbackQuery) -> None:
+    if not await require_moderator_callback(callback):
+        return
+    if callback.message is None:
+        await callback.answer("Message is not available.", show_alert=True)
+        return
+    message_id = parse_channel_message_callback(
+        callback.data or "", CHANNEL_RECONCILE_CALLBACK_PREFIX
+    )
+    if message_id is None:
+        await callback.answer("Channel reconciliation button is invalid.", show_alert=True)
+        return
+    record = get_channel_message(
+        message_id,
+        database_url=get_settings().database_url,
+    )
+    if record is None or record.status != "ambiguous":
+        await callback.answer("This delivery is no longer ambiguous.", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.edit_text(
+        format_channel_reconciliation_prompt(record),
+        reply_markup=channel_reconciliation_keyboard(record.id),
+    )
+
+
+@router.callback_query(F.data.startswith(CHANNEL_RETRY_CONFIRMED_CALLBACK_PREFIX))
+async def handle_channel_retry_confirmed_callback(callback: CallbackQuery) -> None:
+    if not await require_moderator_callback(callback):
+        return
+    if callback.message is None:
+        await callback.answer("Message is not available.", show_alert=True)
+        return
+    message_id = parse_channel_message_callback(
+        callback.data or "", CHANNEL_RETRY_CONFIRMED_CALLBACK_PREFIX
+    )
+    if message_id is None:
+        await callback.answer("Channel retry button is invalid.", show_alert=True)
+        return
+    settings = get_settings()
+    if not settings.telegram_channel_posting_enabled:
+        await callback.answer("Channel publishing is disabled.", show_alert=True)
+        return
+    reconciled = reconcile_ambiguous_channel_message(
+        message_id,
+        reviewer_user_id=str(callback.from_user.id),
+        decision="absent_retry",
+        database_url=settings.database_url,
+    )
+    if reconciled is None or reconciled.status != "reconciled_absent":
+        await callback.answer("This delivery is no longer ambiguous.", show_alert=True)
+        return
+    result = await publish_channel_message(
+        callback.bot,
+        message_id,
+        database_url=settings.database_url,
+    )
+    await callback.answer()
+    if result is not None:
+        await callback.message.edit_text(
+            format_channel_delivery_result(result),
+            reply_markup=None,
+        )
+
+
+@router.callback_query(F.data.startswith(CHANNEL_MARK_PUBLISHED_CALLBACK_PREFIX))
+async def handle_channel_mark_published_callback(callback: CallbackQuery) -> None:
+    if not await require_moderator_callback(callback):
+        return
+    if callback.message is None:
+        await callback.answer("Message is not available.", show_alert=True)
+        return
+    message_id = parse_channel_message_callback(
+        callback.data or "", CHANNEL_MARK_PUBLISHED_CALLBACK_PREFIX
+    )
+    if message_id is None:
+        await callback.answer("Channel reconciliation button is invalid.", show_alert=True)
+        return
+    reconciled = reconcile_ambiguous_channel_message(
+        message_id,
+        reviewer_user_id=str(callback.from_user.id),
+        decision="published",
+        database_url=get_settings().database_url,
+    )
+    if reconciled is None or reconciled.status != "published":
+        await callback.answer("This delivery is no longer ambiguous.", show_alert=True)
+        return
+    await callback.answer("Delivery marked as already published.")
+    await callback.message.edit_text(
+        format_channel_delivery_result(reconciled),
+        reply_markup=None,
+    )
+
+
+@router.callback_query(F.data.startswith(CHANNEL_CANCEL_CALLBACK_PREFIX))
+async def handle_channel_cancel_callback(callback: CallbackQuery) -> None:
+    if not await require_moderator_callback(callback):
+        return
+    message_id = parse_channel_message_callback(
+        callback.data or "", CHANNEL_CANCEL_CALLBACK_PREFIX
+    )
+    if message_id is None:
+        await callback.answer("Channel draft button is invalid.", show_alert=True)
+        return
+    cancelled = cancel_channel_message(
+        message_id,
+        database_url=get_settings().database_url,
+    )
+    if cancelled is None:
+        await callback.answer("Channel draft not found.", show_alert=True)
+        return
+    if cancelled.status in {"publishing", "ambiguous"}:
+        await callback.answer(
+            "Unknown deliveries must be reconciled, not cancelled.",
+            show_alert=True,
+        )
+        return
+    await callback.answer("Channel draft cancelled.")
+    if callback.message is not None:
+        await callback.message.edit_text(
+            f"Channel draft <code>#{cancelled.id}</code> cancelled.",
+            reply_markup=None,
+        )
 
 
 @router.callback_query(F.data == PANEL_CANCEL_CALLBACK)
@@ -3710,17 +3988,28 @@ def suggestion_remove_confirm_callback(
     )
 
 
-def format_moderator_status(*, pending_updates: int, pending_suggestions: int) -> str:
-    return "\n".join(
-        [
-            format_major_title("Todo"),
-            format_field_line("Updates", pending_updates),
-            format_field_line("Suggestion", pending_suggestions),
-        ]
-    )
+def format_moderator_status(
+    *,
+    pending_updates: int,
+    pending_suggestions: int,
+    pending_channel_messages: int = 0,
+) -> str:
+    lines = [
+        format_major_title("Todo"),
+        format_field_line("Updates", pending_updates),
+        format_field_line("Suggestion", pending_suggestions),
+    ]
+    if pending_channel_messages:
+        lines.append(format_field_line("Channel drafts", pending_channel_messages))
+    return "\n".join(lines)
 
 
-def todo_keyboard(*, pending_updates: int, pending_suggestions: int) -> InlineKeyboardMarkup | None:
+def todo_keyboard(
+    *,
+    pending_updates: int,
+    pending_suggestions: int,
+    pending_channel_messages: int = 0,
+) -> InlineKeyboardMarkup | None:
     rows = []
     if pending_updates:
         rows.append(
@@ -3740,8 +4029,132 @@ def todo_keyboard(*, pending_updates: int, pending_suggestions: int) -> InlineKe
                 )
             ]
         )
+    if pending_channel_messages:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Channel drafts",
+                    callback_data=CHANNEL_LIST_CALLBACK,
+                )
+            ]
+        )
 
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+
+
+async def send_channel_draft_preview(
+    message: Message,
+    draft: ChannelMessageRecord | None,
+) -> None:
+    if draft is None:
+        return
+    await message.answer(
+        format_channel_draft_preview(draft),
+        reply_markup=channel_draft_keyboard(draft.id, status=draft.status),
+    )
+
+
+def format_channel_draft_preview(draft: ChannelMessageRecord) -> str:
+    return "\n\n".join(
+        [
+            "\n".join(
+                [
+                    f"<b>✨ Channel draft #{draft.id}</b>",
+                    format_field_line("Type", draft.message_type),
+                    format_field_line("Status", draft.status),
+                ]
+            ),
+            draft.text,
+        ]
+    )
+
+
+def channel_draft_keyboard(
+    message_id: int,
+    *,
+    status: str = "pending_review",
+) -> InlineKeyboardMarkup:
+    if status == "ambiguous":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="Reconcile delivery",
+                        callback_data=f"{CHANNEL_RECONCILE_CALLBACK_PREFIX}{message_id}",
+                    )
+                ]
+            ]
+        )
+    action_text = "Retry" if status == "failed" else "Publish"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=action_text,
+                    callback_data=f"{CHANNEL_PUBLISH_CALLBACK_PREFIX}{message_id}",
+                ),
+                InlineKeyboardButton(
+                    text="Cancel",
+                    callback_data=f"{CHANNEL_CANCEL_CALLBACK_PREFIX}{message_id}",
+                ),
+            ]
+        ]
+    )
+
+
+def format_channel_reconciliation_prompt(draft: ChannelMessageRecord) -> str:
+    return (
+        f"<b>Reconcile channel message #{draft.id}</b>\n\n"
+        "Telegram may have accepted this message even though the bot did not receive "
+        "a definitive response. Check the target channel first, then record exactly one "
+        "outcome below."
+    )
+
+
+def channel_reconciliation_keyboard(message_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Confirmed absent — retry",
+                    callback_data=f"{CHANNEL_RETRY_CONFIRMED_CALLBACK_PREFIX}{message_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Already published",
+                    callback_data=f"{CHANNEL_MARK_PUBLISHED_CALLBACK_PREFIX}{message_id}",
+                )
+            ],
+        ]
+    )
+
+
+def parse_channel_message_callback(value: str, prefix: str) -> int | None:
+    raw_id = value.removeprefix(prefix)
+    return int(raw_id) if raw_id.isdigit() else None
+
+
+def format_channel_delivery_result(result: ChannelMessageRecord) -> str:
+    if result.status == "published":
+        if result.telegram_message_id is None:
+            return (
+                f"Channel message <code>#{result.id}</code> was marked as already "
+                "published after manual reconciliation."
+            )
+        return (
+            f"Published channel message <code>#{result.id}</code> "
+            f"as Telegram message <code>{result.telegram_message_id}</code>."
+        )
+    if result.status == "ambiguous":
+        return (
+            f"Channel message <code>#{result.id}</code> has ambiguous delivery. "
+            "It will not be retried automatically; verify the channel manually."
+        )
+    return (
+        f"Channel message <code>#{result.id}</code> was not published. "
+        f"Status: {escape(result.status)}."
+    )
 
 
 def format_proposed_update_list(updates: tuple[ProposedEventUpdateRecord, ...]) -> str:
@@ -4193,16 +4606,27 @@ def format_proposed_update_detail(
                 )
             )
 
+    changed_field_count = max(1, len(proposed_update_changed_field_names(update)))
     changes = proposed_update_changes(
         update,
-        max_value_html_chars=450 if provenance is not None else None,
+        max_value_html_chars=(
+            min(450, max(120, 1_600 // (2 * changed_field_count)))
+            if provenance is not None
+            else None
+        ),
     )
     if changes:
         lines.extend(["", "<b>What's changed</b>"])
         lines.extend(changes)
 
     if provenance is not None:
-        lines.extend(["", format_researcher_source_check(provenance)])
+        base = "\n".join(lines)
+        source_check = format_researcher_source_check(
+            provenance,
+            max_html_chars=4_096 - len(base) - 2,
+        )
+        if source_check:
+            lines.extend(["", source_check])
     elif update.evidence:
         lines.extend(["", format_evidence_for_display(" ".join(update.evidence))])
 

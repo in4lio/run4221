@@ -81,19 +81,27 @@ jobs:
           rollback() {
             status="$?"
             trap - ERR
-            git checkout --detach "$previous_sha"
-            git reset --hard "$previous_sha"
+            git checkout --detach "$previous_sha" || echo "Rollback git checkout failed." >&2
+            git reset --hard "$previous_sha" || echo "Rollback git reset failed." >&2
             if [[ -n "$previous_bot_rollback_tag" ]]; then
-              docker image tag "$previous_bot_rollback_tag" run4221-bot:latest
+              docker image tag "$previous_bot_rollback_tag" run4221-bot:latest \
+                || echo "Rollback bot image retag failed." >&2
             fi
             if [[ -n "$previous_researcher_rollback_tag" ]] \
               && grep -qx researcher <<<"$previous_services"; then
-              docker image tag "$previous_researcher_rollback_tag" run4221-researcher:latest
+              docker image tag "$previous_researcher_rollback_tag" run4221-researcher:latest \
+                || echo "Rollback researcher image retag failed." >&2
             fi
             if [[ "$service_replaced" == "true" ]]; then
-              docker compose up -d --no-build --remove-orphans --wait --wait-timeout 90
+              if [[ -n "$previous_bot_rollback_tag" ]]; then
+                docker compose up -d --no-build --remove-orphans --wait --wait-timeout 90 \
+                  || echo "Rollback service restart failed." >&2
+              else
+                echo "No previous bot image to roll back to;" \
+                  "stack left stopped for manual intervention." >&2
+              fi
             fi
-            docker compose ps
+            docker compose ps || true
             exit "$status"
           }
           trap rollback ERR

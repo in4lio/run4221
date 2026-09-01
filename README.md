@@ -60,6 +60,15 @@ Run the bot locally:
 uv run python -m run4221
 ```
 
+Public channel delivery is disabled by default. After the bot is an administrator of the
+configured channel, enable the production-light publisher explicitly:
+
+```env
+TELEGRAM_CHANNEL_ID=@run4221
+TELEGRAM_CHANNEL_POSTING_ENABLED=true
+TELEGRAM_CHANNEL_POLL_SECONDS=60
+```
+
 Then open Telegram and send `/start` to [@run4221bot](https://t.me/run4221bot).
 
 ## Commands Available Now
@@ -82,7 +91,9 @@ Moderator:
 - `/edit_event` - edit event fields
 - `/list_archive` - list archived events
 - `/restore_event` - restore an archived event
-- `/todo` - show pending update and suggestion counts
+- `/todo` - show pending updates, suggestions, and channel actions
+- `/channel_drafts` - review public news drafts and delivery failures
+- `/channel_correction <event-id>` - prepare an explicit correction draft for review
 - `/update_event` - manually scan event registration status
 
 - `/apply_update` - apply a pending update
@@ -121,3 +132,18 @@ new event approval, and anything that could affect public posts.
 Once an event is tracked, the bot monitors it in the background. When registration opens,
 a date changes, a race sells out, or useful new information appears, the system prepares
 an update and publishes it to the channel and website after the required review.
+
+The Telegram channel is a news feed, not an administrative log. First announcements and
+detected changes require a separate public-preview action. Only reminders derived from
+approved registration dates can publish automatically; edits, queue activity, archive,
+restore, and delete actions stay silent.
+
+Every public post starts with the event name, distance, date, and location, followed by a
+short emoji-labelled update. Registration-date changes include the new value; unchanged
+registration data produces no news item. Approved opening and closing dates can also
+produce deterministic `tomorrow` reminders.
+
+If Telegram returns an unknown delivery result, the message stays in the moderator queue
+and is never retried automatically. A moderator must first inspect the channel, then record
+either `Already published` or `Confirmed absent — retry`. Explicit corrections can be
+prepared with `/channel_correction <event-id>` and follow the same preview requirement.

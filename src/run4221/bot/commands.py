@@ -15,6 +15,8 @@ PUBLIC_COMMANDS = (
 
 MODERATOR_COMMANDS = (
     BotCommand(command="todo", description="Show moderator todo"),
+    BotCommand(command="channel_drafts", description="Review channel news drafts"),
+    BotCommand(command="channel_correction", description="Prepare public correction"),
     BotCommand(command="add_event", description="Add event from URL"),
     BotCommand(command="archive_event", description="Preview and archive event"),
     BotCommand(command="delete_event", description="Permanently delete event"),

@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from run4221.db import models
 from run4221.db.bootstrap import ensure_database_schema
-from run4221.db.models import utcnow
+from run4221.db.models import RESEARCH_DECISION_MARKER_PREFIX, utcnow
 from run4221.db.session import run_serialized_transaction, session_scope
 from run4221.events import (
     DISTANCE_CODE_TO_KEY,
@@ -25,6 +25,16 @@ from run4221.events import (
     matches_search_terms,
     normalize_event_id,
     normalize_query,
+)
+from run4221.posting.ledger import (
+    ChannelMessageRecord,
+    cancel_event_messages_in_session,
+    cancel_event_schedules_in_session,
+    current_registration_window_id_in_session,
+    prepare_event_announcement_in_session,
+    prepare_registration_news_in_session,
+    rebind_event_schedules_in_session,
+    sync_event_schedules_in_session,
 )
 
 OPEN_REGISTRATION_STATUSES = {"open", "waitlist"}
@@ -145,6 +155,7 @@ class RegistrationWindowApply:
 class ProposedEventUpdateApplyResult:
     update: ProposedEventUpdateRecord
     event: TrackedEvent
+    channel_message: ChannelMessageRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -154,6 +165,7 @@ class ProposedEventUpdatePartialApplyResult:
     follow_up_update: ProposedEventUpdateRecord | None
     applied_fields: tuple[str, ...]
     remaining_fields: tuple[str, ...]
+    channel_message: ChannelMessageRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -381,8 +393,12 @@ def add_event_in_session(
     model.current_edition_id = current_edition.id if current_edition is not None else None
     registration_window = apply_event_registration_fields(session, model, event)
     if registration_window is not None:
-        return event_to_domain(model, registration_window=registration_window)
-    return event_to_domain(model)
+        result = event_to_domain(model, registration_window=registration_window)
+    else:
+        result = event_to_domain(model)
+    prepare_event_announcement_in_session(session, result)
+    sync_event_schedules_in_session(session, result)
+    return result
 
 
 def update_event(
@@ -412,6 +428,17 @@ def update_event(
         registration_close_at=update.registration_close_at,
     )
     validate_event_create(event, existing_event.public_id)
+    registration_changed = any(
+        getattr(existing_event, field) != getattr(update, field)
+        for field in (
+            "event_date",
+            "registration_status",
+            "registration_url",
+            "registration_open_at",
+            "registration_open_precision",
+            "registration_close_at",
+        )
+    )
 
     with session_scope(database_url) as session:
         model = session.get(models.Event, existing_event.id)
@@ -421,6 +448,9 @@ def update_event(
         for region_tag in event.regions:
             ensure_region(session, region_tag)
 
+        previous_window_id = current_registration_window_id_in_session(session, model.id)
+        if registration_changed:
+            cancel_event_schedules_in_session(session, model.id)
         clear_registration_windows(session, model.id)
         model.current_edition_id = None
         replace_children(model.search_keywords, [])
@@ -436,8 +466,17 @@ def update_event(
         model.current_edition_id = current_edition.id if current_edition is not None else None
         registration_window = apply_event_registration_fields(session, model, event)
         if registration_window is not None:
-            return event_to_domain(model, registration_window=registration_window)
-        return event_to_domain(model)
+            result = event_to_domain(model, registration_window=registration_window)
+        else:
+            result = event_to_domain(model)
+        if not registration_changed:
+            rebind_event_schedules_in_session(
+                session,
+                result,
+                previous_window_id=previous_window_id,
+            )
+        sync_event_schedules_in_session(session, result)
+        return result
 
 
 def add_event_suggestion(
@@ -559,6 +598,7 @@ def archive_event(event_id: str, database_url: str | None = None) -> TrackedEven
 
         model.status = "removed"
         model.removed_at = utcnow()
+        cancel_event_messages_in_session(session, model.id)
         return event_to_domain(model)
 
 
@@ -575,7 +615,9 @@ def restore_event(event_id: str, database_url: str | None = None) -> TrackedEven
 
         model.status = "monitoring"
         model.removed_at = None
-        return event_to_domain(model)
+        result = event_to_domain(model)
+        sync_event_schedules_in_session(session, result)
+        return result
 
 
 def delete_event(event_id: str, database_url: str | None = None) -> TrackedEvent | None:
@@ -593,6 +635,7 @@ def delete_event(event_id: str, database_url: str | None = None) -> TrackedEvent
             return None
 
         result = event_to_domain(model)
+        cancel_event_messages_in_session(session, model.id)
         model.current_edition_id = None
         for window in session.scalars(
             select(models.RegistrationWindow).where(
@@ -818,6 +861,13 @@ def approve_proposed_event_update(
             event_model,
             dict(update_model.proposed_fields or {}),
         )
+        channel_message = prepare_registration_news_in_session(
+            session,
+            event,
+            current_fields=dict(update_model.current_fields or {}),
+            proposed_fields=dict(update_model.proposed_fields or {}),
+        )
+        sync_event_schedules_in_session(session, event)
 
         now = utcnow()
         update_model.status = "applied"
@@ -829,6 +879,7 @@ def approve_proposed_event_update(
         return ProposedEventUpdateApplyResult(
             update=proposed_event_update_to_record(update_model),
             event=event,
+            channel_message=channel_message,
         )
 
 
@@ -872,6 +923,13 @@ def partial_apply_proposed_event_update(
             event_model,
             selected_proposed_fields,
         )
+        channel_message = prepare_registration_news_in_session(
+            session,
+            event,
+            current_fields=dict(update.current_fields),
+            proposed_fields=selected_proposed_fields,
+        )
+        sync_event_schedules_in_session(session, event)
 
         now = utcnow()
         update_model.status = "applied" if not remaining else "applied_partial"
@@ -898,7 +956,11 @@ def partial_apply_proposed_event_update(
                         if field in update.proposed_fields
                     },
                     evidence=(
-                        *update.evidence,
+                        *(
+                            line
+                            for line in update.evidence
+                            if not line.startswith(RESEARCH_DECISION_MARKER_PREFIX)
+                        ),
                         f"Created from partial apply of update #{update.id}.",
                     ),
                     confidence=update.confidence,
@@ -917,6 +979,7 @@ def partial_apply_proposed_event_update(
             ),
             applied_fields=selected,
             remaining_fields=remaining,
+            channel_message=channel_message,
         )
 
 
@@ -969,6 +1032,8 @@ def apply_registration_window_update(
         if model is None or model.removed_at is not None:
             return None
 
+        before = registration_update_fields(event_to_domain(model))
+
         model.registration_status = update.registration_status
         if update.registration_url is not None:
             model.registration_url = update.registration_url
@@ -983,7 +1048,15 @@ def apply_registration_window_update(
         window.status = update.registration_status
         window.approved_at = utcnow()
 
-        return event_to_domain(model)
+        result = event_to_domain(model, registration_window=window)
+        prepare_registration_news_in_session(
+            session,
+            result,
+            current_fields=before,
+            proposed_fields=registration_update_fields(result),
+        )
+        sync_event_schedules_in_session(session, result)
+        return result
 
 
 def apply_registration_window_selected_fields(
@@ -998,11 +1071,20 @@ def apply_registration_window_selected_fields(
         if model is None or model.removed_at is not None:
             return None
 
-        return apply_registration_window_selected_fields_in_session(
+        before = registration_update_fields(event_to_domain(model))
+        result = apply_registration_window_selected_fields_in_session(
             session,
             model,
             proposed_fields,
         )
+        prepare_registration_news_in_session(
+            session,
+            result,
+            current_fields=before,
+            proposed_fields=proposed_fields,
+        )
+        sync_event_schedules_in_session(session, result)
+        return result
 
 
 def apply_registration_window_selected_fields_in_session(

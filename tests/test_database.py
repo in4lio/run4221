@@ -1337,3 +1337,70 @@ def test_database_limits_total_pending_event_suggestions(tmp_path) -> None:
             suggestion_payload(99, submitter_user_id="overflow"),
             database_url=url,
         )
+
+
+def test_partial_apply_follow_up_does_not_clone_researcher_decision_marker(tmp_path) -> None:
+    url = database_url(tmp_path)
+    event = add_event(
+        EventCreate(
+            public_id="zurich.42",
+            name="Zurich Marathon",
+            city="Zurich",
+            country="Switzerland",
+            timezone="Europe/Zurich",
+            event_date="2027-04-18",
+            distances=("marathon",),
+            regions=("global", "eu", "ch"),
+            official_url="https://example.com/zurich-marathon",
+            registration_status="announced",
+            registration_open_at="2026-10-01",
+            registration_open_precision="date_only",
+            registration_close_at="2027-03-01",
+        ),
+        database_url=url,
+    )
+    marker = "researcher-decision:v1 run=20260831T140000Z-abc artifact=decision.json sha256=" + (
+        "a" * 64
+    )
+    proposal = create_proposed_event_update(
+        ProposedEventUpdateCreate(
+            event_id=event.id,
+            update_type="registration_window",
+            current_fields={
+                "registration_close_at": "2027-03-01",
+                "registration_open_at": "2026-10-01",
+            },
+            proposed_fields={
+                "registration_close_at": "2027-03-15",
+                "registration_open_at": "2026-11-01",
+            },
+            evidence=(
+                "Researcher worker: the registration schedule moved.",
+                marker,
+                "researcher-evidence:v1 run=20260831T140000Z-abc artifact=page.json",
+            ),
+            confidence=0.95,
+        ),
+        database_url=url,
+    )
+
+    result = partial_apply_proposed_event_update(
+        proposal.id,
+        selected_fields=("registration_close_at",),
+        reviewer_user_id="42",
+        database_url=url,
+    )
+
+    assert result is not None
+    assert result.follow_up_update is not None
+    follow_up_evidence = result.follow_up_update.evidence
+    assert marker not in follow_up_evidence
+    assert not any(
+        line.startswith("researcher-decision:v1 ") for line in follow_up_evidence
+    )
+    assert "Researcher worker: the registration schedule moved." in follow_up_evidence
+    assert (
+        "researcher-evidence:v1 run=20260831T140000Z-abc artifact=page.json"
+        in follow_up_evidence
+    )
+    assert f"Created from partial apply of update #{proposal.id}." in follow_up_evidence
