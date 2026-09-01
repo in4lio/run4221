@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from typing import Protocol
 
-from run4221.ai.event_extractor import conflicts_with_event_identity
+from run4221.ai.event_extractor import (
+    conflicts_with_event_identity,
+    event_identity_tokens,
+)
 from run4221.db.research import (
     EventSuggestionCreate,
     ProposedEventUpdateCreate,
@@ -54,7 +59,14 @@ SUPPORTED_UPDATE_FIELDS = (
     "event_date",
 )
 
-type SnapshotFetcher = Callable[[str], Awaitable[PageSnapshot]]
+
+class SnapshotFetcher(Protocol):
+    def __call__(
+        self,
+        url: str,
+        *,
+        allowed_origin: str | None = None,
+    ) -> Awaitable[PageSnapshot]: ...
 
 
 class ResearchAgent(Protocol):
@@ -111,6 +123,30 @@ class ResearcherService:
         )
         self._announce_run(run_id)
         try:
+            async with asyncio.timeout(self.budget.max_wall_time_seconds_per_job):
+                return await self._refresh_started(
+                    run_id,
+                    source,
+                    frozen_event,
+                    frozen_fields,
+                )
+        except TimeoutError:
+            return self._finish_without_queue(
+                run_id,
+                source.url,
+                RunState.CAPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Refresh wall-time budget was exhausted.",
+            )
+
+    async def _refresh_started(
+        self,
+        run_id: str,
+        source: ResearchSourceRecord,
+        frozen_event: TrackedEvent,
+        frozen_fields: dict[str, object],
+    ) -> ResearchJobResult:
+        try:
             captured = await self._capture(run_id, source.url)
         except PageFetchError as error:
             return self._finish_without_queue(
@@ -140,43 +176,14 @@ class ResearcherService:
                 )
             )
             self._record_scout(run_id, source.url, scout)
-            if scout.state is not AgentRunState.SUCCEEDED:
-                return self._finish_agent_outcome(run_id, source.url, scout)
-
-            followup_limit = min(
-                MAX_REFRESH_FOLLOWUP_PAGES,
-                self.budget.max_static_pages_per_job - 1,
-            )
-            captured_final_urls = {normalize_url(captured.snapshot.final_url)}
-            for candidate_url in _refresh_candidate_urls(
-                scout.candidates,
-                event=frozen_event,
-                approved_source_url=source.url,
-            ):
-                if len(captures) - 1 >= followup_limit:
-                    break
-                try:
-                    followup = await self._capture(run_id, candidate_url)
-                except PageFetchError:
-                    continue
-                if blocked_page_reason(followup.snapshot) is not None:
-                    continue
-                if not _same_source_domain(
-                    followup.snapshot.final_url,
-                    source.url,
-                ):
-                    continue
-                if conflicts_with_event_identity(
-                    followup.snapshot.final_url,
-                    followup.snapshot.title or "",
-                    frozen_event.distances,
-                ):
-                    continue
-                normalized_final_url = normalize_url(followup.snapshot.final_url)
-                if normalized_final_url in captured_final_urls:
-                    continue
-                captures.append(followup)
-                captured_final_urls.add(normalized_final_url)
+            if scout.state is AgentRunState.SUCCEEDED:
+                await self._capture_refresh_followups(
+                    run_id,
+                    source,
+                    frozen_event,
+                    scout.candidates,
+                    captures,
+                )
 
         assessment = await self.agent.assess(
             AssessmentRequest(
@@ -319,9 +326,7 @@ class ResearcherService:
             metadata={"query": clean_query},
         )
         self._announce_run(run_id)
-        scout = await self.agent.scout(
-            ScoutRequest(mode="discovery", query=clean_query)
-        )
+        scout = await self.agent.scout(ScoutRequest(mode="discovery", query=clean_query))
         self._record_scout(
             run_id,
             scout.candidates[0].source_url if scout.candidates else AUDIT_SOURCE_URL,
@@ -369,9 +374,7 @@ class ResearcherService:
                     if pages_captured >= self.budget.max_static_pages_per_job:
                         break
                     try:
-                        registry_capture = await self._capture(
-                            run_id, registry_url
-                        )
+                        registry_capture = await self._capture(run_id, registry_url)
                     except PageFetchError:
                         continue
                     if blocked_page_reason(registry_capture.snapshot) is not None:
@@ -380,9 +383,7 @@ class ResearcherService:
                     pages_captured += 1
                 trust = self.trust_policy.evaluate(
                     captured.snapshot,
-                    registry_snapshots=tuple(
-                        item.snapshot for item in registry_captures.values()
-                    ),
+                    registry_snapshots=tuple(item.snapshot for item in registry_captures.values()),
                 )
             if not trust.trusted:
                 skipped_reasons.append(trust.reason)
@@ -390,9 +391,7 @@ class ResearcherService:
 
             evidence = [captured]
             if trust.registry_snapshot is not None:
-                registry_capture = registry_captures.get(
-                    trust.registry_snapshot.source_url
-                )
+                registry_capture = registry_captures.get(trust.registry_snapshot.source_url)
                 if registry_capture is None:
                     skipped_reasons.append("trusted registry artifact was unavailable")
                     continue
@@ -538,9 +537,63 @@ class ResearcherService:
             "; ".join(skipped_reasons)[:1_000] or "No trusted candidate was captured.",
         )
 
-    async def _capture(self, run_id: str, url: str) -> CapturedPage:
+    async def _capture_refresh_followups(
+        self,
+        run_id: str,
+        source: ResearchSourceRecord,
+        event: TrackedEvent,
+        candidates: tuple[ResearchCandidate, ...],
+        captures: list[CapturedPage],
+    ) -> None:
+        followup_limit = min(
+            MAX_REFRESH_FOLLOWUP_PAGES,
+            self.budget.max_static_pages_per_job - 1,
+        )
+        followup_pages_captured = 0
+        captured_final_urls = {normalize_url(captures[0].snapshot.final_url)}
+        for candidate_url in _refresh_candidate_urls(
+            candidates,
+            event=event,
+            approved_source_url=source.url,
+        ):
+            if followup_pages_captured >= followup_limit:
+                break
+            try:
+                followup = await self._capture(
+                    run_id,
+                    candidate_url,
+                    allowed_origin=source.url,
+                )
+            except PageFetchError:
+                continue
+            followup_pages_captured += 1
+            if blocked_page_reason(followup.snapshot) is not None:
+                continue
+            if not _same_source_domain(followup.snapshot.final_url, source.url):
+                continue
+            if conflicts_with_event_identity(
+                followup.snapshot.final_url,
+                (f"{followup.snapshot.title or ''} {followup.snapshot.normalized_text[:2_000]}"),
+                event.distances,
+            ):
+                continue
+            if not _matches_tracked_event_identity(followup.snapshot, event):
+                continue
+            normalized_final_url = normalize_url(followup.snapshot.final_url)
+            if normalized_final_url in captured_final_urls:
+                continue
+            captures.append(followup)
+            captured_final_urls.add(normalized_final_url)
+
+    async def _capture(
+        self,
+        run_id: str,
+        url: str,
+        *,
+        allowed_origin: str | None = None,
+    ) -> CapturedPage:
         try:
-            snapshot = await self.fetch_snapshot(url)
+            snapshot = await self.fetch_snapshot(url, allowed_origin=allowed_origin)
         except PageFetchError:
             raise
         except Exception as error:
@@ -549,10 +602,7 @@ class ResearcherService:
         return CapturedPage(snapshot=snapshot, reference=reference)
 
     def _refresh_search_enabled(self) -> bool:
-        return (
-            self.budget.max_web_searches_per_job > 0
-            and self.budget.max_static_pages_per_job > 1
-        )
+        return self.budget.max_web_searches_per_job > 0 and self.budget.max_static_pages_per_job > 1
 
     def _record_scout(
         self,
@@ -593,9 +643,7 @@ class ResearcherService:
                 "state": result.state.value,
                 "metadata": asdict(result.metadata),
                 "decision": (
-                    result.decision.model_dump(mode="json")
-                    if result.decision is not None
-                    else None
+                    result.decision.model_dump(mode="json") if result.decision is not None else None
                 ),
                 "error_code": result.error_code,
                 "detail": result.detail,
@@ -761,6 +809,45 @@ def _refresh_candidate_urls(
 
 def _same_source_domain(candidate_url: str, approved_source_url: str) -> bool:
     return source_domain(candidate_url) == source_domain(approved_source_url)
+
+
+_GENERIC_EVENT_IDENTITY_TERMS = frozenset(
+    {
+        "event",
+        "events",
+        "lauf",
+        "marathon",
+        "race",
+        "registration",
+        "run",
+        "running",
+    }
+)
+
+
+def _matches_tracked_event_identity(snapshot: PageSnapshot, event: TrackedEvent) -> bool:
+    searchable = f"{snapshot.title or ''} {snapshot.normalized_text[:2_000]}"
+    captured_tokens = event_identity_tokens(snapshot.final_url, searchable)
+    expected_tokens = event_identity_tokens("", event.name) - _GENERIC_EVENT_IDENTITY_TERMS
+    event_year = event.event_date[:4] if event.event_date else None
+    explicit_identity_years = frozenset(
+        re.findall(
+            r"\b20\d{2}\b",
+            f"{snapshot.final_url} {snapshot.title or ''}",
+        )
+    )
+    if (
+        event_year is not None
+        and explicit_identity_years
+        and event_year not in explicit_identity_years
+    ):
+        return False
+    if expected_tokens:
+        required_name_tokens = min(2, len(expected_tokens))
+        return len(expected_tokens & captured_tokens) >= required_name_tokens
+
+    captured_years = frozenset(re.findall(r"\b20\d{2}\b", searchable))
+    return event_year is not None and event_year in captured_years
 
 
 def _changed_supported_fields(

@@ -213,7 +213,11 @@ class ResearchAgentJob:
         if not isinstance(request, ScoutRequest):
             raise TypeError("scout requires a ScoutRequest.")
         try:
-            limits = self.budget.limits_for_call(needs_web_search=True)
+            reserve_assessment = request.mode == "refresh"
+            limits = self.budget.limits_for_call(
+                needs_web_search=True,
+                reserve_assessment=reserve_assessment,
+            )
         except BudgetExhausted as error:
             return ScoutRunResult(
                 state=AgentRunState.CAPPED,
@@ -233,9 +237,15 @@ class ResearchAgentJob:
                 timeout=limits.wall_time_seconds,
             )
         except Exception as error:
-            return self._scout_error(error)
+            return self._scout_error(
+                error,
+                preserve_assessment_reserve=reserve_assessment,
+            )
 
-        metadata, cap = self._observe_result(result)
+        metadata, cap = self._observe_result(
+            result,
+            preserve_assessment_reserve=reserve_assessment,
+        )
         if cap is not None:
             return ScoutRunResult(
                 state=AgentRunState.CAPPED,
@@ -377,18 +387,24 @@ class ResearchAgentJob:
             ),
         )
 
-    def _observe_result(self, result: Any) -> tuple[AgentRunMetadata, BudgetCap | None]:
+    def _observe_result(
+        self,
+        result: Any,
+        *,
+        preserve_assessment_reserve: bool = False,
+    ) -> tuple[AgentRunMetadata, BudgetCap | None]:
         raw_responses = tuple(getattr(result, "raw_responses", ()) or ())
         usage = _observed_usage(raw_responses)
-        web_search_calls = sum(
-            _count_web_search_calls(response) for response in raw_responses
-        )
+        web_search_calls = sum(_count_web_search_calls(response) for response in raw_responses)
         observation = BudgetObservation(
             turns=max(1, len(raw_responses)),
             web_searches=web_search_calls,
             output_tokens=usage.get("output_tokens"),
         )
-        cap = self.budget.record(observation)
+        cap = self.budget.record(
+            observation,
+            preserve_assessment_reserve=preserve_assessment_reserve,
+        )
         return (
             AgentRunMetadata(
                 model=self.model,
@@ -418,8 +434,16 @@ class ResearchAgentJob:
             stop_reason=stop_reason,
         )
 
-    def _scout_error(self, error: BaseException) -> ScoutRunResult:
-        state, error_code = self._classify_error(error)
+    def _scout_error(
+        self,
+        error: BaseException,
+        *,
+        preserve_assessment_reserve: bool,
+    ) -> ScoutRunResult:
+        state, error_code = self._classify_error(
+            error,
+            preserve_assessment_reserve=preserve_assessment_reserve,
+        )
         return ScoutRunResult(
             state=state,
             metadata=self._empty_metadata(),
@@ -436,11 +460,21 @@ class ResearchAgentJob:
             detail=_SAFE_DETAILS.get(error_code, _SAFE_DETAILS["provider_error"]),
         )
 
-    def _classify_error(self, error: BaseException) -> tuple[AgentRunState, str]:
+    def _classify_error(
+        self,
+        error: BaseException,
+        *,
+        preserve_assessment_reserve: bool = False,
+    ) -> tuple[AgentRunState, str]:
         if isinstance(error, MaxTurnsExceeded):
-            self.budget.record_failed_call(exhaust_turns=True)
+            self.budget.record_failed_call(
+                exhaust_turns=True,
+                preserve_assessment_reserve=preserve_assessment_reserve,
+            )
             return AgentRunState.CAPPED, "max_turns"
-        self.budget.record_failed_call()
+        self.budget.record_failed_call(
+            preserve_assessment_reserve=preserve_assessment_reserve,
+        )
         if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
             return AgentRunState.CAPPED, "timeout"
         if isinstance(error, ModelBehaviorError):

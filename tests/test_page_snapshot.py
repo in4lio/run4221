@@ -408,6 +408,66 @@ def test_fetch_page_snapshot_revalidates_redirect_target() -> None:
         run(fetch())
 
 
+def test_fetch_page_snapshot_blocks_cross_origin_redirect_before_request() -> None:
+    requested_urls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(
+            302,
+            headers={"location": "https://other.example/registration"},
+            request=request,
+        )
+
+    async def fetch():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_page_snapshot(
+                "https://example.com/start",
+                client=client,
+                resolve_host=public_resolver,
+                allowed_origin="https://example.com/event",
+            )
+
+    with pytest.raises(PageFetchError, match="leaves the approved origin"):
+        run(fetch())
+
+    assert len(requested_urls) == 1
+
+
+@pytest.mark.parametrize(
+    ("candidate_url", "error"),
+    (
+        ("http://example.com/registration", "leaves the approved origin"),
+        ("https://example.com:8443/registration", "Non-default URL ports"),
+    ),
+)
+def test_fetch_page_snapshot_rejects_origin_change_before_request(
+    candidate_url: str,
+    error: str,
+) -> None:
+    requested_urls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(200, request=request)
+
+    async def fetch():
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await fetch_page_snapshot(
+                candidate_url,
+                client=client,
+                resolve_host=public_resolver,
+                allowed_origin="https://example.com/event",
+            )
+
+    with pytest.raises(PageFetchError, match=error):
+        run(fetch())
+
+    assert requested_urls == []
+
+
 def test_fetch_page_snapshot_enforces_response_size_limit() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"x" * 11, request=request)
