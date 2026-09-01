@@ -9,6 +9,15 @@ RESEARCHER_WORKER_PREFIX = "Researcher worker:"
 RESEARCHER_SOURCE_CHECK_PREFIX = "Source check:"
 RESEARCHER_DECISION_PREFIX = "researcher-decision:v1 "
 RESEARCHER_EVIDENCE_PREFIX = "researcher-evidence:v1 "
+MAX_RESEARCHER_CAPTURED_SOURCES = 3
+
+
+@dataclass(frozen=True)
+class ResearcherCapturedSource:
+    source_url: str
+    captured_at: str
+    artifact_name: str
+    hash_prefix: str
 
 
 @dataclass(frozen=True)
@@ -20,6 +29,19 @@ class ResearcherProvenance:
     run_id: str
     artifact_name: str
     hash_prefix: str
+    additional_sources: tuple[ResearcherCapturedSource, ...] = ()
+
+    @property
+    def captured_sources(self) -> tuple[ResearcherCapturedSource, ...]:
+        return (
+            ResearcherCapturedSource(
+                source_url=self.source_url,
+                captured_at=self.captured_at,
+                artifact_name=self.artifact_name,
+                hash_prefix=self.hash_prefix,
+            ),
+            *self.additional_sources,
+        )
 
 
 def format_major_title(title: str) -> str:
@@ -47,7 +69,7 @@ def parse_researcher_provenance(
     summary = ""
     trust_reason = ""
     decision: dict[str, str] = {}
-    captured: dict[str, str] = {}
+    captured: list[dict[str, str]] = []
     for value in values:
         for raw_line in str(value).splitlines():
             line = raw_line.strip()
@@ -57,24 +79,26 @@ def parse_researcher_provenance(
                 trust_reason = line.removeprefix(RESEARCHER_SOURCE_CHECK_PREFIX).strip()
             elif line.startswith(RESEARCHER_DECISION_PREFIX):
                 decision = _parse_researcher_marker(line, RESEARCHER_DECISION_PREFIX)
-            elif line.startswith(RESEARCHER_EVIDENCE_PREFIX) and not captured:
-                captured = _parse_researcher_marker(line, RESEARCHER_EVIDENCE_PREFIX)
+            elif (
+                line.startswith(RESEARCHER_EVIDENCE_PREFIX)
+                and len(captured) < MAX_RESEARCHER_CAPTURED_SOURCES
+            ):
+                captured.append(_parse_researcher_marker(line, RESEARCHER_EVIDENCE_PREFIX))
 
     if not (summary and decision and captured):
         return None
 
+    captured_sources = tuple(_researcher_captured_source(marker, decision) for marker in captured)
+    primary = captured_sources[0]
     return ResearcherProvenance(
         summary=summary or "Researcher-created queue finding.",
         trust_reason=trust_reason.removesuffix("."),
-        source_url=_safe_source_url(captured.get("source", "")),
-        captured_at=_safe_token(captured.get("captured_at", ""), 80),
-        run_id=_safe_token(captured.get("run", "") or decision.get("run", ""), 128),
-        artifact_name=_safe_artifact_basename(
-            captured.get("artifact", "") or decision.get("artifact", "")
-        ),
-        hash_prefix=_safe_hash_prefix(
-            captured.get("sha256", "") or decision.get("sha256", "")
-        ),
+        source_url=primary.source_url,
+        captured_at=primary.captured_at,
+        run_id=_safe_token(captured[0].get("run", "") or decision.get("run", ""), 128),
+        artifact_name=primary.artifact_name,
+        hash_prefix=primary.hash_prefix,
+        additional_sources=captured_sources[1:],
     )
 
 
@@ -110,11 +134,7 @@ def _safe_source_url(value: str) -> str:
 
 
 def _safe_token(value: str, max_length: int) -> str:
-    return (
-        value
-        if re.fullmatch(rf"[A-Za-z0-9_.:+-]{{1,{max_length}}}", value)
-        else "unknown"
-    )
+    return value if re.fullmatch(rf"[A-Za-z0-9_.:+-]{{1,{max_length}}}", value) else "unknown"
 
 
 def _safe_artifact_basename(value: str) -> str:
@@ -125,24 +145,39 @@ def _safe_hash_prefix(value: str) -> str:
     return value[:12] if re.fullmatch(r"[a-f0-9]{12,64}", value) else "unknown"
 
 
+def _researcher_captured_source(
+    captured: dict[str, str],
+    decision: dict[str, str],
+) -> ResearcherCapturedSource:
+    return ResearcherCapturedSource(
+        source_url=_safe_source_url(captured.get("source", "")),
+        captured_at=_safe_token(captured.get("captured_at", ""), 80),
+        artifact_name=_safe_artifact_basename(
+            captured.get("artifact", "") or decision.get("artifact", "")
+        ),
+        hash_prefix=_safe_hash_prefix(captured.get("sha256", "") or decision.get("sha256", "")),
+    )
+
+
 def format_researcher_source_check(provenance: ResearcherProvenance | None) -> str:
     if provenance is None:
         return ""
 
-    fields = [
-        ("Source", provenance.source_url, 500, "text"),
-        ("Captured", provenance.captured_at, 100, "text"),
-        ("Evidence", provenance.summary, 400, "text"),
-    ]
+    fields: list[tuple[str, object, int, str]] = []
+    for index, source in enumerate(provenance.captured_sources, start=1):
+        suffix = "" if index == 1 else f" {index}"
+        fields.extend(
+            [
+                (f"Source{suffix}", source.source_url, 500, "text"),
+                (f"Captured{suffix}", source.captured_at, 100, "text"),
+                (f"Artifact{suffix}", source.artifact_name, 180, "text"),
+                (f"Hash{suffix}", source.hash_prefix, 32, "id"),
+            ]
+        )
+    fields.append(("Evidence", provenance.summary, 400, "text"))
     if provenance.trust_reason:
         fields.append(("Trust", provenance.trust_reason, 200, "text"))
-    fields.extend(
-        [
-            ("Run ID", provenance.run_id, 160, "id"),
-            ("Artifact", provenance.artifact_name, 180, "text"),
-            ("Hash", provenance.hash_prefix, 32, "id"),
-        ]
-    )
+    fields.append(("Run ID", provenance.run_id, 160, "id"))
     lines = ["<blockquote><b>Source check</b>"]
     lines.extend(
         format_bounded_field_line(label, value, max_html_chars=limit, kind=kind)

@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
-from agents import WebSearchTool
+from agents import MaxTurnsExceeded, WebSearchTool
 from agents.agent_output import AgentOutputSchema
 from pydantic import TypeAdapter
 
@@ -66,9 +66,7 @@ def fake_result(
         response_id=response_id,
         usage=usage,
         raw_usage=({"output_tokens": output_tokens} if output_tokens is not None else None),
-        output=[
-            SimpleNamespace(type="web_search_call") for _ in range(web_search_calls)
-        ],
+        output=[SimpleNamespace(type="web_search_call") for _ in range(web_search_calls)],
     )
     return SimpleNamespace(final_output=final_output, raw_responses=[response])
 
@@ -88,6 +86,21 @@ def artifact_reference() -> ArtifactReference:
         artifact_name="page_snapshot-test.json",
         source_url="https://example.com/marathon",
         content_hash="a" * 64,
+    )
+
+
+def assessment_request() -> AssessmentRequest:
+    return AssessmentRequest(
+        mode="refresh",
+        evidence=(
+            CapturedSnapshotEvidence(
+                reference=artifact_reference(),
+                final_url="https://example.com/marathon",
+                fetched_at=datetime(2026, 8, 31, tzinfo=UTC),
+                normalized_text="Official marathon details.",
+                text_hash="b" * 64,
+            ),
+        ),
     )
 
 
@@ -200,6 +213,129 @@ def test_refresh_scout_limits_search_to_approved_source_domain() -> None:
     assert tool.filters is not None
     assert tool.filters.allowed_domains == ["events.example.com"]
     assert tool.external_web_access is True
+
+
+def test_refresh_scout_reserves_budget_for_assessor() -> None:
+    decision = {
+        "action": "no_change",
+        "summary": "Captured evidence does not support a change.",
+    }
+    runner = FakeRunner(
+        fake_result(
+            ScoutOutput(candidates=(candidate(),)),
+            web_search_calls=1,
+            output_tokens=256,
+        ),
+        fake_result(decision, output_tokens=40),
+    )
+    job = ResearchAgentJob(
+        instructions="Research safely.",
+        prompt_reference="research_agent:v1",
+        budget=ResearchBudget(
+            max_agent_turns_per_job=4,
+            max_web_searches_per_job=1,
+            max_output_tokens_per_job=512,
+            max_retries_per_job=1,
+            max_wall_time_seconds_per_job=10,
+        ),
+        runner=runner,
+    )
+
+    scout = asyncio.run(
+        job.scout(
+            ScoutRequest(
+                mode="refresh",
+                query="Example Marathon registration",
+                approved_source_url="https://example.com/marathon",
+            )
+        )
+    )
+    assessor = asyncio.run(job.assess(assessment_request()))
+
+    assert scout.state is AgentRunState.SUCCEEDED
+    assert assessor.state is AgentRunState.SUCCEEDED
+    assert len(runner.calls) == 2
+    scout_call, assessor_call = runner.calls
+    assert scout_call["max_turns"] == 3
+    assert scout_call["starting_agent"].model_settings.max_tokens == 256
+    assert scout_call["starting_agent"].model_settings.retry.max_retries == 0
+    assert assessor_call["max_turns"] == 3
+    assert assessor_call["starting_agent"].model_settings.max_tokens == 256
+    assert assessor_call["starting_agent"].model_settings.retry.max_retries == 1
+
+
+def test_unmetered_refresh_scout_preserves_assessor_reserve() -> None:
+    decision = {
+        "action": "no_change",
+        "summary": "Captured evidence does not support a change.",
+    }
+    runner = FakeRunner(
+        fake_result(ScoutOutput(candidates=()), output_tokens=None),
+        fake_result(decision, output_tokens=40),
+    )
+    job = ResearchAgentJob(
+        instructions="Research safely.",
+        prompt_reference="research_agent:v1",
+        budget=ResearchBudget(
+            max_web_searches_per_job=1,
+            max_output_tokens_per_job=512,
+            max_wall_time_seconds_per_job=10,
+        ),
+        runner=runner,
+    )
+
+    scout = asyncio.run(
+        job.scout(
+            ScoutRequest(
+                mode="refresh",
+                query="Example Marathon registration",
+                approved_source_url="https://example.com/marathon",
+            )
+        )
+    )
+    assessor = asyncio.run(job.assess(assessment_request()))
+
+    assert scout.state is AgentRunState.SUCCEEDED
+    assert assessor.state is AgentRunState.SUCCEEDED
+    assert runner.calls[1]["starting_agent"].model_settings.max_tokens == 256
+
+
+def test_refresh_scout_turn_exhaustion_preserves_assessor_turn() -> None:
+    decision = {
+        "action": "no_change",
+        "summary": "Captured evidence does not support a change.",
+    }
+    runner = FakeRunner(
+        MaxTurnsExceeded("Scout exhausted its allocated turns."),
+        fake_result(decision, output_tokens=40),
+    )
+    job = ResearchAgentJob(
+        instructions="Research safely.",
+        prompt_reference="research_agent:v1",
+        budget=ResearchBudget(
+            max_agent_turns_per_job=2,
+            max_web_searches_per_job=1,
+            max_output_tokens_per_job=512,
+            max_wall_time_seconds_per_job=10,
+        ),
+        runner=runner,
+    )
+
+    scout = asyncio.run(
+        job.scout(
+            ScoutRequest(
+                mode="refresh",
+                query="Example Marathon registration",
+                approved_source_url="https://example.com/marathon",
+            )
+        )
+    )
+    assessor = asyncio.run(job.assess(assessment_request()))
+
+    assert scout.state is AgentRunState.CAPPED
+    assert scout.error_code == "max_turns"
+    assert assessor.state is AgentRunState.SUCCEEDED
+    assert runner.calls[1]["max_turns"] == 1
 
 
 def test_assessor_has_zero_tools_and_accepts_only_frozen_captured_evidence() -> None:
@@ -460,13 +596,12 @@ def test_search_budget_stops_before_a_third_provider_call() -> None:
     assert third.error_code == "web_search_budget"
     assert len(runner.calls) == 2
     assert [
-        call["starting_agent"].model_settings.extra_body["max_tool_calls"]
-        for call in runner.calls
+        call["starting_agent"].model_settings.extra_body["max_tool_calls"] for call in runner.calls
     ] == [2, 1]
-    assert [
-        call["starting_agent"].model_settings.retry.max_retries
-        for call in runner.calls
-    ] == [2, 0]
+    assert [call["starting_agent"].model_settings.retry.max_retries for call in runner.calls] == [
+        2,
+        0,
+    ]
 
 
 def test_output_token_exhaustion_stops_before_another_sdk_call() -> None:

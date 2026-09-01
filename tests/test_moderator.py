@@ -167,8 +167,7 @@ def researcher_evidence(
     return (
         f"Researcher worker: {summary}",
         "Source check: stored approved event source.",
-        "researcher-decision:v1 "
-        f"run={run_id} artifact=prepared.json sha256={'a' * 64}",
+        f"researcher-decision:v1 run={run_id} artifact=prepared.json sha256={'a' * 64}",
         "researcher-evidence:v1 "
         f"run={run_id} artifact={artifact} sha256={'b' * 12} "
         f"source={source_url} captured_at=2026-08-31T14:00:00+00:00",
@@ -349,7 +348,7 @@ def test_researcher_suggestion_detail_escapes_and_bounds_provenance() -> None:
     detail = format_suggestion_detail(suggestion)
 
     assert "<b>From</b>: Researcher worker" in detail
-    assert "Treat &lt;b&gt;this&lt;/b&gt; &amp; \"that\" as evidence." in detail
+    assert 'Treat &lt;b&gt;this&lt;/b&gt; &amp; "that" as evidence.' in detail
     assert "<b>Source</b>: https://example.com/race?&lt;script&gt;&amp;source=calendar" in detail
     assert "<b>Captured</b>: 2026-08-31T14:00:00+00:00" in detail
     assert "<b>Run ID</b>: <code>2d1aa0bb-13c1-4f1b-b81f-a7f6b83b62dc</code>" in detail
@@ -357,6 +356,41 @@ def test_researcher_suggestion_detail_escapes_and_bounds_provenance() -> None:
     assert "<b>Hash</b>: <code>bbbbbbbbbbbb</code>" in detail
     assert "/srv/run4221" not in detail
     assert "researcher-evidence:v1" not in detail
+    assert len(detail) <= 4096
+
+
+def test_researcher_detail_renders_all_captured_sources() -> None:
+    run_id = "2d1aa0bb-13c1-4f1b-b81f-a7f6b83b62dc"
+    evidence = researcher_evidence() + (
+        "researcher-evidence:v1 "
+        f"run={run_id} artifact=registration.json sha256={'c' * 64} "
+        "source=https://example.com/registration "
+        "captured_at=2026-08-31T14:01:00+00:00",
+        "researcher-evidence:v1 "
+        f"run={run_id} artifact=lottery.json sha256={'d' * 64} "
+        "source=https://example.com/lottery "
+        "captured_at=2026-08-31T14:02:00+00:00",
+    )
+    suggestion = SimpleNamespace(
+        id=7,
+        event_name="Baden Marathon",
+        url="https://www.badenmarathon.de/",
+        distances=("marathon",),
+        submitter_username=None,
+        submitter_display_name=None,
+        submitter_user_id=None,
+        note="\n".join(evidence),
+    )
+
+    detail = format_suggestion_detail(suggestion)
+
+    assert "<b>Source</b>: https://example.com/register" in detail
+    assert "<b>Source 2</b>: https://example.com/registration" in detail
+    assert "<b>Source 3</b>: https://example.com/lottery" in detail
+    assert "<b>Artifact 2</b>: registration.json" in detail
+    assert "<b>Artifact 3</b>: lottery.json" in detail
+    assert "<b>Hash 2</b>: <code>cccccccccccc</code>" in detail
+    assert "<b>Hash 3</b>: <code>dddddddddddd</code>" in detail
     assert len(detail) <= 4096
 
 
@@ -1369,9 +1403,7 @@ def test_apply_update_id_asks_for_confirmation(monkeypatch) -> None:
     message = FakeMessage()
     asyncio.run(moderator.apply_update_by_record_id_text(message, "#3"))
 
-    assert message.answers == [
-        format_update_review_confirmation(update, action="apply")
-    ]
+    assert message.answers == [format_update_review_confirmation(update, action="apply")]
     confirm, back = message.answer_kwargs[0]["reply_markup"].inline_keyboard[0]
     assert confirm.text == "Confirm"
     assert back.text == "Cancel"
@@ -1421,9 +1453,7 @@ def test_show_update_state_keeps_dialog_keyboard_on_invalid_id(monkeypatch) -> N
 
     assert not state.cleared
     assert message.answers == [
-        "<b>💬 Show update</b>\n"
-        "Send an update ID.\n"
-        "<b>Example</b>: <i>#1</i>"
+        "<b>💬 Show update</b>\nSend an update ID.\n<b>Example</b>: <i>#1</i>"
     ]
     assert [button.text for button in message.answer_kwargs[0]["reply_markup"].keyboard[0]] == [
         "Cancel"
@@ -1443,9 +1473,7 @@ def test_guided_input_rejects_unexpected_commands(monkeypatch) -> None:
     message = FakeMessage(text="/list_suggestions")
     asyncio.run(moderator.handle_edit_event_id(message, FakeState()))
 
-    assert message.answers == [
-        "Only /cancel is accepted while this dialog is waiting for input."
-    ]
+    assert message.answers == ["Only /cancel is accepted while this dialog is waiting for input."]
     assert [button.text for button in message.answer_kwargs[0]["reply_markup"].keyboard[0]] == [
         "Cancel"
     ]
@@ -1546,11 +1574,7 @@ def test_proposed_update_detail_formats_diff_and_evidence() -> None:
     assert "Registration update proposed" not in detail
     assert "<b>What's changed</b>" in detail
     assert "- <b>registration_status</b>\n  <s>unknown</s>\n  open" in detail
-    assert (
-        "- <b>registration_url</b>\n"
-        "  <s>unknown</s>\n"
-        "  https://example.com/register"
-    ) in detail
+    assert ("- <b>registration_url</b>\n  <s>unknown</s>\n  https://example.com/register") in detail
     assert "<b>Source check</b>" in detail
     assert "/apply_update 1" not in detail
     assert "/reject_update 1" not in detail
@@ -1562,9 +1586,7 @@ def test_proposed_update_detail_formats_explicit_field_clear() -> None:
             id=4,
             event_id="berlin.42",
             update_type="registration_window",
-            current_fields={
-                "registration_url": "https://example.com/kids-and-youth/mini-marathon"
-            },
+            current_fields={"registration_url": "https://example.com/kids-and-youth/mini-marathon"},
             proposed_fields={"registration_url": None},
             evidence=("The saved URL belongs to a child event.",),
             confidence=0.99,
@@ -1646,10 +1668,13 @@ def test_researcher_provenance_is_repeated_in_all_confirmations() -> None:
         assert len(confirmation) <= 4096
 
     assert format_event_added_confirmation(from_suggestion=False) == "Event added."
-    assert format_event_added_confirmation(
-        from_suggestion=True,
-        suggestion_note="Please track it.",
-    ) == "Event added. The source suggestion was removed from the pending queue."
+    assert (
+        format_event_added_confirmation(
+            from_suggestion=True,
+            suggestion_note="Please track it.",
+        )
+        == "Event added. The source suggestion was removed from the pending queue."
+    )
 
 
 def test_parse_queue_number_accepts_visible_numbers() -> None:

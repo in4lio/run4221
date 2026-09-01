@@ -138,16 +138,33 @@ async def validate_public_http_url(
         try:
             parsed_addresses.append(ipaddress.ip_address(address))
         except ValueError as error:
-            raise PageFetchError(
-                f"Host resolved to an invalid address: {address}"
-            ) from error
+            raise PageFetchError(f"Host resolved to an invalid address: {address}") from error
     blocked = tuple(str(address) for address in parsed_addresses if not address.is_global)
     if blocked:
         raise PageFetchError(f"Private or non-public address is not allowed: {blocked[0]}")
     return tuple(
-        str(address)
-        for address in sorted(parsed_addresses, key=lambda address: address.version)
+        str(address) for address in sorted(parsed_addresses, key=lambda address: address.version)
     )
+
+
+def validate_allowed_origin(url: str, allowed_origin: str) -> None:
+    if _normalized_public_origin(url) != _normalized_public_origin(allowed_origin):
+        raise PageFetchError(f"URL leaves the approved origin: {url}")
+
+
+def _normalized_public_origin(url: str) -> tuple[str, str, int]:
+    parsed = urlparse(url)
+    scheme = parsed.scheme.casefold()
+    if scheme not in {"http", "https"} or not parsed.hostname:
+        raise PageFetchError(f"Only absolute public HTTP(S) URLs are allowed: {url}")
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise PageFetchError(f"Invalid URL port: {url}") from error
+    default_port = 443 if scheme == "https" else 80
+    if port not in {None, default_port}:
+        raise PageFetchError(f"Non-default URL ports are not allowed: {url}")
+    return scheme, parsed.hostname.rstrip(".").casefold(), default_port
 
 
 async def fetch_public_response(
@@ -158,9 +175,12 @@ async def fetch_public_response(
     timeout: float,
     resolve_host: HostResolver,
     max_response_bytes: int,
+    allowed_origin: str | None = None,
 ) -> httpx.Response:
     current_url = url
     for redirect_count in range(MAX_REDIRECTS + 1):
+        if allowed_origin is not None:
+            validate_allowed_origin(current_url, allowed_origin)
         addresses = await validate_public_http_url(
             current_url,
             resolve_host=resolve_host,
@@ -196,16 +216,13 @@ async def fetch_public_response(
                     if content_type:
                         media_type = content_type.split(";", maxsplit=1)[0].strip().casefold()
                         if not (
-                            media_type.startswith("text/")
-                            or media_type == "application/xhtml+xml"
+                            media_type.startswith("text/") or media_type == "application/xhtml+xml"
                         ):
                             raise PageFetchError(f"Unsupported page content type: {media_type}")
 
                     content_encoding = streamed.headers.get("content-encoding", "identity")
                     if content_encoding.strip().casefold() != "identity":
-                        raise PageFetchError(
-                            "Compressed page responses are not supported."
-                        )
+                        raise PageFetchError("Compressed page responses are not supported.")
 
                     declared_length = streamed.headers.get("content-length")
                     if declared_length and declared_length.isdigit():
@@ -215,9 +232,7 @@ async def fetch_public_response(
                             )
 
                     content = (
-                        bytearray(streamed.content)
-                        if streamed.is_stream_consumed
-                        else bytearray()
+                        bytearray(streamed.content) if streamed.is_stream_consumed else bytearray()
                     )
                     if len(content) > max_response_bytes:
                         raise PageFetchError(
@@ -275,6 +290,7 @@ async def fetch_page_snapshot(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     resolve_host: HostResolver = resolve_host_addresses,
     max_response_bytes: int = MAX_RESPONSE_BYTES,
+    allowed_origin: str | None = None,
 ) -> PageSnapshot:
     headers = {
         "User-Agent": USER_AGENT,
@@ -290,6 +306,7 @@ async def fetch_page_snapshot(
                 timeout=timeout,
                 resolve_host=resolve_host,
                 max_response_bytes=max_response_bytes,
+                allowed_origin=allowed_origin,
             )
         else:
             async with httpx.AsyncClient(
@@ -305,6 +322,7 @@ async def fetch_page_snapshot(
                     timeout=timeout,
                     resolve_host=resolve_host,
                     max_response_bytes=max_response_bytes,
+                    allowed_origin=allowed_origin,
                 )
     except (httpx.HTTPError, ValueError) as error:
         raise PageFetchError(f"Could not fetch {url}: {error}") from error
@@ -389,11 +407,7 @@ def extract_response_content(
 
     title = normalize_text(" ".join(parser.title_parts)) or None
     body_text = normalize_text(" ".join(parser.text_parts))
-    links = select_snapshot_links(
-        PageLink(url=url, text=text)
-        for url, text in parser.links
-        if url
-    )
+    links = select_snapshot_links(PageLink(url=url, text=text) for url, text in parser.links if url)
     if body_text:
         return title, body_text, links
 
@@ -472,8 +486,7 @@ def select_snapshot_links(links: Iterable[PageLink]) -> tuple[PageLink, ...]:
             continue
         key = normalize_fetch_url(link.url)
         is_relevant = any(
-            term in f"{link.text} {link.url}".casefold()
-            for term in LINK_DISCOVERY_TERMS
+            term in f"{link.text} {link.url}".casefold() for term in LINK_DISCOVERY_TERMS
         )
         if key not in unique or (is_relevant and key not in relevant):
             unique[key] = link
