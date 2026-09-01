@@ -172,6 +172,36 @@ def test_scout_uses_luna_web_search_and_explicit_provider_limits() -> None:
     assert "previous_response_id" not in call
 
 
+def test_refresh_scout_limits_search_to_approved_source_domain() -> None:
+    runner = FakeRunner(fake_result(ScoutOutput(candidates=(candidate(),))))
+    job = ResearchAgentJob(
+        instructions="Find exact official registration pages.",
+        prompt_reference="research_agent:v1",
+        budget=ResearchBudget(
+            max_web_searches_per_job=1,
+            max_wall_time_seconds_per_job=10,
+        ),
+        runner=runner,
+    )
+
+    result = asyncio.run(
+        job.scout(
+            ScoutRequest(
+                mode="refresh",
+                query="Baden Marathon 2027 standard public registration lottery status",
+                approved_source_url="https://events.example.com/marathon",
+            )
+        )
+    )
+
+    assert result.state is AgentRunState.SUCCEEDED
+    tool = runner.calls[0]["starting_agent"].tools[0]
+    assert isinstance(tool, WebSearchTool)
+    assert tool.filters is not None
+    assert tool.filters.allowed_domains == ["events.example.com"]
+    assert tool.external_web_access is True
+
+
 def test_assessor_has_zero_tools_and_accepts_only_frozen_captured_evidence() -> None:
     decision = {
         "action": "propose_update",

@@ -26,6 +26,7 @@ from run4221.researcher.budget import (
     JobBudgetTracker,
     ProviderCallLimits,
 )
+from run4221.researcher.policy import source_domain
 from run4221.researcher.schemas import (
     ArtifactReference,
     AssessorDecision,
@@ -220,7 +221,7 @@ class ResearchAgentJob:
                 error_code=error.cap.value,
             )
 
-        agent = self._scout_agent(limits)
+        agent = self._scout_agent(limits, request)
         try:
             result = await asyncio.wait_for(
                 self.runner.run(
@@ -317,8 +318,16 @@ class ResearchAgentJob:
             decision=decision,
         )
 
-    def _scout_agent(self, limits: ProviderCallLimits) -> Agent[None]:
+    def _scout_agent(
+        self,
+        limits: ProviderCallLimits,
+        request: ScoutRequest,
+    ) -> Agent[None]:
         assert limits.max_tool_calls is not None
+        allowed_domains = None
+        if request.mode == "refresh":
+            assert request.approved_source_url is not None
+            allowed_domains = [source_domain(request.approved_source_url)]
         return Agent(
             name="Run4221 event scout",
             instructions=(
@@ -327,7 +336,17 @@ class ResearchAgentJob:
                 f"{self.budget.policy.max_candidates_per_cycle}.\n\n"
             ),
             model=self.model,
-            tools=[WebSearchTool(search_context_size="low")],
+            tools=[
+                WebSearchTool(
+                    filters=(
+                        {"allowed_domains": allowed_domains}
+                        if allowed_domains is not None
+                        else None
+                    ),
+                    search_context_size="low",
+                    external_web_access=True,
+                )
+            ],
             output_type=ScoutOutput,
             model_settings=ModelSettings(
                 parallel_tool_calls=False,
