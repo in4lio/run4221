@@ -11,11 +11,8 @@ from pathlib import Path
 from run4221.db.repository import (
     EventCreate,
     add_event,
-    count_event_suggestions,
     count_proposed_event_updates,
     find_event,
-    list_event_suggestions,
-    list_events,
     list_proposed_event_updates,
 )
 from run4221.db.research import list_due_sources
@@ -32,7 +29,6 @@ from run4221.researcher.agent import (
     ScoutRunResult,
 )
 from run4221.researcher.artifacts import ResearchArtifactStore
-from run4221.researcher.policy import SourceTrustPolicy
 from run4221.researcher.schemas import (
     EvidenceRequest,
     ResearchBudget,
@@ -235,24 +231,6 @@ def refresh_decision(request) -> ResearchDecision:
     return supported_update(request)
 
 
-def discovery_decision(request) -> ResearchDecision:
-    return ResearchDecision(
-        action="suggest_event",
-        summary="Captured official event page with marathon details.",
-        confidence=0.91,
-        candidate=ResearchCandidate(
-            source_url=request.evidence[0].final_url,
-            title="New City Marathon",
-            snippet="Marathon in New City on 2027-10-10.",
-            event_date="2027-10-10",
-            location="New City, Germany",
-            region_tags=("eu", "de"),
-            distances=("marathon",),
-        ),
-        evidence=[item.reference for item in request.evidence],
-    )
-
-
 def tracked_source(url: str):
     add_event(event_payload(), database_url=url)
     return list_due_sources(
@@ -268,8 +246,6 @@ def service(
     url: str,
     agent: FakeAgent,
     fetch,
-    trusted_domains=("baden.example", "official.example"),
-    trusted_registry_urls=(),
     budget: ResearchBudget | None = None,
 ) -> ResearcherService:
     async def fetch_with_policy(
@@ -284,10 +260,6 @@ def service(
         database_url=url,
         artifacts=ResearchArtifactStore(tmp_path / "runs"),
         agent=agent,
-        trust_policy=SourceTrustPolicy(
-            trusted_domains=frozenset(trusted_domains),
-            trusted_registry_urls=tuple(trusted_registry_urls),
-        ),
         budget=budget or ResearchBudget(max_wall_time_seconds_per_job=10),
         fetch_snapshot=fetch_with_policy,
     )
@@ -1564,77 +1536,6 @@ def test_refresh_can_explicitly_clear_invalid_registration_url(tmp_path: Path) -
     }
 
 
-def test_ae2_discovery_creates_system_suggestion_and_no_event(tmp_path: Path) -> None:
-    url = database_url(tmp_path)
-    candidate = ResearchCandidate(
-        source_url="https://official.example/new-city-marathon",
-        title="Search result",
-        snippet="Possible event page.",
-        discovery_query="Germany marathon 2027",
-    )
-
-    async def fetch(source_url: str) -> PageSnapshot:
-        return snapshot(source_url, text="New City Marathon, 10 October 2027.")
-
-    result = asyncio.run(
-        service(
-            tmp_path,
-            url=url,
-            agent=FakeAgent(candidates=(candidate,), decide=discovery_decision),
-            fetch=fetch,
-        ).discover("Germany marathon 2027")
-    )
-
-    assert result.status.outcome == "suggestion_created"
-    assert result.queue_reference == "event_suggestion:1"
-    assert list_events(database_url=url) == ()
-    suggestions = list_event_suggestions(database_url=url)
-    assert len(suggestions) == 1
-    assert suggestions[0].submitter_user_id is None
-    assert suggestions[0].distances == ("marathon",)
-    assert suggestions[0].note and "researcher-evidence:v1" in suggestions[0].note
-    assert "researcher-decision:v1" in suggestions[0].note
-    assert "Source check: configured trusted domain." in suggestions[0].note
-    assert "captured_at=2026-08-31T14:00:00+00:00" in suggestions[0].note
-
-
-def test_discovery_continues_after_no_change_candidate(tmp_path: Path) -> None:
-    url = database_url(tmp_path)
-    candidates = tuple(
-        ResearchCandidate(
-            source_url=f"https://official.example/{slug}",
-            title=f"Search result {slug}",
-            snippet="Possible event page.",
-        )
-        for slug in ("existing-event", "new-event")
-    )
-
-    def decide(request) -> ResearchDecision:
-        if request.evidence[0].final_url.endswith("/existing-event"):
-            return ResearchDecision(
-                action="no_change",
-                summary="The first candidate is already represented.",
-            )
-        return discovery_decision(request)
-
-    async def fetch(source_url: str) -> PageSnapshot:
-        return snapshot(source_url)
-
-    agent = FakeAgent(candidates=candidates, decide=decide)
-    result = asyncio.run(
-        service(
-            tmp_path,
-            url=url,
-            agent=agent,
-            fetch=fetch,
-        ).discover("Germany marathon 2027")
-    )
-
-    assert result.status.outcome == "suggestion_created"
-    assert len(agent.assessment_calls) == 2
-    assert list_event_suggestions(database_url=url)[0].url == candidates[1].source_url
-
-
 def test_shadow_mode_audits_supported_finding_without_queue_write(tmp_path: Path) -> None:
     url = database_url(tmp_path)
     source = tracked_source(url)
@@ -1654,7 +1555,6 @@ def test_shadow_mode_audits_supported_finding_without_queue_write(tmp_path: Path
         database_url=url,
         artifacts=ResearchArtifactStore(tmp_path / "shadow-runs"),
         agent=FakeAgent(decide=refresh_decision),
-        trust_policy=SourceTrustPolicy(trusted_domains=frozenset({"baden.example"})),
         budget=ResearchBudget(max_wall_time_seconds_per_job=10),
         fetch_snapshot=fetch_with_policy,
         persist_queue=False,
@@ -1666,109 +1566,6 @@ def test_shadow_mode_audits_supported_finding_without_queue_write(tmp_path: Path
     assert result.status.outcome == "inconclusive"
     assert "shadow" in (result.status.detail or "").casefold()
     assert count_proposed_event_updates(database_url=url) == 0
-
-
-def test_repeated_discovery_is_audited_duplicate_skip(tmp_path: Path) -> None:
-    url = database_url(tmp_path)
-    candidate = ResearchCandidate(
-        source_url="https://official.example/new-city-marathon",
-        title="Search result",
-        snippet="Possible event page.",
-    )
-
-    async def fetch(source_url: str) -> PageSnapshot:
-        return snapshot(source_url)
-
-    first = service(
-        tmp_path / "first",
-        url=url,
-        agent=FakeAgent(candidates=(candidate,), decide=discovery_decision),
-        fetch=fetch,
-    )
-    second = service(
-        tmp_path / "second",
-        url=url,
-        agent=FakeAgent(candidates=(candidate,), decide=discovery_decision),
-        fetch=fetch,
-    )
-
-    assert asyncio.run(first.discover("marathon")).status.outcome == "suggestion_created"
-    duplicate = asyncio.run(second.discover("marathon"))
-
-    assert duplicate.status.status == "skipped"
-    assert duplicate.status.outcome == "no_change"
-    assert "duplicate" in (duplicate.status.detail or "").casefold()
-    assert count_event_suggestions(database_url=url) == 1
-    terminal = second.artifacts.read_artifact(duplicate.terminal_reference)
-    assert terminal["content"]["queue_state"] == "absent"
-
-
-def test_untrusted_page_cannot_self_declare_official(tmp_path: Path) -> None:
-    url = database_url(tmp_path)
-    candidate = ResearchCandidate(
-        source_url="https://unknown.example/marathon",
-        title="Official Marathon Website",
-        snippet="This page says it is official.",
-    )
-    agent = FakeAgent(candidates=(candidate,), decide=discovery_decision)
-
-    async def fetch(source_url: str) -> PageSnapshot:
-        return snapshot(source_url, text="We are the official marathon organizer.")
-
-    result = asyncio.run(
-        service(
-            tmp_path,
-            url=url,
-            agent=agent,
-            fetch=fetch,
-            trusted_domains=("registry.example",),
-        ).discover("marathon")
-    )
-
-    assert result.status.status == "skipped"
-    assert result.status.outcome == "inconclusive"
-    assert count_event_suggestions(database_url=url) == 0
-    assert agent.assessment_calls == []
-
-
-def test_registry_link_chain_requires_and_persists_both_artifacts(tmp_path: Path) -> None:
-    url = database_url(tmp_path)
-    candidate_url = "https://organizer.example/new-city-marathon"
-    registry_url = "https://registry.example/events"
-    candidate = ResearchCandidate(
-        source_url=candidate_url,
-        title="Search result",
-        snippet="Possible event page.",
-    )
-    agent = FakeAgent(candidates=(candidate,), decide=discovery_decision)
-
-    async def fetch(source_url: str) -> PageSnapshot:
-        if source_url == registry_url:
-            return snapshot(
-                source_url,
-                text="Trusted event registry.",
-                links=(PageLink(url=candidate_url, text="New City Marathon"),),
-            )
-        return snapshot(source_url)
-
-    result = asyncio.run(
-        service(
-            tmp_path,
-            url=url,
-            agent=agent,
-            fetch=fetch,
-            trusted_domains=("registry.example",),
-            trusted_registry_urls=(registry_url,),
-        ).discover("marathon")
-    )
-
-    assert result.status.outcome == "suggestion_created"
-    assert len(agent.assessment_calls[0].evidence) == 2
-    note = list_event_suggestions(database_url=url)[0].note or ""
-    assert "Source check: captured trusted registry link." in note
-    for evidence in agent.assessment_calls[0].evidence:
-        assert evidence.reference.artifact_name in note
-        assert evidence.reference.content_hash[:12] in note
 
 
 def test_uncaptured_evidence_and_profile_only_result_never_write_queue(tmp_path: Path) -> None:
@@ -1875,7 +1672,6 @@ def test_service_boundary_has_no_direct_apply_or_registration_orchestration() ->
     assert "run4221.ai.registration_window" not in imported
     assert "update_registration_window" not in source
     assert "auto_confirm" not in inspect.signature(ResearcherService.refresh).parameters
-    assert "auto_confirm" not in inspect.signature(ResearcherService.discover).parameters
 
 
 def test_refresh_accepts_half_marathon_evidence_for_mixed_distance_event(
@@ -1947,37 +1743,6 @@ def test_refresh_still_rejects_mini_marathon_evidence_for_mixed_distance_event(
     assert count_proposed_event_updates(database_url=url) == 0
 
 
-def test_discovery_enforces_end_to_end_wall_time_budget(tmp_path: Path) -> None:
-    url = database_url(tmp_path)
-    candidate = ResearchCandidate(
-        source_url="https://official.example/new-city-marathon",
-        title="Search result",
-        snippet="Possible event page.",
-    )
-    budget = ResearchBudget(max_wall_time_seconds_per_job=10).model_copy(
-        update={"max_wall_time_seconds_per_job": 0.01}
-    )
-
-    async def fetch(source_url: str) -> PageSnapshot:
-        await asyncio.sleep(0.05)
-        return snapshot(source_url, text="New City Marathon, 10 October 2027.")
-
-    result = asyncio.run(
-        service(
-            tmp_path,
-            url=url,
-            agent=FakeAgent(candidates=(candidate,), decide=discovery_decision),
-            fetch=fetch,
-            budget=budget,
-        ).discover("Germany marathon 2027")
-    )
-
-    assert result.status.status == "capped"
-    assert result.status.outcome == "inconclusive"
-    assert result.status.detail == "Discovery wall-time budget was exhausted."
-    assert count_event_suggestions(database_url=url) == 0
-
-
 def test_refresh_skips_http_error_source_before_assessment(tmp_path: Path) -> None:
     url = database_url(tmp_path)
     source = tracked_source(url)
@@ -1993,26 +1758,3 @@ def test_refresh_skips_http_error_source_before_assessment(tmp_path: Path) -> No
     assert result.status.detail == "Approved source was unusable: unusable HTTP status 404."
     assert agent.assessment_calls == []
     assert count_proposed_event_updates(database_url=url) == 0
-
-
-def test_discovery_skips_http_error_candidate_before_assessment(tmp_path: Path) -> None:
-    url = database_url(tmp_path)
-    candidate = ResearchCandidate(
-        source_url="https://official.example/new-city-marathon",
-        title="Search result",
-        snippet="Possible event page.",
-    )
-    agent = FakeAgent(candidates=(candidate,), decide=discovery_decision)
-
-    async def fetch(source_url: str) -> PageSnapshot:
-        return snapshot(source_url, status_code=500)
-
-    result = asyncio.run(
-        service(tmp_path, url=url, agent=agent, fetch=fetch).discover("Germany marathon 2027")
-    )
-
-    assert result.status.status == "skipped"
-    assert result.status.outcome == "inconclusive"
-    assert "unusable HTTP status 500" in (result.status.detail or "")
-    assert agent.assessment_calls == []
-    assert count_event_suggestions(database_url=url) == 0

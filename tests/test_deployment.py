@@ -204,8 +204,7 @@ def test_example_keeps_researcher_paused_with_a_dedicated_credential() -> None:
     assert "BOT_ENV_FILE=./private/runtime/bot.env" in example
     assert "RESEARCHER_ENV_FILE=./private/runtime/researcher.env" in example
     assert "RESEARCHER_OPENAI_API_KEY=" in example
-    assert "RESEARCHER_ENABLED=false" in example
-    assert "RESEARCHER_DISCOVERY_ENABLED=false" in example
+    assert "RESEARCHER_SCHEDULE_ENABLED=false" in example
     assert "RESEARCHER_RENDERING_ENABLED=false" in example
 
 

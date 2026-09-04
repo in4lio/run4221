@@ -9,11 +9,9 @@ from urllib.parse import urlparse
 
 from run4221.db.models import RESEARCH_DECISION_MARKER_PREFIX
 from run4221.db.research import (
-    EventSuggestionCreate,
     ProposedEventUpdateCreate,
     ResearchSourceRecord,
     admit_proposed_update,
-    admit_suggestion,
     normalize_url,
 )
 from run4221.events import TrackedEvent
@@ -37,7 +35,7 @@ from run4221.researcher.agent import (
     ScoutRunResult,
 )
 from run4221.researcher.artifacts import ResearchArtifactStore
-from run4221.researcher.policy import SourceTrustPolicy, source_domain
+from run4221.researcher.policy import source_domain
 from run4221.researcher.schemas import (
     ArtifactReference,
     AssessmentVerdict,
@@ -196,7 +194,6 @@ class ResearcherService:
         database_url: str,
         artifacts: ResearchArtifactStore,
         agent: ResearchAgent,
-        trust_policy: SourceTrustPolicy,
         budget: ResearchBudget,
         fetch_snapshot: SnapshotFetcher = fetch_page_snapshot,
         persist_queue: bool = True,
@@ -205,7 +202,6 @@ class ResearcherService:
         self.database_url = database_url
         self.artifacts = artifacts
         self.agent = agent
-        self.trust_policy = trust_policy
         self.budget = budget
         self.fetch_snapshot = fetch_snapshot
         self.persist_queue = persist_queue
@@ -605,241 +601,6 @@ class ResearcherService:
             queue_reference=queue_reference,
         )
 
-    async def discover(self, query: str) -> ResearchJobResult:
-        """Search and capture bounded candidates, admitting at most one suggestion."""
-
-        clean_query = query.strip()
-        if not clean_query:
-            raise ValueError("Discovery query cannot be empty.")
-        run_id = self.artifacts.create_run(
-            job_type="discovery",
-            metadata={"query": clean_query},
-        )
-        self._announce_run(run_id)
-        try:
-            async with asyncio.timeout(self.budget.max_wall_time_seconds_per_job):
-                return await self._discover_started(run_id, clean_query)
-        except TimeoutError:
-            return self._finish_without_queue(
-                run_id,
-                AUDIT_SOURCE_URL,
-                RunState.CAPPED,
-                RunOutcome.INCONCLUSIVE,
-                "Discovery wall-time budget was exhausted.",
-            )
-
-    async def _discover_started(self, run_id: str, clean_query: str) -> ResearchJobResult:
-        scout = await self.agent.scout(ScoutRequest(mode="discovery", query=clean_query))
-        self._record_scout(
-            run_id,
-            scout.candidates[0].source_url if scout.candidates else AUDIT_SOURCE_URL,
-            scout,
-        )
-        if scout.state is not AgentRunState.SUCCEEDED:
-            return self._finish_agent_outcome(run_id, AUDIT_SOURCE_URL, scout)
-        if not scout.candidates:
-            return self._finish_without_queue(
-                run_id,
-                AUDIT_SOURCE_URL,
-                RunState.SUCCEEDED,
-                RunOutcome.NO_CHANGE,
-                "Search returned no candidates.",
-            )
-
-        registry_captures: dict[str, CapturedPage] = {}
-        pages_captured = 0
-        skipped_reasons: list[str] = []
-        no_change_reasons: list[str] = []
-        for candidate in scout.candidates[: self.budget.max_candidates_per_cycle]:
-            if pages_captured >= self.budget.max_static_pages_per_job:
-                return self._finish_without_queue(
-                    run_id,
-                    candidate.source_url,
-                    RunState.CAPPED,
-                    RunOutcome.INCONCLUSIVE,
-                    "Static page capture budget was exhausted.",
-                )
-            try:
-                captured = await self._capture(run_id, candidate.source_url)
-            except PageFetchError as error:
-                skipped_reasons.append(f"capture failed ({type(error).__name__})")
-                continue
-            pages_captured += 1
-            if reason := blocked_page_reason(captured.snapshot):
-                skipped_reasons.append(f"candidate page unusable ({reason})")
-                continue
-
-            trust = self.trust_policy.evaluate(captured.snapshot)
-            if not trust.trusted:
-                for registry_url in self.trust_policy.trusted_registry_urls:
-                    if registry_url in registry_captures:
-                        continue
-                    if pages_captured >= self.budget.max_static_pages_per_job:
-                        break
-                    try:
-                        registry_capture = await self._capture(run_id, registry_url)
-                    except PageFetchError:
-                        continue
-                    if blocked_page_reason(registry_capture.snapshot) is not None:
-                        continue
-                    registry_captures[registry_url] = registry_capture
-                    pages_captured += 1
-                trust = self.trust_policy.evaluate(
-                    captured.snapshot,
-                    registry_snapshots=tuple(item.snapshot for item in registry_captures.values()),
-                )
-            if not trust.trusted:
-                skipped_reasons.append(trust.reason)
-                continue
-
-            evidence = [captured]
-            if trust.registry_snapshot is not None:
-                registry_capture = registry_captures.get(trust.registry_snapshot.source_url)
-                if registry_capture is None:
-                    skipped_reasons.append("trusted registry artifact was unavailable")
-                    continue
-                evidence.append(registry_capture)
-            assessment = await self.agent.assess(
-                AssessmentRequest(
-                    mode="discovery",
-                    context=(FrozenContextField(name="query", value=clean_query),),
-                    evidence=tuple(item.as_agent_evidence() for item in evidence),
-                )
-            )
-            self._record_assessment(run_id, candidate.source_url, assessment)
-            if assessment.state is not AgentRunState.SUCCEEDED or assessment.decision is None:
-                return self._finish_agent_outcome(run_id, candidate.source_url, assessment)
-            decision = assessment.decision
-            required_references = tuple(item.reference for item in evidence)
-            if decision.action is DecisionAction.NO_CHANGE:
-                no_change_reasons.append(decision.summary)
-                continue
-            if decision.action is not DecisionAction.SUGGEST_EVENT or decision.candidate is None:
-                return self._finish_without_queue(
-                    run_id,
-                    candidate.source_url,
-                    RunState.SKIPPED,
-                    RunOutcome.INCONCLUSIVE,
-                    decision.summary,
-                )
-            if not self._valid_evidence(decision, required=required_references):
-                return self._finish_without_queue(
-                    run_id,
-                    candidate.source_url,
-                    RunState.SKIPPED,
-                    RunOutcome.INCONCLUSIVE,
-                    "Decision did not cite the complete captured trust evidence.",
-                )
-            if not _candidate_matches_capture(decision.candidate, captured.snapshot):
-                return self._finish_without_queue(
-                    run_id,
-                    candidate.source_url,
-                    RunState.SKIPPED,
-                    RunOutcome.INCONCLUSIVE,
-                    "Suggested event URL was not the captured trusted candidate.",
-                )
-            if not decision.candidate.distances:
-                return self._finish_without_queue(
-                    run_id,
-                    candidate.source_url,
-                    RunState.SKIPPED,
-                    RunOutcome.INCONCLUSIVE,
-                    "Suggested event profile had no supported distance.",
-                )
-
-            committed_status = ResearchRunStatus(
-                status=RunState.SUCCEEDED,
-                outcome=RunOutcome.SUGGESTION_CREATED,
-            )
-            if not self.persist_queue:
-                return self._finish_without_queue(
-                    run_id,
-                    candidate.source_url,
-                    RunState.SUCCEEDED,
-                    RunOutcome.INCONCLUSIVE,
-                    "Shadow mode validated an event candidate without writing the queue.",
-                )
-            prepared = self.artifacts.prepare_decision(
-                run_id,
-                source_url=candidate.source_url,
-                decision=decision,
-                committed_status=committed_status,
-            )
-            note = "\n".join(
-                _moderation_evidence(
-                    decision.summary,
-                    tuple(evidence),
-                    trust_reason=trust.reason,
-                    prepared=prepared,
-                )
-            )
-            try:
-                admission = admit_suggestion(
-                    EventSuggestionCreate(
-                        event_name=decision.candidate.title,
-                        url=decision.candidate.source_url,
-                        event_date=decision.candidate.event_date,
-                        location=decision.candidate.location,
-                        region_tags=decision.candidate.region_tags,
-                        distances=decision.candidate.distances,
-                        note=note,
-                        submitter_user_id=None,
-                        submitter_username=None,
-                        submitter_display_name=None,
-                    ),
-                    max_pending=self.budget.max_pending_suggestions,
-                    database_url=self.database_url,
-                )
-            except Exception:
-                return self._finish_rejected_admission(
-                    prepared,
-                    RunState.FAILED,
-                    "Suggestion admission failed before commit.",
-                )
-            if admission.outcome != "admitted" or admission.suggestion is None:
-                detail = {
-                    "duplicate": "Candidate URL is already tracked or queued; duplicate skipped.",
-                    "queue_full": "The researcher suggestion queue is full.",
-                }[admission.outcome]
-                return self._finish_rejected_admission(
-                    prepared,
-                    RunState.CAPPED if admission.outcome == "queue_full" else RunState.SKIPPED,
-                    detail,
-                    outcome=(
-                        RunOutcome.INCONCLUSIVE
-                        if admission.outcome == "queue_full"
-                        else RunOutcome.NO_CHANGE
-                    ),
-                )
-
-            queue_reference = f"event_suggestion:{admission.suggestion.id}"
-            terminal = self.artifacts.finalize_committed(
-                prepared,
-                queue_reference=queue_reference,
-            )
-            return ResearchJobResult(
-                run_id,
-                committed_status,
-                terminal,
-                queue_reference=queue_reference,
-            )
-
-        if no_change_reasons:
-            return self._finish_without_queue(
-                run_id,
-                scout.candidates[0].source_url,
-                RunState.SUCCEEDED,
-                RunOutcome.NO_CHANGE,
-                "; ".join(no_change_reasons)[:1_000],
-            )
-        return self._finish_without_queue(
-            run_id,
-            scout.candidates[0].source_url,
-            RunState.SKIPPED,
-            RunOutcome.INCONCLUSIVE,
-            "; ".join(skipped_reasons)[:1_000] or "No trusted candidate was captured.",
-        )
-
     async def _capture(
         self,
         run_id: str,
@@ -977,25 +738,6 @@ class ResearcherService:
             return False
         try:
             for reference in referenced:
-                self.artifacts.verify_artifact(reference)
-        except Exception:
-            return False
-        return True
-
-    def _valid_evidence(
-        self,
-        decision: ResearchDecision,
-        *,
-        required: tuple[ArtifactReference, ...],
-    ) -> bool:
-        if not decision.evidence:
-            return False
-        required_set = set(required)
-        decision_set = set(decision.evidence)
-        if required_set != decision_set:
-            return False
-        try:
-            for reference in decision.evidence:
                 self.artifacts.verify_artifact(reference)
         except Exception:
             return False
@@ -1297,14 +1039,6 @@ def _normalized_proposed_changes(
             ),
         }
     )
-
-
-def _candidate_matches_capture(candidate: ResearchCandidate, snapshot: PageSnapshot) -> bool:
-    candidate_url = normalize_url(candidate.source_url)
-    return candidate_url in {
-        normalize_url(snapshot.source_url),
-        normalize_url(snapshot.final_url),
-    }
 
 
 def _decision_captures(

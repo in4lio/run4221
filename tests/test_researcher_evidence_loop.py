@@ -6,7 +6,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -29,7 +28,6 @@ from run4221.researcher.agent import (
     ScoutRunResult,
 )
 from run4221.researcher.artifacts import ResearchArtifactStore
-from run4221.researcher.policy import SourceTrustPolicy
 from run4221.researcher.schemas import (
     EvidenceRequest,
     ResearchBudget,
@@ -270,13 +268,10 @@ def _run(
     )[0]
     artifacts = ResearchArtifactStore(root / "runs")
     fetcher = FixtureFetcher(pages)
-    hostname = urlsplit(source.url).hostname
-    assert hostname is not None
     service = ResearcherService(
         database_url=database_url,
         artifacts=artifacts,
         agent=agent,
-        trust_policy=SourceTrustPolicy(trusted_domains=frozenset({hostname})),
         budget=ResearchBudget(
             max_wall_time_seconds_per_job=10,
             max_rendered_pages_per_job=0,

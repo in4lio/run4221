@@ -242,10 +242,7 @@ class ResearchArtifactStore:
         """Record a truthful terminal after a queue admission rejects the attempt."""
 
         prepared = self._read_prepared(prepared_reference)
-        if status.outcome in {
-            RunOutcome.SUGGESTION_CREATED,
-            RunOutcome.PROPOSAL_CREATED,
-        }:
+        if status.outcome is RunOutcome.PROPOSAL_CREATED:
             raise ArtifactLifecycleError(
                 "An uncommitted decision cannot report a queue-created outcome."
             )
@@ -267,10 +264,7 @@ class ResearchArtifactStore:
             raise ArtifactLifecycleError(
                 "A prepared queue decision must be finalized through commit reporting."
             )
-        if status.outcome in {
-            RunOutcome.SUGGESTION_CREATED,
-            RunOutcome.PROPOSAL_CREATED,
-        }:
+        if status.outcome is RunOutcome.PROPOSAL_CREATED:
             raise ArtifactLifecycleError(
                 "Queue-created outcomes require a prepared decision and commit report."
             )
@@ -640,14 +634,12 @@ class ResearchArtifactStore:
         decision: ResearchDecision,
         status: ResearchRunStatus,
     ) -> None:
-        expected_outcomes = {
-            DecisionAction.SUGGEST_EVENT: RunOutcome.SUGGESTION_CREATED,
-            DecisionAction.PROPOSE_UPDATE: RunOutcome.PROPOSAL_CREATED,
-        }
-        expected = expected_outcomes.get(decision.action)
-        if expected is None:
+        if decision.action is not DecisionAction.PROPOSE_UPDATE:
             raise ArtifactLifecycleError("Only a queue-writing decision can be prepared.")
-        if status.status is not RunState.SUCCEEDED or status.outcome is not expected:
+        if (
+            status.status is not RunState.SUCCEEDED
+            or status.outcome is not RunOutcome.PROPOSAL_CREATED
+        ):
             raise ArtifactLifecycleError(
                 "Prepared decision status must match its committed queue outcome."
             )

@@ -203,10 +203,17 @@ def test_unmetered_response_exhausts_output_budget_conservatively() -> None:
         runner=runner,
     )
 
-    first = asyncio.run(job.scout(ScoutRequest(mode="discovery", query="marathon")))
-    second = asyncio.run(job.assess(assessment_request()))
+    request = ScoutRequest(
+        mode="refresh",
+        query="marathon",
+        approved_source_url="https://example.com/marathon",
+    )
+    first = asyncio.run(job.scout(request))
+    second = asyncio.run(job.scout(request))
 
     assert first.state is AgentRunState.SUCCEEDED
+    # The unmetered response forfeits every output token beyond the protected
+    # assessment reserve, so no further scout call can run.
     assert second.state is AgentRunState.CAPPED
     assert second.error_code == "output_token_budget"
     assert runner.calls == 1

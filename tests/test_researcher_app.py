@@ -6,10 +6,13 @@ from pathlib import Path
 from uuid import uuid4
 
 from run4221.db.bootstrap import initialize_database
-from run4221.db.repository import EventCreate, EventSuggestionCreate, add_event
-from run4221.db.research import admit_suggestion, get_research_source, list_due_sources
+from run4221.db.repository import EventCreate, ProposedEventUpdateCreate, add_event
+from run4221.db.research import (
+    admit_proposed_update,
+    get_research_source,
+    list_due_sources,
+)
 from run4221.researcher.app import (
-    DiscoverySchedule,
     ResearcherWorker,
     async_main,
     check_config,
@@ -20,7 +23,6 @@ from run4221.researcher.config import ResearcherSettings
 from run4221.researcher.health import HealthStore
 from run4221.researcher.schemas import (
     ArtifactReference,
-    ResearchCandidate,
     ResearchDecision,
     ResearchRunStatus,
 )
@@ -41,14 +43,9 @@ def settings(tmp_path: Path, **overrides: object) -> ResearcherSettings:
         "prompt_source": "file",
         "prompt_dir": str(tmp_path / "prompts"),
         "artifact_dir": str(tmp_path / "runs"),
-        "schedule_path": str(tmp_path / "researcher-schedule.json"),
         "lock_path": str(tmp_path / "researcher.lock"),
         "health_path": str(tmp_path / "researcher-health.json"),
-        "trusted_domains": "official.example, registry.example",
-        "trusted_registry_urls": "https://registry.example/marathons",
-        "discovery_queries": "germany marathon 2027, france marathon 2027",
-        "enabled": True,
-        "discovery_enabled": True,
+        "schedule_enabled": True,
     }
     values.update(overrides)
     return ResearcherSettings(**values)
@@ -112,13 +109,6 @@ class FakeService:
             raise RuntimeError("provider down")
         return result()
 
-    async def discover(self, query: str):
-        self.calls.append(("discover", query))
-        self.on_run_started(str(uuid4()))
-        if self.fail:
-            raise RuntimeError("provider down")
-        return result()
-
 
 class Factory:
     def __init__(self, tmp_path: Path, failures: list[bool] | None = None) -> None:
@@ -139,7 +129,6 @@ def worker(tmp_path: Path, factory: Factory, **overrides: object) -> ResearcherW
         config,
         service_factory=factory,
         health=HealthStore(config.health_path, now=lambda: NOW),
-        schedule=DiscoverySchedule(config.schedule_path),
         now=lambda: NOW,
     )
 
@@ -161,10 +150,6 @@ def test_check_config_cli_makes_no_agent_or_api_call(tmp_path: Path, monkeypatch
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("DATABASE_URL", config.database_url)
     monkeypatch.setenv("RESEARCHER_PROMPT_DIR", config.prompt_dir)
-    monkeypatch.setenv("RESEARCHER_TRUSTED_DOMAINS", config.trusted_domains)
-    monkeypatch.setenv("RESEARCHER_TRUSTED_REGISTRY_URLS", config.trusted_registry_urls)
-    monkeypatch.setenv("RESEARCHER_DISCOVERY_QUERIES", config.discovery_queries)
-    monkeypatch.setenv("RESEARCHER_DISCOVERY_ENABLED", "true")
     monkeypatch.setattr(
         "run4221.researcher.app.set_default_openai_key",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("agent configured")),
@@ -211,20 +196,15 @@ def test_cycle_claims_before_failure_continues_and_restart_does_not_readmit(tmp_
     initialize(tmp_path)
     first_event = add_source(tmp_path, public_id="first.42")
     second_event = add_source(tmp_path, public_id="second.42")
-    factory = Factory(tmp_path, failures=[True, False, False])
-    app = worker(
-        tmp_path,
-        factory,
-        max_events_per_cycle=2,
-        discovery_queries="germany marathon 2027",
-    )
+    factory = Factory(tmp_path, failures=[True, False])
+    app = worker(tmp_path, factory, max_events_per_cycle=2)
     app.initialize_health()
 
     cycle = asyncio.run(app.run_cycle())
 
-    assert cycle.attempted == 3  # two sources, then one bounded discovery job
+    assert cycle.attempted == 2  # exactly the due sources, nothing else
     assert cycle.failed == 1
-    assert factory.calls[:2] == [("refresh", first_event), ("refresh", second_event)]
+    assert factory.calls == [("refresh", first_event), ("refresh", second_event)]
     assert app.health.read().consecutive_failures == 0  # later successes recover health
     assert list_due_sources(
         due_before=NOW - timedelta(days=1),
@@ -233,12 +213,7 @@ def test_cycle_claims_before_failure_continues_and_restart_does_not_readmit(tmp_
     ) == ()
 
     restarted_factory = Factory(tmp_path)
-    restarted = worker(
-        tmp_path,
-        restarted_factory,
-        max_events_per_cycle=2,
-        discovery_queries="germany marathon 2027",
-    )
+    restarted = worker(tmp_path, restarted_factory, max_events_per_cycle=2)
     restarted.initialize_health()
     same_day = asyncio.run(restarted.run_cycle())
 
@@ -260,10 +235,9 @@ def test_loop_survives_job_failure_and_runs_next_cycle(tmp_path: Path) -> None:
         sleeps.append(seconds)
 
     app = ResearcherWorker(
-        settings(tmp_path, discovery_enabled=False),
+        settings(tmp_path),
         service_factory=factory,
         health=HealthStore(tmp_path / "researcher-health.json", now=lambda: NOW),
-        schedule=DiscoverySchedule(tmp_path / "researcher-schedule.json"),
         now=lambda: NOW,
         sleep=no_wait,
     )
@@ -275,59 +249,58 @@ def test_loop_survives_job_failure_and_runs_next_cycle(tmp_path: Path) -> None:
     assert sleeps == [app.settings.interval_seconds]
 
 
-def test_discovery_schedule_claim_is_atomic_and_keyed_by_query_revision(tmp_path: Path) -> None:
-    schedule = DiscoverySchedule(tmp_path / "schedule.json")
-
-    assert schedule.claim("Germany  marathon 2027", NOW)
-    assert not schedule.claim(" germany marathon 2027 ", NOW + timedelta(hours=2))
-    assert schedule.claim("Germany marathon 2028", NOW + timedelta(hours=2))
-    assert schedule.claim("Germany marathon 2027", NOW + timedelta(days=1))
-    assert list(tmp_path.glob(".*.tmp")) == []
-
-
 def test_startup_reconciles_a_committed_prepared_decision(tmp_path: Path) -> None:
     initialize(tmp_path)
-    config = settings(tmp_path, discovery_enabled=False)
+    event_id = add_source(tmp_path)
+    config = settings(tmp_path)
     store = ResearchArtifactStore(config.artifact_dir)
-    run_id = store.create_run(job_type="discovery")
+    run_id = store.create_run(job_type="refresh")
+    source_url = f"https://official.example/{event_id}"
     evidence = store.write_artifact(
         run_id,
         artifact_type="page_snapshot",
-        source_url="https://official.example/reconcile-marathon",
+        source_url=source_url,
         content={"captured": True},
     )
-    decision = ResearchDecision(
-        action="suggest_event",
-        summary="Captured official event page.",
-        candidate=ResearchCandidate(
-            source_url="https://official.example/reconcile-marathon",
-            title="Reconcile Marathon",
-            snippet="Marathon details.",
-            distances=("marathon",),
-        ),
-        evidence=[evidence],
+    decision = ResearchDecision.model_validate(
+        {
+            "action": "propose_update",
+            "summary": "The captured approved source says registration is open.",
+            "confidence": 0.95,
+            "proposed_fields": {"registration_status": "open"},
+            "evidence": [evidence],
+            "applicability": [
+                {
+                    "evidence": evidence,
+                    "event_identity": "confirmed",
+                    "event_edition": "confirmed",
+                    "distance_category": "confirmed",
+                    "applicable_fields": ["registration_status"],
+                }
+            ],
+            "field_support": [
+                {"field": "registration_status", "evidence": [evidence]}
+            ],
+        }
     )
     prepared = store.prepare_decision(
         run_id,
-        source_url=decision.candidate.source_url,
+        source_url=source_url,
         decision=decision,
         committed_status=ResearchRunStatus(
             status="succeeded",
-            outcome="suggestion_created",
+            outcome="proposal_created",
         ),
     )
-    admission = admit_suggestion(
-        EventSuggestionCreate(
-            event_name="Reconcile Marathon",
-            url=decision.candidate.source_url,
-            event_date=None,
-            location=None,
-            region_tags=(),
-            distances=("marathon",),
-            note=decision_queue_marker(prepared),
-            submitter_user_id=None,
-            submitter_username=None,
-            submitter_display_name=None,
+    admission = admit_proposed_update(
+        ProposedEventUpdateCreate(
+            event_id=event_id,
+            update_type="registration_window",
+            current_fields={"registration_status": "unknown"},
+            proposed_fields={"registration_status": "open"},
+            evidence=(decision_queue_marker(prepared),),
+            confidence=0.95,
+            change_summary=decision.summary,
         ),
         database_url=config.database_url,
     )
@@ -345,4 +318,4 @@ def test_startup_reconciles_a_committed_prepared_decision(tmp_path: Path) -> Non
     assert reconciled[0].terminal_reference is not None
     assert store.read_artifact(reconciled[0].terminal_reference)["content"][
         "queue_reference"
-    ] == "event_suggestion:1"
+    ] == "proposed_event_update:1"

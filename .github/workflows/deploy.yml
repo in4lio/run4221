@@ -113,7 +113,7 @@ jobs:
           docker compose run --rm -T --interactive=false --build --no-deps researcher \
             uv run run4221-researcher --check-config
           docker compose run --rm -T --interactive=false --no-deps researcher uv run python -c \
-            'from run4221.researcher.config import ResearcherSettings; s = ResearcherSettings(); assert not s.enabled and not s.discovery_enabled and not s.rendering_enabled, "researcher must deploy ready-paused"'
+            'from run4221.researcher.config import ResearcherSettings; s = ResearcherSettings(); assert not s.schedule_enabled and not s.rendering_enabled, "researcher must deploy ready-paused"'
           service_replaced=true
           docker compose stop researcher
           docker compose up -d --build --no-deps --wait --wait-timeout 90 bot

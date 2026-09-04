@@ -11,7 +11,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 ShortText = Annotated[str, Field(min_length=1, max_length=240)]
 SummaryText = Annotated[str, Field(min_length=1, max_length=1_000)]
 EvidenceText = Annotated[str, Field(min_length=1, max_length=1_000)]
-EvidenceList = Annotated[list[EvidenceText], Field(max_length=8)]
 EvidenceKey = Annotated[str, Field(pattern=r"^E[1-8]$")]
 RESEARCHER_MAX_PENDING_SUGGESTIONS = 20
 
@@ -35,7 +34,6 @@ class ResearchCandidate(ResearchSchema):
     source_url: Annotated[str, Field(min_length=1, max_length=2_048)]
     title: ShortText
     snippet: EvidenceText
-    discovery_query: Annotated[str, Field(min_length=1, max_length=500)] | None = None
     event_date: Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")] | None = None
     location: Annotated[str, Field(min_length=1, max_length=240)] | None = None
     region_tags: Annotated[tuple[ShortText, ...], Field(max_length=12)] = ()
@@ -48,13 +46,6 @@ class AssessmentVerdict(StrEnum):
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
     INCONCLUSIVE = "inconclusive"
-
-
-class ResearchAssessment(ResearchSchema):
-    verdict: AssessmentVerdict
-    summary: SummaryText
-    confidence: float = Field(ge=0.0, le=1.0)
-    evidence: EvidenceList = Field(default_factory=list)
 
 
 class RegistrationStatus(StrEnum):
@@ -152,7 +143,6 @@ class ArtifactReference(ResearchSchema):
 
 class DecisionAction(StrEnum):
     NO_CHANGE = "no_change"
-    SUGGEST_EVENT = "suggest_event"
     PROPOSE_UPDATE = "propose_update"
     INCONCLUSIVE = "inconclusive"
 
@@ -238,11 +228,6 @@ class AssessorNoPayloadDecision(AssessorTerminalDecision):
     action: Literal[DecisionAction.NO_CHANGE, DecisionAction.INCONCLUSIVE]
 
 
-class AssessorSuggestionDecision(AssessorTerminalDecision):
-    action: Literal[DecisionAction.SUGGEST_EVENT]
-    candidate: ResearchCandidate
-
-
 class AssessorUpdateDecision(AssessorTerminalDecision):
     action: Literal[DecisionAction.PROPOSE_UPDATE]
     proposed_fields: ProposedEventChanges
@@ -297,15 +282,12 @@ class EvidenceRequest(ResearchSchema):
 
 
 AssessorDecision = Annotated[
-    AssessorNoPayloadDecision | AssessorSuggestionDecision | AssessorUpdateDecision,
+    AssessorNoPayloadDecision | AssessorUpdateDecision,
     Field(discriminator="action"),
 ]
 
 AssessorOutcome = Annotated[
-    AssessorNoPayloadDecision
-    | AssessorSuggestionDecision
-    | AssessorUpdateDecision
-    | EvidenceRequest,
+    AssessorNoPayloadDecision | AssessorUpdateDecision | EvidenceRequest,
     Field(discriminator="action"),
 ]
 
@@ -387,11 +369,6 @@ class ResearchDecision(ResearchSchema):
         if any(not set(conflict.evidence).issubset(applicability) for conflict in self.conflicts):
             raise ValueError("Every conflict artifact requires an applicability item.")
 
-        if self.action is DecisionAction.SUGGEST_EVENT:
-            if self.candidate is None:
-                raise ValueError("suggest_event requires a candidate.")
-            if self.proposed_fields is not None:
-                raise ValueError("suggest_event cannot include proposed_fields.")
         if self.action is DecisionAction.PROPOSE_UPDATE:
             if self.proposed_fields is None:
                 raise ValueError("propose_update requires proposed_fields.")
@@ -424,10 +401,9 @@ class ResearchDecision(ResearchSchema):
                 for conflict in self.conflicts
             ):
                 raise ValueError("A proposed update cannot source-order conflicting evidence.")
-        if self.action not in {
-            DecisionAction.SUGGEST_EVENT,
-            DecisionAction.PROPOSE_UPDATE,
-        } and (self.candidate is not None or self.proposed_fields is not None):
+        if self.action is not DecisionAction.PROPOSE_UPDATE and (
+            self.candidate is not None or self.proposed_fields is not None
+        ):
             raise ValueError("Non-persisting actions cannot include a queue payload.")
         if self.action is not DecisionAction.PROPOSE_UPDATE and self.field_support:
             raise ValueError("Only propose_update can include field_support.")
@@ -461,7 +437,6 @@ class RunState(StrEnum):
 
 class RunOutcome(StrEnum):
     NO_CHANGE = "no_change"
-    SUGGESTION_CREATED = "suggestion_created"
     PROPOSAL_CREATED = "proposal_created"
     INCONCLUSIVE = "inconclusive"
 
