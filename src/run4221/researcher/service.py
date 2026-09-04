@@ -7,10 +7,6 @@ from dataclasses import asdict, dataclass
 from typing import Protocol
 from urllib.parse import urlparse
 
-from run4221.ai.event_extractor import (
-    conflicts_with_event_identity,
-    event_identity_tokens,
-)
 from run4221.db.models import RESEARCH_DECISION_MARKER_PREFIX
 from run4221.db.research import (
     EventSuggestionCreate,
@@ -21,6 +17,10 @@ from run4221.db.research import (
     normalize_url,
 )
 from run4221.events import TrackedEvent
+from run4221.ingestion.event_identity import (
+    conflicts_with_event_identity,
+    event_identity_tokens,
+)
 from run4221.ingestion.page_snapshot import (
     PageFetchError,
     PageSnapshot,

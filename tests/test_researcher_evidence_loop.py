@@ -11,7 +11,6 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 
-from run4221.ai.event_extractor import event_identity_tokens
 from run4221.db.repository import (
     EventCreate,
     add_event,
@@ -20,6 +19,7 @@ from run4221.db.repository import (
     find_event,
 )
 from run4221.db.research import list_due_sources
+from run4221.ingestion.event_identity import event_identity_tokens
 from run4221.ingestion.page_snapshot import PageSnapshot, fetch_page_snapshot
 from run4221.researcher.agent import (
     AgentRunMetadata,

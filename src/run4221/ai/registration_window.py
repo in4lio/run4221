@@ -7,11 +7,8 @@ from pathlib import Path
 from typing import Protocol
 
 from run4221.ai.event_extractor import (
-    conflicts_with_event_identity,
     infer_event_date,
     infer_registration_url,
-    is_likely_article_url,
-    select_registration_url_for_distances,
     snapshot_evidence,
 )
 from run4221.db.repository import (
@@ -21,6 +18,11 @@ from run4221.db.repository import (
     create_proposed_event_update,
 )
 from run4221.events import TrackedEvent
+from run4221.ingestion.event_identity import (
+    conflicts_with_event_identity,
+    is_likely_article_url,
+    select_registration_url_for_distances,
+)
 from run4221.ingestion.page_snapshot import (
     PageFetchError,
     PageSnapshot,
