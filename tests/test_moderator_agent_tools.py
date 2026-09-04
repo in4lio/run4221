@@ -1,10 +1,10 @@
 import asyncio
+import inspect
 
 from run4221.agent.moderator_tools import (
     ModeratorAgentTools,
     moderator_agent_tool_specs,
 )
-from run4221.ai.event_extractor import EventDraft
 from run4221.db.bootstrap import initialize_database
 from run4221.db.repository import (
     EventSuggestionCreate,
@@ -16,11 +16,106 @@ from run4221.db.repository import (
 )
 from run4221.db.seed import seed_initial_data
 from run4221.db.session import session_scope
+from run4221.researcher.engine import EngineConfigError
+from run4221.researcher.schemas import (
+    ArtifactReference,
+    EventProfileDraft,
+    ResearchRunStatus,
+)
+from run4221.researcher.service import ProfileJobResult, ResearchJobResult
 from tests.seed_fixtures import sample_seed_events
+
+RUN_ID = "2d1aa0bb-13c1-4f1b-b81f-a7f6b83b62dc"
 
 
 def database_url(tmp_path) -> str:
     return f"sqlite:///{tmp_path / 'run4221-agent-tools.sqlite3'}"
+
+
+def artifact_reference() -> ArtifactReference:
+    return ArtifactReference(
+        run_id=RUN_ID,
+        artifact_name="terminal.json",
+        source_url="https://example.com/agent-marathon",
+        content_hash="a" * 64,
+    )
+
+
+def profile_job_result(
+    draft: EventProfileDraft | None,
+    *,
+    status: str = "succeeded",
+    outcome: str = "profile_completed",
+    detail: str | None = None,
+) -> ProfileJobResult:
+    return ProfileJobResult(
+        run_id=RUN_ID,
+        status=ResearchRunStatus(status=status, outcome=outcome, detail=detail),
+        terminal_reference=artifact_reference(),
+        draft=draft,
+    )
+
+
+def refresh_job_result(
+    *,
+    status: str = "succeeded",
+    outcome: str = "no_change",
+    detail: str | None = None,
+    queue_reference: str | None = None,
+    conflicting_update_id: int | None = None,
+) -> ResearchJobResult:
+    return ResearchJobResult(
+        run_id=RUN_ID,
+        status=ResearchRunStatus(status=status, outcome=outcome, detail=detail),
+        terminal_reference=artifact_reference(),
+        queue_reference=queue_reference,
+        conflicting_update_id=conflicting_update_id,
+    )
+
+
+def sample_draft(source_url: str = "https://example.com/agent-marathon") -> EventProfileDraft:
+    return EventProfileDraft(
+        source_url=source_url,
+        name="Agent Test Marathon",
+        public_id="agent-test.42",
+        city="Agent City",
+        country="Germany",
+        timezone="Europe/Berlin",
+        event_date="2027-05-01",
+        distances=("marathon",),
+        regions=("de", "eu"),
+        official_url=source_url,
+        registration_url=None,
+        summary="Fixture evidence.",
+        confidence=0.93,
+    )
+
+
+class FakeEngine:
+    def __init__(
+        self,
+        *,
+        profile_result: ProfileJobResult | None = None,
+        refresh_result: ResearchJobResult | None = None,
+        refresh_error: Exception | None = None,
+    ) -> None:
+        self.profile_result = profile_result
+        self.refresh_result = refresh_result
+        self.refresh_error = refresh_error
+        self.profile_calls: list[str] = []
+        self.refresh_calls: list[str] = []
+
+    async def profile(self, url: str) -> ProfileJobResult:
+        self.profile_calls.append(url)
+        assert self.profile_result is not None
+        return self.profile_result
+
+    async def refresh_source(self, event_id: str) -> ResearchJobResult:
+        self.refresh_calls.append(event_id)
+        if self.refresh_error is not None:
+            raise self.refresh_error
+        assert self.refresh_result is not None
+        return self.refresh_result
 
 
 def initialize_sample_database(url: str) -> None:
@@ -179,50 +274,162 @@ def test_moderator_agent_search_uses_repository_contract(tmp_path) -> None:
 
 def test_moderator_agent_apply_suggestion_returns_draft_without_converting(
     tmp_path,
-    monkeypatch,
 ) -> None:
     url = database_url(tmp_path)
     initialize_database(url)
-    provider = object()
-    tools = ModeratorAgentTools(database_url=url, extractor_provider=provider)  # type: ignore[arg-type]
-    suggestion = add_event_suggestion(suggestion_payload(), database_url=url)
-
-    async def fake_extract_event_draft_from_url(
-        source_url: str,
-        *,
-        extractor_provider=None,
-    ) -> EventDraft:
-        assert extractor_provider is provider
-        return EventDraft(
-            source_url=source_url,
-            name="Agent Test Marathon",
-            public_id="agent-test.42",
-            city="Agent City",
-            country="Germany",
-            timezone="Europe/Berlin",
-            event_date="2027-05-01",
-            distances=("marathon",),
-            regions=("de", "eu"),
-            official_url=source_url,
-            registration_url=None,
-            confidence=0.93,
-            evidence="Fixture evidence.",
+    engine = FakeEngine(
+        profile_result=profile_job_result(
+            sample_draft(),
+            detail="Fixture evidence.",
         )
-
-    monkeypatch.setattr(
-        "run4221.agent.moderator_tools.extract_event_draft_from_url",
-        fake_extract_event_draft_from_url,
     )
+    tools = ModeratorAgentTools(database_url=url, engine=engine)  # type: ignore[arg-type]
+    suggestion = add_event_suggestion(suggestion_payload(), database_url=url)
 
     result = asyncio.run(tools.apply_suggestion(suggestion.id))
 
     assert result.ok is True
+    assert engine.profile_calls == [suggestion.url]
     assert result.data["suggestion"]["id"] == suggestion.id
     assert result.data["draft"]["public_id"] == "agent-test.42"
+    assert result.data["run_id"] == RUN_ID
     assert result.data["next_step"] == (
         "create_event with source_suggestion_id after moderator review"
     )
     assert get_event_suggestion(suggestion.id, database_url=url).status == "pending"
+
+
+def test_moderator_agent_discover_event_profile_returns_typed_run(tmp_path) -> None:
+    url = database_url(tmp_path)
+    initialize_database(url)
+    engine = FakeEngine(profile_result=profile_job_result(sample_draft()))
+    tools = ModeratorAgentTools(database_url=url, engine=engine)  # type: ignore[arg-type]
+
+    result = asyncio.run(tools.discover_event_profile("https://example.com/agent-marathon"))
+
+    assert result.ok is True
+    assert result.data["run_id"] == RUN_ID
+    assert result.data["status"] == "succeeded"
+    assert result.data["outcome"] == "profile_completed"
+    assert result.data["draft"]["name"] == "Agent Test Marathon"
+    assert result.data["draft"]["registration_url_candidates"] == []
+
+
+def test_moderator_agent_discover_event_profile_fails_closed_without_draft(
+    tmp_path,
+) -> None:
+    url = database_url(tmp_path)
+    initialize_database(url)
+    engine = FakeEngine(
+        profile_result=profile_job_result(
+            None,
+            status="failed",
+            outcome="inconclusive",
+            detail="OpenAI authentication failed.",
+        )
+    )
+    tools = ModeratorAgentTools(database_url=url, engine=engine)  # type: ignore[arg-type]
+
+    result = asyncio.run(tools.discover_event_profile("https://example.com/agent-marathon"))
+
+    assert result.ok is False
+    assert "configuration or usage limits" in (result.error or "")
+    assert "OpenAI authentication failed." in (result.error or "")
+    assert RUN_ID in (result.error or "")
+
+
+def test_moderator_agent_update_event_uses_engine_refresh(tmp_path) -> None:
+    url = database_url(tmp_path)
+    initialize_database(url)
+    tools_for_create = ModeratorAgentTools(database_url=url)
+    created = tools_for_create.create_event(event_fields())
+    assert created.ok is True
+
+    engine = FakeEngine(
+        refresh_result=refresh_job_result(
+            status="succeeded",
+            outcome="proposal_created",
+            detail="Registration opens on 2027-01-01.",
+            queue_reference="proposed_event_update:4",
+        )
+    )
+    tools = ModeratorAgentTools(database_url=url, engine=engine)  # type: ignore[arg-type]
+
+    result = asyncio.run(tools.update_event("agent-test.42"))
+
+    assert result.ok is True
+    assert engine.refresh_calls == ["agent-test.42"]
+    assert result.data["queue_reference"] == "proposed_event_update:4"
+    assert result.data["conflicting_update_id"] is None
+    assert result.data["message"] == "Created pending update #4 for moderator review."
+    assert "auto_confirm" not in inspect.signature(ModeratorAgentTools.update_event).parameters
+
+
+def test_moderator_agent_update_event_reports_conflicting_pending_update(
+    tmp_path,
+) -> None:
+    url = database_url(tmp_path)
+    initialize_database(url)
+    tools_for_create = ModeratorAgentTools(database_url=url)
+    assert tools_for_create.create_event(event_fields()).ok is True
+
+    engine = FakeEngine(
+        refresh_result=refresh_job_result(
+            status="skipped",
+            outcome="inconclusive",
+            detail="A conflicting pending proposal already exists.",
+            conflicting_update_id=11,
+        )
+    )
+    tools = ModeratorAgentTools(database_url=url, engine=engine)  # type: ignore[arg-type]
+
+    result = asyncio.run(tools.update_event("agent-test.42"))
+
+    assert result.ok is True
+    assert result.data["conflicting_update_id"] == 11
+    assert result.data["message"] == "Update #11 is already pending for this event."
+
+
+def test_moderator_agent_update_event_without_source_fails_with_named_error(
+    tmp_path,
+) -> None:
+    url = database_url(tmp_path)
+    initialize_database(url)
+    tools_for_create = ModeratorAgentTools(database_url=url)
+    assert tools_for_create.create_event(event_fields()).ok is True
+
+    engine = FakeEngine(
+        refresh_error=ValueError("No active research source for event: agent-test.42")
+    )
+    tools = ModeratorAgentTools(database_url=url, engine=engine)  # type: ignore[arg-type]
+
+    result = asyncio.run(tools.update_event("agent-test.42"))
+
+    assert result.ok is False
+    assert result.error == "No active research source for event: agent-test.42"
+
+
+def test_moderator_agent_tools_fail_closed_when_engine_is_not_configured(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    url = database_url(tmp_path)
+    initialize_database(url)
+    tools_for_create = ModeratorAgentTools(database_url=url)
+    assert tools_for_create.create_event(event_fields()).ok is True
+
+    def broken_build_engine():
+        raise EngineConfigError("Researcher settings are invalid or incomplete.")
+
+    monkeypatch.setattr("run4221.researcher.engine.build_engine", broken_build_engine)
+    tools = ModeratorAgentTools(database_url=url)
+
+    discover = asyncio.run(tools.discover_event_profile("https://example.com/x"))
+    update = asyncio.run(tools.update_event("agent-test.42"))
+
+    for result in (discover, update):
+        assert result.ok is False
+        assert (result.error or "").startswith("Researcher engine is not configured:")
 
 
 def test_moderator_agent_create_event_can_convert_suggestion(tmp_path) -> None:

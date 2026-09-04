@@ -54,6 +54,7 @@ class SuggestionAdmission:
 class ProposalAdmission:
     outcome: ProposalAdmissionOutcome
     update: ProposedEventUpdateRecord | None = None
+    conflicting_update_id: int | None = None
 
 
 def list_due_sources(
@@ -300,7 +301,10 @@ def admit_proposed_update(
             )
         )
         if conflict is not None:
-            return ProposalAdmission(outcome="conflicting_pending")
+            return ProposalAdmission(
+                outcome="conflicting_pending",
+                conflicting_update_id=conflict,
+            )
 
         pending_count = session.scalar(
             select(func.count(models.ProposedEventUpdate.id)).where(

@@ -1670,6 +1670,12 @@ def test_concurrent_identical_refreshes_admit_one_pending_proposal(tmp_path: Pat
 
     assert sorted(result.status.status for result in results) == ["skipped", "succeeded"]
     assert count_proposed_event_updates(database_url=base_url) == 1
+    succeeded = next(result for result in results if result.status.status == "succeeded")
+    skipped = next(result for result in results if result.status.status == "skipped")
+    assert succeeded.queue_reference == "proposed_event_update:1"
+    # The losing run names the blocking pending update through the typed field.
+    assert skipped.conflicting_update_id == 1
+    assert skipped.queue_reference is None
 
 
 def test_service_boundary_has_no_direct_apply_or_registration_orchestration() -> None:
