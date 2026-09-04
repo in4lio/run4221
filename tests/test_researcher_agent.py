@@ -27,7 +27,6 @@ from run4221.researcher.schemas import (
     AssessorOutcome,
     DecisionAction,
     EvidenceRequest,
-    EvidenceRequestPurpose,
     ResearchBudget,
     ResearchCandidate,
     RunOutcome,
@@ -91,7 +90,6 @@ def candidate(url: str = "https://example.com/marathon") -> ResearchCandidate:
         source_url=url,
         title="Example Marathon",
         snippet="Candidate official event page.",
-        discovery_query="2027 marathon",
     )
 
 
@@ -122,7 +120,7 @@ def assessment_request() -> AssessmentRequest:
 def assess_decision(
     decision: object,
     *,
-    mode: str = "discovery",
+    mode: str = "refresh",
     evidence: tuple[CapturedSnapshotEvidence, ...] | None = None,
 ):
     runner = FakeRunner(fake_result(decision))
@@ -204,8 +202,9 @@ def test_scout_uses_luna_web_search_and_explicit_provider_limits() -> None:
     result = asyncio.run(
         job.scout(
             ScoutRequest(
-                mode="discovery",
+                mode="refresh",
                 query="2027 marathon Germany",
+                approved_source_url="https://example.com/marathon",
                 context=(FrozenContextField(name="region", value="DE"),),
             )
         )
@@ -228,11 +227,13 @@ def test_scout_uses_luna_web_search_and_explicit_provider_limits() -> None:
     assert isinstance(agent.tools[0], WebSearchTool)
     assert agent.output_type is ScoutOutput
     assert agent.model_settings.parallel_tool_calls is False
-    assert agent.model_settings.max_tokens == 512
+    # The scout reserves half the output tokens, one turn, and one retry for
+    # the assessor that always follows a refresh scout.
+    assert agent.model_settings.max_tokens == 256
     assert agent.model_settings.preserve_raw_usage is True
-    assert agent.model_settings.extra_args == {"max_tool_calls": 2}
-    assert agent.model_settings.retry.max_retries == 1
-    assert call["max_turns"] == 4
+    assert agent.model_settings.extra_args == {"max_tool_calls": 1}
+    assert agent.model_settings.retry.max_retries == 0
+    assert call["max_turns"] == 3
     assert call["run_config"].trace_include_sensitive_data is False
     assert "session" not in call
     assert "previous_response_id" not in call
@@ -553,10 +554,9 @@ def test_assessor_attaches_exact_captured_references_with_discriminated_output()
     runner = FakeRunner(
         fake_result(
             {
-                "action": "suggest_event",
-                "summary": "Captured official event page.",
+                "action": "no_change",
+                "summary": "Captured official event page is unchanged.",
                 "confidence": 0.91,
-                "candidate": candidate().model_dump(mode="json"),
             }
         )
     )
@@ -567,7 +567,7 @@ def test_assessor_attaches_exact_captured_references_with_discriminated_output()
         runner=runner,
     )
     request = AssessmentRequest(
-        mode="discovery",
+        mode="refresh",
         evidence=(
             CapturedSnapshotEvidence(
                 reference=first_reference,
@@ -794,30 +794,6 @@ def test_confidence_cannot_rescue_rejected_update_applicability() -> None:
     assert result.decision is None
 
 
-def test_discovery_remains_compatible_but_cannot_request_refresh_evidence() -> None:
-    suggestion = {
-        "action": "suggest_event",
-        "summary": "The captured page describes a new event.",
-        "confidence": 0.93,
-        "candidate": candidate().model_dump(mode="json"),
-    }
-    request = {
-        "action": "request_evidence",
-        "purpose": EvidenceRequestPurpose.REGISTRATION_STATUS,
-        "query": "official registration status",
-        "gap": "Registration state is absent.",
-    }
-
-    compatible = assess_decision(suggestion, mode="discovery")
-    rejected = assess_decision(request, mode="discovery")
-
-    assert compatible.state is AgentRunState.SUCCEEDED
-    assert compatible.decision is not None
-    assert rejected.state is AgentRunState.INCONCLUSIVE
-    assert rejected.decision is None
-    assert rejected.evidence_request is None
-
-
 def test_assessment_input_uses_local_keys_and_hides_immutable_reference_boundaries() -> None:
     decision = {
         "action": "no_change",
@@ -855,12 +831,6 @@ def test_assessment_input_uses_local_keys_and_hides_immutable_reference_boundari
             "action": "inconclusive",
             "summary": "The captured page does not confirm a date.",
             "confidence": 0.31,
-        },
-        {
-            "action": "suggest_event",
-            "summary": "The captured page describes a new event.",
-            "confidence": 0.93,
-            "candidate": candidate().model_dump(mode="json"),
         },
         {
             **valid_update_decision(),
@@ -908,7 +878,7 @@ def test_assessor_accepts_explicit_clear_fields() -> None:
     "decision",
     [
         {"action": "unknown", "summary": "Unsupported action."},
-        {"action": "suggest_event", "summary": "Missing candidate."},
+        {"action": "suggest_event", "summary": "Removed discovery action."},
         {"action": "propose_update", "summary": "Missing proposed fields."},
         {
             "action": "no_change",
@@ -998,7 +968,11 @@ def test_search_budget_stops_before_a_third_provider_call() -> None:
         ),
         runner=runner,
     )
-    request = ScoutRequest(mode="discovery", query="marathon")
+    request = ScoutRequest(
+        mode="refresh",
+        query="marathon",
+        approved_source_url="https://example.com/marathon",
+    )
 
     first = asyncio.run(job.scout(request))
     second = asyncio.run(job.scout(request))
@@ -1011,54 +985,40 @@ def test_search_budget_stops_before_a_third_provider_call() -> None:
     assert len(runner.calls) == 2
     assert [
         call["starting_agent"].model_settings.extra_args["max_tool_calls"] for call in runner.calls
-    ] == [2, 1]
+    ] == [1, 1]
     assert [call["starting_agent"].model_settings.retry.max_retries for call in runner.calls] == [
-        2,
+        1,
         0,
     ]
 
 
 def test_output_token_exhaustion_stops_before_another_sdk_call() -> None:
+    # A refresh scout always holds back the assessment reserve, so only an
+    # assessor call can consume the final output tokens of a job.
+    decision = {
+        "action": "no_change",
+        "summary": "Captured evidence does not support a change.",
+    }
     runner = FakeRunner(
-        fake_result(
-            ScoutOutput(candidates=(candidate(),)),
-            web_search_calls=1,
-            output_tokens=128,
-        ),
-        AssertionError("assessor call must not run"),
+        fake_result(decision, output_tokens=128),
+        AssertionError("second assessor call must not run"),
     )
     job = ResearchAgentJob(
         instructions="Research safely.",
         prompt_reference="research_agent:v1",
         budget=ResearchBudget(
-            max_web_searches_per_job=1,
             max_output_tokens_per_job=128,
             max_wall_time_seconds_per_job=10,
         ),
         runner=runner,
     )
 
-    scout = asyncio.run(job.scout(ScoutRequest(mode="discovery", query="marathon")))
-    assessor = asyncio.run(
-        job.assess(
-            AssessmentRequest(
-                mode="discovery",
-                evidence=(
-                    CapturedSnapshotEvidence(
-                        reference=artifact_reference(),
-                        final_url="https://example.com/marathon",
-                        fetched_at=datetime(2026, 8, 31, tzinfo=UTC),
-                        normalized_text="Registration is open.",
-                        text_hash="b" * 64,
-                    ),
-                ),
-            )
-        )
-    )
+    first = asyncio.run(job.assess(assessment_request()))
+    second = asyncio.run(job.assess(assessment_request()))
 
-    assert scout.state is AgentRunState.SUCCEEDED
-    assert assessor.state is AgentRunState.CAPPED
-    assert assessor.error_code == "output_token_budget"
+    assert first.state is AgentRunState.SUCCEEDED
+    assert second.state is AgentRunState.CAPPED
+    assert second.error_code == "output_token_budget"
     assert len(runner.calls) == 1
 
 
@@ -1119,14 +1079,19 @@ def test_turn_budget_stops_before_another_sdk_call() -> None:
         budget=ResearchBudget(
             max_agent_turns_per_job=2,
             max_web_searches_per_job=1,
-            max_output_tokens_per_job=128,
+            max_output_tokens_per_job=512,
             max_wall_time_seconds_per_job=10,
         ),
         runner=runner,
     )
+    request = ScoutRequest(
+        mode="refresh",
+        query="marathon",
+        approved_source_url="https://example.com/marathon",
+    )
 
-    first = asyncio.run(job.scout(ScoutRequest(mode="discovery", query="marathon")))
-    second = asyncio.run(job.scout(ScoutRequest(mode="discovery", query="marathon")))
+    first = asyncio.run(job.scout(request))
+    second = asyncio.run(job.scout(request))
 
     assert first.state is AgentRunState.SUCCEEDED
     assert second.state is AgentRunState.CAPPED

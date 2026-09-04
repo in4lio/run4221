@@ -6,7 +6,6 @@ This package intentionally exposes no Telegram, moderation, or persistence tools
 from run4221.researcher.config import ResearcherSettings
 from run4221.researcher.schemas import (
     ArtifactReference,
-    ResearchAssessment,
     ResearchBudget,
     ResearchCandidate,
     ResearchDecision,
@@ -15,7 +14,6 @@ from run4221.researcher.schemas import (
 
 __all__ = (
     "ArtifactReference",
-    "ResearchAssessment",
     "ResearchBudget",
     "ResearchCandidate",
     "ResearchDecision",

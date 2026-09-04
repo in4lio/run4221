@@ -2,17 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
-import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Protocol
-from uuid import uuid4
 
 from agents import set_default_openai_key
 
@@ -30,15 +26,12 @@ from run4221.researcher.artifacts import (
     QueueResolution,
     ReconciliationResult,
     ResearchArtifactStore,
-    fsync_directory,
 )
 from run4221.researcher.config import ResearcherSettings, load_researcher_prompt
 from run4221.researcher.health import HealthStore, check_researcher_health
 from run4221.researcher.lock import ProcessLock
-from run4221.researcher.policy import SourceTrustPolicy
 from run4221.researcher.schemas import ResearchBudget, ResearchRunStatus, RunOutcome, RunState
 from run4221.researcher.service import (
-    AUDIT_SOURCE_URL,
     ResearcherService,
     ResearchJobResult,
     decision_queue_marker,
@@ -53,7 +46,7 @@ class CheckedConfig:
     prompt: PromptVersionRecord
     model: str
     budget: ResearchBudget
-    trust_policy: SourceTrustPolicy
+
 
 @dataclass(frozen=True)
 class JobExecution:
@@ -75,90 +68,15 @@ class ServiceFactory(Protocol):
     ) -> ResearcherService: ...
 
 
-class DiscoverySchedule:
-    """Crash-safe once-per-UTC-day admission for discovery query revisions."""
-
-    def __init__(self, path: str | Path) -> None:
-        self.path = Path(path)
-
-    def validate(self) -> None:
-        self._read()
-
-    def claim(self, query: str, at: datetime) -> bool:
-        if at.tzinfo is None:
-            raise ValueError("Schedule timestamps must be timezone-aware.")
-        normalized = _normalize_query(query)
-        if not normalized:
-            raise ValueError("Discovery query cannot be empty.")
-        query_hash = _query_hash(normalized)
-        window = at.astimezone(UTC).date().isoformat()
-        payload = self._read()
-        claims = payload["claims"]
-        assert isinstance(claims, dict)
-        current = claims.get(query_hash)
-        if isinstance(current, dict) and current.get("window") == window:
-            return False
-        claims[query_hash] = {
-            "window": window,
-            "claimed_at": at.astimezone(UTC).isoformat(),
-        }
-        self._write(payload)
-        return True
-
-    def _read(self) -> dict[str, object]:
-        if not self.path.exists():
-            return {"schema_version": 1, "claims": {}}
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise RuntimeError("Researcher discovery schedule is invalid.") from error
-        if (
-            not isinstance(payload, dict)
-            or payload.get("schema_version") != 1
-            or not isinstance(payload.get("claims"), dict)
-        ):
-            raise RuntimeError("Researcher discovery schedule is invalid.")
-        return payload
-
-    def _write(self, payload: dict[str, object]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.parent / f".{self.path.name}.{uuid4()}.tmp"
-        raw = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
-        descriptor: int | None = None
-        try:
-            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(descriptor, "wb") as stream:
-                descriptor = None
-                stream.write(raw)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, self.path)
-            fsync_directory(self.path.parent)
-        finally:
-            if descriptor is not None:
-                os.close(descriptor)
-            temporary.unlink(missing_ok=True)
-
-
 def check_config(settings: ResearcherSettings) -> CheckedConfig:
     """Validate startup dependencies without constructing an agent or calling OpenAI."""
 
     require_initialized_database(settings.database_url)
     prompt = load_researcher_prompt(settings)
-    trust_policy = SourceTrustPolicy(
-        trusted_domains=settings.trusted_domain_values,
-        trusted_registry_urls=settings.trusted_registry_url_values,
-    )
-    if settings.discovery_enabled and not settings.discovery_query_values:
-        raise RuntimeError("Discovery is enabled but no discovery queries are configured.")
-    if settings.discovery_enabled and not trust_policy.trusted_domains:
-        raise RuntimeError("Discovery is enabled but no trusted domains are configured.")
-    DiscoverySchedule(settings.schedule_path).validate()
     return CheckedConfig(
         prompt=prompt,
         model=settings.model,
         budget=settings.budget,
-        trust_policy=trust_policy,
     )
 
 
@@ -170,20 +88,18 @@ class ResearcherWorker:
         checked: CheckedConfig | None = None,
         service_factory: ServiceFactory | None = None,
         health: HealthStore | None = None,
-        schedule: DiscoverySchedule | None = None,
         now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.settings = settings
         self.checked = checked
         self.health = health or HealthStore(settings.health_path)
-        self.schedule = schedule or DiscoverySchedule(settings.schedule_path)
         self.now = now or (lambda: datetime.now(UTC))
         self.sleep = sleep
         self.service_factory = service_factory or self._default_service_factory
 
     def initialize_health(self) -> None:
-        self.health.initialize(enabled=self.settings.enabled)
+        self.health.initialize(enabled=self.settings.schedule_enabled)
 
     def reconcile_prepared(self) -> tuple[ReconciliationResult, ...]:
         """Finish interrupted queue lifecycles before accepting new work."""
@@ -213,17 +129,9 @@ class ResearcherWorker:
             raise ValueError(f"No active research source for event: {event_id}")
         return await self._execute_refresh(source, shadow=shadow)
 
-    async def run_discovery(self, query: str, *, shadow: bool = False) -> JobExecution:
-        return await self._execute_job(
-            label=f"discovery:{_query_hash(query)[:12]}",
-            source_url=AUDIT_SOURCE_URL,
-            shadow=shadow,
-            invoke=lambda service: service.discover(query),
-        )
-
     async def run_cycle(self, *, shadow: bool = False) -> CycleResult:
-        self.health.set_idle(enabled=self.settings.enabled)
-        if not self.settings.enabled:
+        self.health.set_idle(enabled=self.settings.schedule_enabled)
+        if not self.settings.schedule_enabled:
             return CycleResult()
 
         now = self.now()
@@ -243,15 +151,6 @@ class ResearcherWorker:
             execution = await self._execute_refresh(source, shadow=shadow)
             attempted += 1
             failed += int(execution.failed)
-
-        if self.settings.discovery_enabled:
-            for query in self.settings.discovery_query_values:
-                if not self.schedule.claim(query, now):
-                    continue
-                execution = await self.run_discovery(query, shadow=shadow)
-                attempted += 1
-                failed += int(execution.failed)
-                break
 
         self.health.set_idle(enabled=True)
         return CycleResult(attempted=attempted, failed=failed)
@@ -383,7 +282,6 @@ class ResearcherWorker:
                 budget=checked.budget,
                 model=checked.model,
             ),
-            trust_policy=checked.trust_policy,
             budget=checked.budget,
             persist_queue=not shadow,
             on_run_started=on_run_started,
@@ -411,7 +309,6 @@ def _argument_parser() -> argparse.ArgumentParser:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check-config", action="store_true")
     mode.add_argument("--once", action="store_true")
-    mode.add_argument("--discover", metavar="QUERY")
     mode.add_argument("--cycle", action="store_true")
     mode.add_argument("--loop", action="store_true")
     mode.add_argument("--health", action="store_true")
@@ -441,9 +338,6 @@ async def async_main(argv: list[str] | None = None) -> int:
     if args.once:
         async def operation() -> object:
             return await worker.run_event(args.event_id, shadow=args.shadow)
-    elif args.discover is not None:
-        async def operation() -> object:
-            return await worker.run_discovery(args.discover, shadow=args.shadow)
     elif args.cycle:
         async def operation() -> object:
             return await worker.run_cycle(shadow=args.shadow)
@@ -460,15 +354,3 @@ def run() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     raise SystemExit(asyncio.run(async_main()))
-
-
-def _normalize_query(query: str) -> str:
-    return " ".join(query.split())
-
-
-def _query_hash(query: str) -> str:
-    normalized = _normalize_query(query)
-    if not normalized:
-        raise ValueError("Discovery query cannot be empty.")
-    return hashlib.sha256(normalized.casefold().encode()).hexdigest()
-

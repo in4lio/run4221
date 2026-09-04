@@ -14,7 +14,6 @@ from run4221.researcher.config import (
 )
 from run4221.researcher.schemas import (
     ArtifactReference,
-    ResearchAssessment,
     ResearchBudget,
     ResearchCandidate,
     ResearchDecision,
@@ -30,8 +29,7 @@ def test_researcher_settings_have_safe_independent_defaults() -> None:
     settings = ResearcherSettings(_env_file=None, openai_api_key="test-api-key")
 
     assert settings.model == "gpt-5.6-luna"
-    assert settings.enabled is False
-    assert settings.discovery_enabled is False
+    assert settings.schedule_enabled is False
     assert settings.rendering_enabled is False
     assert settings.max_output_tokens_per_job == 2_000
     assert settings.budget == ResearchBudget()
@@ -127,9 +125,9 @@ def test_researcher_contract_rejects_unknown_actions_and_fields() -> None:
         )
 
     with pytest.raises(ValidationError):
-        ResearchAssessment.model_validate(
+        ResearchDecision.model_validate(
             {
-                "verdict": "inconclusive",
+                "action": "no_change",
                 "summary": "No stable source.",
                 "confidence": 0.2,
                 "evidence": [],
@@ -146,12 +144,11 @@ def test_researcher_decision_rejects_mixed_queue_payloads() -> None:
     }
     proposed_fields = {"registration_status": "open"}
 
-    with pytest.raises(ValidationError, match="cannot include proposed_fields"):
+    with pytest.raises(ValidationError, match="cannot include a queue payload"):
         ResearchDecision(
-            action="suggest_event",
-            summary="Suggest the captured event.",
+            action="no_change",
+            summary="A non-persisting action cannot carry a candidate.",
             candidate=candidate,
-            proposed_fields=proposed_fields,
         )
 
     with pytest.raises(ValidationError, match="cannot include a candidate"):
@@ -194,11 +191,10 @@ def test_researcher_contract_rejects_unsafe_urls(schema_payload: dict[str, objec
 
 def test_researcher_contract_rejects_oversized_evidence() -> None:
     with pytest.raises(ValidationError):
-        ResearchAssessment(
-            verdict="inconclusive",
-            summary="No stable source.",
-            confidence=0.2,
-            evidence=["x" * 1_001],
+        ResearchCandidate(
+            source_url="https://example.com/marathon",
+            title="Example Marathon",
+            snippet="x" * 1_001,
         )
 
 
