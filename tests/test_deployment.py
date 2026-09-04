@@ -98,7 +98,8 @@ def test_compose_keeps_bot_and_researcher_static_and_least_privileged() -> None:
     assert "target: researcher" in researcher
     assert "AS bot" in dockerfile
     assert "AS researcher" in dockerfile
-    assert "--extra researcher" in dockerfile
+    assert "--extra researcher" not in dockerfile
+    assert 'CMD ["uv", "run", "python", "-m", "run4221"]' in dockerfile
     assert "playwright" not in dockerfile.casefold()
     assert "chromium" not in dockerfile.casefold()
 
@@ -119,7 +120,8 @@ def test_compose_keeps_bot_and_researcher_static_and_least_privileged() -> None:
 def test_deploy_preflights_researcher_before_replacement_and_restores_topology() -> None:
     workflow = read_project_file(".github/workflows/deploy.yml")
 
-    assert "uv sync --frozen --extra dev --extra researcher" in workflow
+    assert "uv sync --frozen --extra dev" in workflow
+    assert "--extra researcher" not in workflow
     assert 'previous_sha="$(git rev-parse HEAD)"' in workflow
     assert 'previous_services="$(docker compose config --services' in workflow
     assert 'previous_bot_image="$(docker inspect' in workflow
@@ -137,6 +139,12 @@ def test_deploy_preflights_researcher_before_replacement_and_restores_topology()
     assert workflow.index("run4221-researcher --check-config") < workflow.index(
         "service_replaced=true"
     )
+    assert (
+        "docker compose run --rm -T --interactive=false --no-deps bot uv run python -c"
+        in workflow
+    )
+    assert "from run4221.researcher.engine import build_engine; build_engine()" in workflow
+    assert workflow.index("build_engine()") < workflow.index("service_replaced=true")
     assert "docker image tag" in workflow
     assert "--remove-orphans" in workflow
     assert (
@@ -206,6 +214,9 @@ def test_example_keeps_researcher_paused_with_a_dedicated_credential() -> None:
     assert "RESEARCHER_OPENAI_API_KEY=" in example
     assert "RESEARCHER_SCHEDULE_ENABLED=false" in example
     assert "RESEARCHER_RENDERING_ENABLED=false" in example
+    assert "AI_EXTRACTOR_PROVIDER" not in example
+    assert "OPENAI_EXTRACT_MODEL" not in example
+    assert "OPENAI_API_KEY=" in example
 
 
 def test_dockerignore_excludes_private_material_while_runtime_mounts_remain() -> None:

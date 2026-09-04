@@ -11,9 +11,7 @@ from run4221.db.bootstrap import ensure_database_schema
 from run4221.db.models import utcnow
 from run4221.db.session import session_scope
 
-DISCOVER_EVENT_PROFILE_PROMPT = "discover_event_profile"
 RESEARCH_AGENT_PROMPT = "research_agent"
-UPDATE_REGISTRATION_WINDOW_PROMPT = "update_registration_window"
 
 PROMPT_STATUSES = {"draft", "active", "previous", "failed", "retired"}
 

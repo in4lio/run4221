@@ -59,9 +59,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -f private-source/prompts/discover_event_profile.instructions.txt
           test -f private-source/prompts/research_agent.instructions.txt
-          test -f private-source/prompts/update_registration_window.instructions.txt
           if [[ "${{ inputs.action }}" == "reset-and-seed-suggestions" ]]; then
             test -f private-source/data/launch_suggestions.json
           fi

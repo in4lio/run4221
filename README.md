@@ -44,15 +44,16 @@ cp .env.example .env
 Edit `.env` and set `TELEGRAM_BOT_TOKEN` to the token from BotFather. Do not commit `.env`.
 The default local database is `data/run4221.sqlite3`; it is created on startup.
 
-To enable OpenAI extraction for `/add_event`, set:
+The bot's AI features (`/add_event` page parsing and registration checks) run on the
+research engine and need:
 
 ```env
-AI_EXTRACTOR_PROVIDER=openai
+OPENAI_API_KEY=...
 RUN4221_PROMPT_SOURCE=file
 RUN4221_PROMPT_DIR=private/prompts
-OPENAI_API_KEY=...
-OPENAI_EXTRACT_MODEL=gpt-5.4-mini
 ```
+
+Without an API key the bot still runs; AI commands answer with a configuration error.
 
 Run the bot locally:
 

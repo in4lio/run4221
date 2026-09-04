@@ -28,6 +28,4 @@ CMD ["uv", "run", "python", "-m", "run4221"]
 
 FROM static-runtime AS researcher
 
-RUN uv sync --frozen --no-dev --extra researcher
-
 CMD ["uv", "run", "run4221-researcher", "--loop"]
