@@ -13,7 +13,6 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from run4221.ai.event_extractor import (
     EventDraft,
     extract_event_draft_from_url,
-    select_registration_url_for_distances,
 )
 from run4221.ai.provider_factory import ExtractorProviderConfigError, get_extractor_provider
 from run4221.ai.registration_window import (
@@ -76,6 +75,7 @@ from run4221.events import (
     TrackedEvent,
     normalize_event_id,
 )
+from run4221.ingestion.event_identity import select_registration_url_for_distances
 from run4221.posting.ledger import (
     ChannelMessageRecord,
     approve_channel_message,
