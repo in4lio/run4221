@@ -333,6 +333,56 @@ def format_event_list(events: tuple[TrackedEvent, ...], *, title: str) -> str:
     return "\n".join(lines)
 
 
+_PROVIDER_LIMIT_TERMS = (
+    "authentication",
+    "quota",
+    "rate limit",
+    "rate_limit",
+    "timed out",
+    "timeout",
+)
+_QUEUE_FULL_TERMS = ("queue is full", "queue-full", "queue_full")
+
+
+def research_outcome_headline(result) -> str:
+    """One plain-text sentence for a typed researcher run result.
+
+    Accepts any object with ``status`` (state/outcome/detail) plus the optional
+    ``queue_reference``/``conflicting_update_id`` fields of a refresh result.
+    Every failure is a named message; no evidence-string parsing happens here.
+    """
+
+    status = result.status
+    state = str(status.status)
+    outcome = str(status.outcome)
+    detail = (status.detail or "").casefold()
+    if state == "failed":
+        if any(term in detail for term in _PROVIDER_LIMIT_TERMS):
+            return (
+                "The researcher provider rejected the run: "
+                "check its configuration or usage limits."
+            )
+        return "The check failed before reaching a decision."
+    if state == "capped":
+        if any(term in detail for term in _QUEUE_FULL_TERMS):
+            return "The moderation queue is full. Review pending updates, then retry."
+        return "The check stopped at its run budget."
+    if state == "skipped":
+        conflicting_update_id = getattr(result, "conflicting_update_id", None)
+        if conflicting_update_id is not None:
+            return f"Update #{conflicting_update_id} is already pending for this event."
+        return "The captured evidence did not support a validated change."
+    if outcome == "no_change":
+        return "No material change detected."
+    if outcome == "proposal_created":
+        reference = str(getattr(result, "queue_reference", None) or "")
+        update_id = reference.rsplit(":", 1)[-1]
+        return f"Created pending update #{update_id} for moderator review."
+    if outcome == "profile_completed":
+        return "Profile draft completed."
+    return "The check finished without a queueable decision."
+
+
 def format_event_detail(event: TrackedEvent) -> str:
     date = event.event_date or "date TBA"
     registration_url = event.registration_url or event.official_url

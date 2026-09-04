@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import re
+from contextlib import suppress
 from datetime import date, datetime
 from html import escape
+from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
@@ -10,15 +14,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from run4221.ai.event_extractor import (
-    EventDraft,
-    extract_event_draft_from_url,
-)
-from run4221.ai.provider_factory import ExtractorProviderConfigError, get_extractor_provider
-from run4221.ai.registration_window import (
-    RegistrationWindowUpdateResult,
-    update_registration_window,
-)
 from run4221.bot.auth import is_moderator_account, require_moderator
 from run4221.bot.formatting import (
     ResearcherProvenance,
@@ -29,6 +24,7 @@ from run4221.bot.formatting import (
     format_major_title,
     format_researcher_source_check,
     parse_researcher_provenance,
+    research_outcome_headline,
 )
 from run4221.bot.keyboards import (
     dialog_keyboard,
@@ -75,7 +71,10 @@ from run4221.events import (
     TrackedEvent,
     normalize_event_id,
 )
-from run4221.ingestion.event_identity import select_registration_url_for_distances
+from run4221.ingestion.event_identity import (
+    resolve_timezone,
+    select_registration_url_for_distances,
+)
 from run4221.posting.ledger import (
     ChannelMessageRecord,
     approve_channel_message,
@@ -89,8 +88,63 @@ from run4221.posting.ledger import (
     retry_channel_message,
 )
 from run4221.posting.publisher import publish_channel_message
+from run4221.researcher.schemas import EventProfileDraft
+
+if TYPE_CHECKING:
+    from run4221.researcher.engine import ResearchEngine
+    from run4221.researcher.service import ProfileJobResult, ResearchJobResult
 
 router = Router(name="moderator")
+
+# One AI lever: the researcher engine is built lazily on first use so the bot
+# boots and serves every non-AI command without researcher configuration.
+_engine: ResearchEngine | None = None
+
+# KTD8 parse lock: chats with an event-page parse in flight. The marker is held
+# for the duration of the engine call, so /cancel cannot resurrect or restart
+# the flow while a parse is still running.
+_parsing_chats: set[int | None] = set()
+
+# Per-event registration-check guard shared by /update_event and the
+# post-create background scan.
+_refreshing_events: set[str] = set()
+
+# Strong references to post-create background scans so they are not GC'd.
+_background_refresh_tasks: set[asyncio.Task] = set()
+
+PARSE_IN_PROGRESS_MESSAGE = (
+    "An event page is already being parsed in this chat. "
+    "Wait for it to finish before starting a new flow."
+)
+
+
+def get_engine() -> ResearchEngine:
+    """Return the cached researcher engine, building it on first use."""
+
+    global _engine
+    if _engine is None:
+        from run4221.researcher.engine import build_engine
+
+        _engine = build_engine()
+    return _engine
+
+
+async def acquire_engine(message: Message) -> ResearchEngine | None:
+    """Fail closed: any engine construction error becomes a named message."""
+
+    try:
+        return get_engine()
+    except Exception as error:
+        await message.answer(
+            f"Researcher engine is not configured: {escape(str(error))}"
+        )
+        return None
+
+
+def message_chat_id(message: Message) -> int | None:
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    return int(chat_id) if chat_id is not None else None
 
 ARCHIVE_LIST_DEFAULT_LIMIT = 10
 ARCHIVE_LIST_MAX_LIMIT = 30
@@ -135,6 +189,7 @@ CHANNEL_MARK_PUBLISHED_CALLBACK_PREFIX = "channel:mark_published:"
 
 class AddEventStates(StatesGroup):
     source_url = State()
+    parsing = State()
     name = State()
     public_id = State()
     city = State()
@@ -300,6 +355,9 @@ async def handle_add_event(
 ) -> None:
     if not await require_moderator(message):
         return
+    if message_chat_id(message) in _parsing_chats:
+        await message.answer(PARSE_IN_PROGRESS_MESSAGE)
+        return
 
     await state.clear()
     source = (command.args or "").strip() if command else ""
@@ -336,6 +394,16 @@ async def handle_add_event_source_url(message: Message, state: FSMContext) -> No
         return
 
     await start_add_event_from_url(message, state, source)
+
+
+@router.message(AddEventStates.parsing)
+async def handle_add_event_parsing_input(message: Message) -> None:
+    if not await require_moderator(message):
+        return
+
+    await message.answer(
+        "Still parsing the event page. Wait for the draft, or use /cancel."
+    )
 
 
 async def start_add_event_from_suggestion(
@@ -399,23 +467,74 @@ async def start_add_event_from_url(
     source_suggestion_id: int | None = None,
     source_suggestion_note: str | None = None,
 ) -> None:
-    await warn_existing_url_events(message, url)
-
-    try:
-        extractor_provider = get_extractor_provider(get_settings())
-    except ExtractorProviderConfigError as error:
-        await message.answer(f"Extractor provider is not configured: {escape(str(error))}")
+    chat_id = message_chat_id(message)
+    if chat_id in _parsing_chats:
+        await message.answer(PARSE_IN_PROGRESS_MESSAGE)
         return
 
-    draft = await extract_event_draft_from_url(url, extractor_provider=extractor_provider)
-    state_data = draft_to_state(draft)
+    await warn_existing_url_events(message, url)
+
+    engine = await acquire_engine(message)
+    if engine is None:
+        return
+
+    # KTD8 parse lock: enter the parsing state with a fresh run token before
+    # the engine call; the returned draft is discarded unless both still match.
+    parse_token = uuid4().hex
+    await state.set_state(AddEventStates.parsing)
+    await state.update_data(parse_token=parse_token)
+    await message.answer("Parsing the event page...")
+
+    _parsing_chats.add(chat_id)
+    try:
+        result = await engine.profile(url)
+    except Exception as error:
+        if await parse_is_current(state, parse_token):
+            await state.clear()
+            await message.answer(
+                "Event page parsing failed. Try again later.\n"
+                f"Error: {escape(str(error))}",
+                reply_markup=remove_dialog_keyboard(),
+            )
+        return
+    finally:
+        _parsing_chats.discard(chat_id)
+
+    if not await parse_is_current(state, parse_token):
+        # The flow was cancelled or replaced while parsing: discard the draft.
+        return
+
+    if result.draft is None:
+        await state.clear()
+        await message.answer(
+            format_profile_failure(result),
+            reply_markup=remove_dialog_keyboard(),
+        )
+        return
+
+    state_data = draft_to_state(result.draft)
     if source_suggestion_id is not None:
         state_data["source_suggestion_id"] = source_suggestion_id
         state_data["source_suggestion_note"] = source_suggestion_note
     await state.update_data(**state_data)
-    await message.answer(format_draft_summary(draft))
+    await message.answer(
+        format_draft_summary(
+            result.draft,
+            run_id=result.run_id,
+            timezone=str(state_data["timezone"]),
+        )
+    )
     await state.set_state(AddEventStates.name)
-    await ask_field_confirmation(message, "name", draft.name)
+    await ask_field_confirmation(message, "name", result.draft.name)
+
+
+async def parse_is_current(state: FSMContext, parse_token: str) -> bool:
+    """True only while this parse still owns the flow's parsing state."""
+
+    if await state.get_state() != AddEventStates.parsing.state:
+        return False
+    data = await state.get_data()
+    return data.get("parse_token") == parse_token
 
 
 @router.message(AddEventStates.name)
@@ -796,17 +915,58 @@ async def handle_add_event_registration_close_at(message: Message, state: FSMCon
     )
     if announcement is not None:
         await send_channel_draft_preview(message, announcement)
-    await message.answer("Running first registration scan...")
+    engine = await acquire_engine(message)
+    if engine is None:
+        return
+    await message.answer(
+        "Started the first registration check in the background. "
+        "I will post the result here."
+    )
+    schedule_background_registration_check(engine, event, message)
+
+
+def schedule_background_registration_check(
+    engine: ResearchEngine,
+    event: TrackedEvent,
+    message: Message,
+) -> asyncio.Task:
+    """KTD7: post-create scan runs as an asynchronous background engine refresh."""
+
+    task = asyncio.create_task(
+        run_background_registration_check(engine, event, message),
+        name=f"registration-check:{event.id}",
+    )
+    _background_refresh_tasks.add(task)
+    task.add_done_callback(_background_refresh_tasks.discard)
+    return task
+
+
+async def run_background_registration_check(
+    engine: ResearchEngine,
+    event: TrackedEvent,
+    message: Message,
+) -> None:
+    """One-shot refresh that reports into the same chat and never raises."""
+
+    _refreshing_events.add(event.id)
     try:
-        registration_update = await update_registration_window(event)
+        result = await engine.refresh_source(event.id)
+        text = format_refresh_outcome(result)
+    except ValueError:
+        text = (
+            "I could not find an active source for event "
+            f"<code>{escape(event.public_id)}</code>."
+        )
     except Exception as error:
-        await message.answer(
-            "First registration scan failed. Event was added and can be checked later.\n"
+        text = (
+            "The background registration check failed. "
+            "The event was added and can be checked later with /update_event.\n"
             f"Error: {escape(str(error))}"
         )
-        return
-
-    await message.answer(format_registration_update_result(registration_update))
+    finally:
+        _refreshing_events.discard(event.id)
+    with suppress(Exception):
+        await message.answer(text)
 
 
 @router.message(Command("edit_event"))
@@ -995,20 +1155,40 @@ async def update_event_registration_by_id(
         )
         return
 
-    await message.answer(
-        f"Running registration scan for <b>{escape(event.name)}</b>...",
-        reply_markup=remove_dialog_keyboard() if cleanup_keyboard else None,
-    )
-    try:
-        registration_update = await update_registration_window(event)
-    except Exception as error:
+    if event.id in _refreshing_events:
         await message.answer(
-            "Registration scan failed. Try again later.\n"
-            f"Error: {escape(str(error))}"
+            f"A registration check is already running for <b>{escape(event.name)}</b>.",
+            reply_markup=remove_dialog_keyboard() if cleanup_keyboard else None,
         )
         return
 
-    await message.answer(format_registration_update_result(registration_update))
+    engine = await acquire_engine(message)
+    if engine is None:
+        return
+
+    await message.answer(
+        f"Running registration check for <b>{escape(event.name)}</b>...",
+        reply_markup=remove_dialog_keyboard() if cleanup_keyboard else None,
+    )
+    _refreshing_events.add(event.id)
+    try:
+        result = await engine.refresh_source(event.id)
+    except ValueError:
+        await message.answer(
+            "I could not find an active source for event "
+            f"<code>{escape(event.public_id)}</code>."
+        )
+        return
+    except Exception as error:
+        await message.answer(
+            "Registration check failed. Try again later.\n"
+            f"Error: {escape(str(error))}"
+        )
+        return
+    finally:
+        _refreshing_events.discard(event.id)
+
+    await message.answer(format_refresh_outcome(result))
 
 
 @router.message(Command("archive_event"))
@@ -3187,14 +3367,19 @@ async def require_moderator_callback(callback: CallbackQuery) -> bool:
     return False
 
 
-def draft_to_state(draft: EventDraft) -> dict[str, object]:
+def draft_to_state(draft: EventProfileDraft) -> dict[str, object]:
     return {
         "source_url": draft.source_url,
         "name": draft.name,
         "public_id": draft.public_id,
         "city": draft.city,
         "country": draft.country,
-        "timezone": draft.timezone,
+        "timezone": resolve_timezone(
+            draft.timezone,
+            country=draft.country,
+            regions=draft.regions,
+            city=draft.city,
+        ),
         "event_date": draft.event_date,
         "distances": draft.distances,
         "regions": draft.regions,
@@ -3204,51 +3389,57 @@ def draft_to_state(draft: EventDraft) -> dict[str, object]:
         "registration_open_at": None,
         "registration_open_precision": "unknown",
         "registration_close_at": None,
-        "registration_url_candidates": draft.registration_url_candidates,
+        "registration_url_candidates": tuple(
+            candidate.as_pair for candidate in draft.registration_url_candidates
+        ),
     }
 
 
-def format_draft_summary(draft: EventDraft) -> str:
-    return "\n".join(
-        [
-            format_major_title("Draft extracted from URL"),
-            "",
-            "Draft fields come from a structured extractor over fetched page evidence.",
-            format_field_line("Confidence", f"{draft.confidence:.2f}"),
-            format_evidence_for_display(draft.evidence),
-            "",
-            "I will ask you to confirm or correct each field.",
-        ]
-    )
-
-
-def format_registration_update_result(update: RegistrationWindowUpdateResult) -> str:
+def format_draft_summary(
+    draft: EventProfileDraft,
+    *,
+    run_id: str,
+    timezone: str | None = None,
+) -> str:
     lines = [
-        "<b>Registration scan</b>",
+        format_major_title("Draft extracted from URL"),
         "",
-        format_field_line("Status", update.registration_status),
-        format_field_line("Confidence", f"{update.confidence:.2f}"),
+        "Draft fields come from the researcher engine over captured page evidence.",
+        format_field_line("Confidence", f"{draft.confidence:.2f}"),
+        format_field_line("Name", draft.name),
+        format_field_line("Captured page", draft.source_url),
     ]
-    if update.registration_open_at:
-        lines.append(format_field_line("Opens", update.registration_open_at))
-    if update.registration_url:
-        lines.append(format_field_line("Registration URL", update.registration_url))
-    if update.event_date:
-        lines.append(format_field_line("Event date", update.event_date))
-    if update.proposed_update_id is not None:
-        lines.append("")
-        lines.append(
-            "Created proposed update "
-            f"#{update.proposed_update_id} for moderator confirmation."
-        )
-    elif update.applied:
-        lines.append("")
-        lines.append("High-confidence update was applied automatically.")
-    else:
-        lines.append("")
-        lines.append("No registration announcement detected yet.")
+    if timezone and timezone != draft.timezone:
+        lines.append(format_field_line("Timezone", f"{timezone} (derived)"))
+    if draft.summary:
+        lines.append(format_bounded_field_line("Summary", draft.summary, max_html_chars=400))
+    lines.append(format_field_line("Run ID", run_id, kind="id"))
+    lines.extend(["", "I will ask you to confirm or correct each field."])
+    return "\n".join(lines)
 
-    lines.extend(["", format_evidence_for_display(update.evidence)])
+
+def format_refresh_outcome(result: ResearchJobResult) -> str:
+    lines = [
+        "<b>Registration check</b>",
+        "",
+        escape(research_outcome_headline(result), quote=False),
+    ]
+    if result.status.detail:
+        lines.append(format_bounded_field_line("Detail", result.status.detail, max_html_chars=700))
+    lines.append(format_field_line("Run ID", result.run_id, kind="id"))
+    return "\n".join(lines)
+
+
+def format_profile_failure(result: ProfileJobResult) -> str:
+    lines = [
+        "<b>Event page parsing</b>",
+        "",
+        escape(research_outcome_headline(result), quote=False),
+        "No draft was produced, so the add flow was stopped.",
+    ]
+    if result.status.detail:
+        lines.append(format_bounded_field_line("Detail", result.status.detail, max_html_chars=700))
+    lines.append(format_field_line("Run ID", result.run_id, kind="id"))
     return "\n".join(lines)
 
 
@@ -3277,154 +3468,18 @@ def _researcher_suggestion_provenance(suggestion) -> ResearcherProvenance | None
     return parse_researcher_provenance(suggestion.note)
 
 
-def format_evidence_for_display(evidence: str) -> str:
-    formatted = evidence.strip()
-    if not formatted:
-        return "unknown"
+def format_stored_evidence(evidence: tuple[str, ...] | list[str]) -> str:
+    """Render legacy queue-row evidence lines verbatim, escaped and unparsed."""
 
-    formatted = re.sub(
-        r"(Stored snapshot:\s+)(?:/[^\s]+/)?([^/\s]+\.json)(?=\.|\s|$)",
-        r"\1\2",
-        formatted,
-    )
-    formatted = re.sub(
-        r"\s+(?=(?:Text hash|Stored snapshot|Title|Extractor provider|"
-        r"Registration extractor provider|AI provider|Page blocked|Detected registration status|"
-        r"Detected registration opening date|Detected registration URL|Detected event date):)",
-        "\n",
-        formatted,
-    )
-    formatted = re.sub(r"\s+(?=Extractor provider .+ failed:)", "\n", formatted)
-    formatted = re.sub(r"\s+(?=Falling back to )", "\n", formatted)
-    formatted = re.sub(r"\s+(?=AI provider is )", "\n", formatted)
-    formatted = re.sub(r"\"\s+\"", "\"\n\"", formatted)
-    formatted = re.sub(r"(?<=[.!?])\s+(?=\")", "\n", formatted)
-    formatted = re.sub(r"(?<=[.!?]\")\s+(?=\")", "\n", formatted)
-    formatted = re.sub(r"(?<!:)\s+(?=https?://)", "\n", formatted)
-    formatted = re.sub(r"[ \t]+", " ", formatted)
-    formatted = re.sub(r"\n+", "\n", formatted)
-    source_check, key_info = split_evidence_lines(
-        compact_evidence_lines(formatted.splitlines())
-    )
-    return format_evidence_sections(source_check, key_info)
-
-
-def compact_evidence_lines(lines: list[str]) -> list[str]:
-    compacted: list[str] = []
-    quoted_snippets = 0
-    max_quoted_snippets = 4
-
-    for raw_line in lines:
-        line = raw_line.strip()
-        if not line or line.startswith("Text hash:"):
-            continue
-        if is_empty_detected_evidence_line(line):
-            continue
-        if line.startswith('"') and line.endswith('"'):
-            if quoted_snippets >= max_quoted_snippets:
-                continue
-            quoted_snippets += 1
-        compacted.append(line)
-
-    return compacted
-
-
-def split_evidence_lines(lines: list[str]) -> tuple[list[str], list[str]]:
-    source_check: list[str] = []
-    key_info: list[str] = []
-
-    for line in lines:
-        if is_source_check_line(line):
-            source_check.append(format_source_check_line(line))
-        else:
-            key_info.append(line)
-
-    return source_check, key_info
-
-
-def is_source_check_line(line: str) -> bool:
-    return (
-        line.startswith("Fetched page snapshot with status ")
-        or line.startswith("Stored snapshot:")
-        or line.startswith("Title:")
-        or line.startswith("Extractor provider")
-        or line.startswith("Registration extractor provider")
-        or line.startswith("AI provider")
-        or line.startswith("Falling back to ")
-        or line.startswith("Page fetch failed:")
-        or line.startswith("Page blocked:")
-        or line.startswith("Fallback extraction")
-    )
-
-
-def format_source_check_line(line: str) -> str:
-    if match := re.fullmatch(r"Fetched page snapshot with status (\d+)\.", line):
-        status = int(match.group(1))
-        if 200 <= status <= 299:
-            return f"Fetched page OK (status {status})."
-        return f"Fetched page returned status {status}."
-
-    if line.startswith("Stored snapshot:"):
-        return format_source_check_field(line, "Stored snapshot:", "Snapshot")
-
-    if line.startswith("Title:"):
-        return format_source_check_field(line, "Title:", "Title")
-
-    if line.startswith("Extractor provider:"):
-        return format_source_check_field(line, "Extractor provider:", "Provider")
-
-    if line.startswith("Registration extractor provider:"):
-        return format_source_check_field(
-            line,
-            "Registration extractor provider:",
-            "Provider",
-        )
-
-    if line.startswith("Page fetch failed:"):
-        return format_source_check_field(line, "Page fetch failed:", "Page fetch failed")
-
-    if line.startswith("Page blocked:"):
-        value = line.removeprefix("Page blocked:").strip().removesuffix(".")
-        return f"⚠️ <b>Warning</b>: {escape(value, quote=False)}"
-
-    return line
-
-
-def format_source_check_field(line: str, prefix: str, label: str) -> str:
-    value = line.removeprefix(prefix).strip().removesuffix(".")
-    return format_field_line(label, value)
-
-
-def format_evidence_sections(source_check: list[str], key_info: list[str]) -> str:
-    lines = ["<b>Source check</b>"]
+    lines = ["<b>Evidence</b>"]
     lines.extend(
-        line if line.startswith(("<b>", "⚠️ <b>")) else escape(line, quote=False)
-        for line in source_check or ["unknown"]
+        escape(str(line).strip(), quote=False)
+        for line in evidence
+        if str(line).strip()
     )
-
-    if key_info:
-        lines.append("")
-        lines.append("<b>Detected info</b>")
-        lines.extend(format_key_info_line(line) for line in key_info)
-
+    if len(lines) == 1:
+        lines.append("unknown")
     return "\n".join(lines)
-
-
-def is_empty_detected_evidence_line(line: str) -> bool:
-    return re.fullmatch(r"Detected [^:]+:\s*\.?", line) is not None
-
-
-def format_key_info_line(line: str) -> str:
-    if match := re.fullmatch(r"(Detected [^:]+):\s*(.+)", line):
-        value = match.group(2).strip().removesuffix(".")
-        return format_field_line(detected_info_label(match.group(1)), value)
-
-    return escape(line, quote=False)
-
-
-def detected_info_label(label: str) -> str:
-    cleaned = label.removeprefix("Detected ").strip()
-    return cleaned[:1].upper() + cleaned[1:]
 
 
 async def warn_existing_url_events(message: Message, url: str) -> None:
@@ -4628,7 +4683,7 @@ def format_proposed_update_detail(
         if source_check:
             lines.extend(["", source_check])
     elif update.evidence:
-        lines.extend(["", format_evidence_for_display(" ".join(update.evidence))])
+        lines.extend(["", format_stored_evidence(update.evidence)])
 
     return "\n".join(lines)
 

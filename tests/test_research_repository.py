@@ -218,6 +218,7 @@ def test_research_proposal_skips_conflicting_active_update(
     assert first.outcome == "admitted"
     assert conflict.outcome == "conflicting_pending"
     assert conflict.update is None
+    assert conflict.conflicting_update_id == first.update.id
     assert count_proposed_event_updates(status=existing_status, database_url=url) == 1
 
 
@@ -246,6 +247,7 @@ def test_research_proposal_respects_pending_queue_cap(tmp_path) -> None:
     assert first.outcome == "admitted"
     assert capped.outcome == "queue_full"
     assert capped.update is None
+    assert capped.conflicting_update_id is None
 
 
 def test_research_queue_resolver_finds_json_proposal_evidence(tmp_path) -> None:

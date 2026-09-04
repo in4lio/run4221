@@ -194,6 +194,7 @@ class ResearchJobResult:
     status: ResearchRunStatus
     terminal_reference: ArtifactReference
     queue_reference: str | None = None
+    conflicting_update_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -611,6 +612,7 @@ class ResearcherService:
                 prepared,
                 RunState.CAPPED if admission.outcome == "queue_full" else RunState.SKIPPED,
                 detail,
+                conflicting_update_id=admission.conflicting_update_id,
             )
 
         queue_reference = f"proposed_event_update:{admission.update.id}"
@@ -1057,10 +1059,16 @@ class ResearcherService:
         detail: str,
         *,
         outcome: RunOutcome = RunOutcome.INCONCLUSIVE,
+        conflicting_update_id: int | None = None,
     ) -> ResearchJobResult:
         status = ResearchRunStatus(status=state, outcome=outcome, detail=detail)
         terminal = self.artifacts.finalize_uncommitted(prepared, status=status)
-        return ResearchJobResult(prepared.run_id, status, terminal)
+        return ResearchJobResult(
+            prepared.run_id,
+            status,
+            terminal,
+            conflicting_update_id=conflicting_update_id,
+        )
 
 
 _AGENT_TERMINAL_STATES = {

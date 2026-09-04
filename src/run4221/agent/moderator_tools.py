@@ -2,13 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from run4221.ai.event_extractor import extract_event_draft_from_url
-from run4221.ai.extraction_provider import ExtractorProvider
-from run4221.ai.provider_factory import ExtractorProviderConfigError, get_extractor_provider
-from run4221.ai.registration_window import update_registration_window
-from run4221.config import get_settings
+from run4221.bot.formatting import research_outcome_headline
 from run4221.db.repository import (
     EventCreate,
     EventUpdate,
@@ -47,6 +43,10 @@ from run4221.db.repository import (
     update_event as repo_update_event,
 )
 from run4221.events import TrackedEvent, normalize_event_id
+
+if TYPE_CHECKING:
+    from run4221.researcher.engine import ResearchEngine
+    from run4221.researcher.service import ProfileJobResult, ResearchJobResult
 
 JsonObject = dict[str, Any]
 
@@ -94,7 +94,7 @@ MODERATOR_AGENT_TOOL_SPECS = (
     ModeratorAgentToolSpec("discover_event_profile", "Extract a draft event profile from a URL."),
     ModeratorAgentToolSpec("create_event", "Create a tracked event from confirmed fields."),
     ModeratorAgentToolSpec("edit_event", "Edit tracked event fields without changing public ID."),
-    ModeratorAgentToolSpec("update_event", "Run a registration-window scan for an event."),
+    ModeratorAgentToolSpec("update_event", "Run a researcher registration check for an event."),
     ModeratorAgentToolSpec("archive_event", "Archive an active event."),
     ModeratorAgentToolSpec("list_archive", "List archived events."),
     ModeratorAgentToolSpec("restore_event", "Restore an archived event."),
@@ -134,11 +134,20 @@ class ModeratorAgentTools:
         *,
         database_url: str | None = None,
         delete_confirmation_code: str | None = None,
-        extractor_provider: ExtractorProvider | None = None,
+        engine: ResearchEngine | None = None,
     ) -> None:
         self.database_url = database_url
         self.delete_confirmation_code = delete_confirmation_code
-        self.extractor_provider = extractor_provider
+        self.engine = engine
+
+    def _acquire_engine(self) -> ResearchEngine:
+        """Lazily build and cache the researcher engine; fail closed on errors."""
+
+        if self.engine is None:
+            from run4221.researcher.engine import build_engine
+
+            self.engine = build_engine()
+        return self.engine
 
     def tool_specs(self) -> tuple[JsonObject, ...]:
         return moderator_agent_tool_specs()
@@ -211,18 +220,19 @@ class ModeratorAgentTools:
 
     async def discover_event_profile(self, url: str) -> AgentToolResult:
         try:
-            provider = self.extractor_provider
-            if provider is None:
-                settings = get_settings()
-                if self.database_url is not None:
-                    settings = settings.model_copy(update={"database_url": self.database_url})
-                provider = get_extractor_provider(settings)
-            draft = await extract_event_draft_from_url(url, extractor_provider=provider)
-        except ExtractorProviderConfigError as error:
-            return AgentToolResult.failure(f"Extractor provider is not configured: {error}")
+            engine = self._acquire_engine()
+        except Exception as error:
+            return AgentToolResult.failure(f"Researcher engine is not configured: {error}")
+        try:
+            result = await engine.profile(url)
         except Exception as error:
             return AgentToolResult.failure(f"Could not discover event profile: {error}")
-        return AgentToolResult.success(serialize_dataclass(draft))
+        if result.draft is None:
+            failure = research_outcome_headline(result)
+            if result.status.detail:
+                failure = f"{failure} {result.status.detail}"
+            return AgentToolResult.failure(f"{failure} (run {result.run_id})")
+        return AgentToolResult.success(serialize_profile_result(result))
 
     def create_event(
         self,
@@ -259,25 +269,22 @@ class ModeratorAgentTools:
             return AgentToolResult.failure(f"Event not found: {event_id}")
         return AgentToolResult.success(serialize_event(event))
 
-    async def update_event(
-        self,
-        event_id: str,
-        *,
-        auto_confirm: bool = False,
-    ) -> AgentToolResult:
+    async def update_event(self, event_id: str) -> AgentToolResult:
         event = find_event(event_id, database_url=self.database_url)
         if event is None:
             return AgentToolResult.failure(f"Event not found: {event_id}")
 
         try:
-            result = await update_registration_window(
-                event,
-                database_url=self.database_url,
-                auto_confirm=auto_confirm,
-            )
+            engine = self._acquire_engine()
+        except Exception as error:
+            return AgentToolResult.failure(f"Researcher engine is not configured: {error}")
+        try:
+            result = await engine.refresh_source(event.id)
+        except ValueError as error:
+            return AgentToolResult.failure(str(error))
         except Exception as error:
             return AgentToolResult.failure(f"Could not update event: {error}")
-        return AgentToolResult.success(serialize_dataclass(result))
+        return AgentToolResult.success(serialize_refresh_result(result))
 
     def archive_event(self, event_id: str) -> AgentToolResult:
         event = repo_archive_event(event_id, database_url=self.database_url)
@@ -446,7 +453,8 @@ class ModeratorAgentTools:
         return AgentToolResult.success(
             {
                 "suggestion": serialize_suggestion(suggestion),
-                "draft": draft_result.data,
+                "draft": draft_result.data["draft"],
+                "run_id": draft_result.data["run_id"],
                 "next_step": "create_event with source_suggestion_id after moderator review",
             }
         )
@@ -485,12 +493,12 @@ def create_moderator_agent_tools(
     *,
     database_url: str | None = None,
     delete_confirmation_code: str | None = None,
-    extractor_provider: ExtractorProvider | None = None,
+    engine: ResearchEngine | None = None,
 ) -> ModeratorAgentTools:
     return ModeratorAgentTools(
         database_url=database_url,
         delete_confirmation_code=delete_confirmation_code,
-        extractor_provider=extractor_provider,
+        engine=engine,
     )
 
 
@@ -613,6 +621,31 @@ def serialize_suggestion(suggestion) -> JsonObject:
         "submitter_user_id": suggestion.submitter_user_id,
         "submitter_username": suggestion.submitter_username,
         "submitter_display_name": suggestion.submitter_display_name,
+    }
+
+
+def serialize_profile_result(result: ProfileJobResult) -> JsonObject:
+    return {
+        "run_id": result.run_id,
+        "status": str(result.status.status),
+        "outcome": str(result.status.outcome),
+        "detail": result.status.detail,
+        "message": research_outcome_headline(result),
+        "draft": (
+            result.draft.model_dump(mode="json") if result.draft is not None else None
+        ),
+    }
+
+
+def serialize_refresh_result(result: ResearchJobResult) -> JsonObject:
+    return {
+        "run_id": result.run_id,
+        "status": str(result.status.status),
+        "outcome": str(result.status.outcome),
+        "detail": result.status.detail,
+        "queue_reference": result.queue_reference,
+        "conflicting_update_id": result.conflicting_update_id,
+        "message": research_outcome_headline(result),
     }
 
 
