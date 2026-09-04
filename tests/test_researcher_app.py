@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -151,7 +152,7 @@ def test_check_config_cli_makes_no_agent_or_api_call(tmp_path: Path, monkeypatch
     monkeypatch.setenv("DATABASE_URL", config.database_url)
     monkeypatch.setenv("RESEARCHER_PROMPT_DIR", config.prompt_dir)
     monkeypatch.setattr(
-        "run4221.researcher.app.set_default_openai_key",
+        "run4221.researcher.engine.set_default_openai_key",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("agent configured")),
     )
 
@@ -249,11 +250,17 @@ def test_loop_survives_job_failure_and_runs_next_cycle(tmp_path: Path) -> None:
     assert sleeps == [app.settings.interval_seconds]
 
 
-def test_startup_reconciles_a_committed_prepared_decision(tmp_path: Path) -> None:
-    initialize(tmp_path)
-    event_id = add_source(tmp_path)
-    config = settings(tmp_path)
-    store = ResearchArtifactStore(config.artifact_dir)
+def prepare_absent_decision(
+    config: ResearcherSettings,
+    event_id: str,
+    *,
+    admit: bool = False,
+) -> tuple[ResearchArtifactStore, str]:
+    """Create one prepared-but-unfinalized run old enough to be reconciled."""
+
+    # Producing the run in the past keeps it outside the 2x producer-cap
+    # freshness window when the worker reconciles with the real clock.
+    store = ResearchArtifactStore(config.artifact_dir, now=lambda: NOW)
     run_id = store.create_run(job_type="refresh")
     source_url = f"https://official.example/{event_id}"
     evidence = store.write_artifact(
@@ -291,20 +298,30 @@ def test_startup_reconciles_a_committed_prepared_decision(tmp_path: Path) -> Non
             status="succeeded",
             outcome="proposal_created",
         ),
+        producer_deadline_seconds=90,
     )
-    admission = admit_proposed_update(
-        ProposedEventUpdateCreate(
-            event_id=event_id,
-            update_type="registration_window",
-            current_fields={"registration_status": "unknown"},
-            proposed_fields={"registration_status": "open"},
-            evidence=(decision_queue_marker(prepared),),
-            confidence=0.95,
-            change_summary=decision.summary,
-        ),
-        database_url=config.database_url,
-    )
-    assert admission.outcome == "admitted"
+    if admit:
+        admission = admit_proposed_update(
+            ProposedEventUpdateCreate(
+                event_id=event_id,
+                update_type="registration_window",
+                current_fields={"registration_status": "unknown"},
+                proposed_fields={"registration_status": "open"},
+                evidence=(decision_queue_marker(prepared),),
+                confidence=0.95,
+                change_summary=decision.summary,
+            ),
+            database_url=config.database_url,
+        )
+        assert admission.outcome == "admitted"
+    return store, run_id
+
+
+def test_startup_reconciles_a_committed_prepared_decision(tmp_path: Path) -> None:
+    initialize(tmp_path)
+    event_id = add_source(tmp_path)
+    config = settings(tmp_path)
+    store, _run_id = prepare_absent_decision(config, event_id, admit=True)
 
     app = ResearcherWorker(
         config,
@@ -319,3 +336,85 @@ def test_startup_reconciles_a_committed_prepared_decision(tmp_path: Path) -> Non
     assert store.read_artifact(reconciled[0].terminal_reference)["content"][
         "queue_reference"
     ] == "proposed_event_update:1"
+
+
+def test_worker_skips_reconciling_a_fresh_prepared_run(tmp_path: Path) -> None:
+    initialize(tmp_path)
+    event_id = add_source(tmp_path)
+    config = settings(tmp_path)
+    # Prepared with the real clock: still inside its 2x producer-cap window.
+    store = ResearchArtifactStore(config.artifact_dir)
+    run_id = store.create_run(job_type="refresh")
+    source_url = f"https://official.example/{event_id}"
+    evidence = store.write_artifact(
+        run_id,
+        artifact_type="page_snapshot",
+        source_url=source_url,
+        content={"captured": True},
+    )
+    decision = ResearchDecision.model_validate(
+        {
+            "action": "propose_update",
+            "summary": "The captured approved source says registration is open.",
+            "confidence": 0.95,
+            "proposed_fields": {"registration_status": "open"},
+            "evidence": [evidence],
+            "applicability": [
+                {
+                    "evidence": evidence,
+                    "event_identity": "confirmed",
+                    "event_edition": "confirmed",
+                    "distance_category": "confirmed",
+                    "applicable_fields": ["registration_status"],
+                }
+            ],
+            "field_support": [
+                {"field": "registration_status", "evidence": [evidence]}
+            ],
+        }
+    )
+    store.prepare_decision(
+        run_id,
+        source_url=source_url,
+        decision=decision,
+        committed_status=ResearchRunStatus(
+            status="succeeded",
+            outcome="proposal_created",
+        ),
+        producer_deadline_seconds=90,
+    )
+
+    app = ResearcherWorker(
+        config,
+        service_factory=Factory(tmp_path),
+        health=HealthStore(config.health_path, now=lambda: NOW),
+    )
+    reconciled = app.reconcile_prepared()
+
+    assert reconciled == ()
+    assert not (Path(config.artifact_dir) / run_id / "terminal.json").exists()
+
+
+def terminal_payload(config: ResearcherSettings, run_id: str) -> dict[str, object]:
+    path = Path(config.artifact_dir) / run_id / "terminal.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_worker_reconciles_prepared_runs_at_every_cycle_start(tmp_path: Path) -> None:
+    initialize(tmp_path)
+    event_id = add_source(tmp_path)
+    config = settings(tmp_path)
+    _store, first_run = prepare_absent_decision(config, event_id)
+    app = worker(tmp_path, Factory(tmp_path))
+    app.initialize_health()
+
+    asyncio.run(app.run_cycle())
+
+    assert terminal_payload(config, first_run)["content"]["queue_state"] == "absent"
+
+    # A second cycle reconciles again: a run prepared between cycles is
+    # finished at the next cycle start, not only at process startup.
+    _store, second_run = prepare_absent_decision(config, event_id)
+    asyncio.run(app.run_cycle())
+
+    assert terminal_payload(config, second_run)["content"]["queue_state"] == "absent"

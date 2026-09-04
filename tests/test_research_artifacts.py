@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from run4221.ingestion.page_snapshot import PageLink, PageSnapshot
 from run4221.researcher.artifacts import (
+    LEGACY_PRODUCER_DEADLINE_SECONDS,
     ArtifactExistsError,
     ArtifactIntegrityError,
     ArtifactLimitError,
@@ -23,6 +24,22 @@ from run4221.researcher.schemas import (
 )
 
 SOURCE_URL = "https://example.com/marathon"
+
+
+class MutableClock:
+    def __init__(self) -> None:
+        self.now = datetime(2026, 8, 31, 12, 0, tzinfo=UTC)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+def reconcilable_store(tmp_path: Path) -> tuple[ResearchArtifactStore, MutableClock]:
+    clock = MutableClock()
+    return ResearchArtifactStore(tmp_path, now=clock), clock
 
 
 def decision(evidence: ArtifactReference) -> ResearchDecision:
@@ -234,7 +251,7 @@ def test_prepared_decision_requires_committed_evidence_and_refuses_overwrite(
 def test_reconcile_absent_prepared_decision_records_truthful_terminal(
     tmp_path: Path,
 ) -> None:
-    store = ResearchArtifactStore(tmp_path)
+    store, clock = reconcilable_store(tmp_path)
     run_id = store.create_run(job_type="refresh")
     evidence = write_registration_evidence(store, run_id)
     prepared = store.prepare_decision(
@@ -243,6 +260,7 @@ def test_reconcile_absent_prepared_decision_records_truthful_terminal(
         decision=decision(evidence),
         committed_status=committed_status(),
     )
+    clock.advance(2 * LEGACY_PRODUCER_DEADLINE_SECONDS)
 
     results = store.reconcile_prepared(
         lambda found: QueueResolution.absent()
@@ -281,7 +299,7 @@ def test_reconcile_committed_after_finalize_crash_records_one_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store = ResearchArtifactStore(tmp_path)
+    store, clock = reconcilable_store(tmp_path)
     run_id = store.create_run(job_type="refresh")
     evidence = write_registration_evidence(store, run_id)
     prepared = store.prepare_decision(
@@ -289,7 +307,9 @@ def test_reconcile_committed_after_finalize_crash_records_one_terminal(
         source_url=SOURCE_URL,
         decision=decision(evidence),
         committed_status=committed_status(),
+        producer_deadline_seconds=90,
     )
+    clock.advance(180)
     real_link = os.link
     failed = False
 
@@ -326,7 +346,7 @@ def test_reconcile_committed_after_finalize_crash_records_one_terminal(
 
 
 def test_inconclusive_reconciliation_does_not_invent_terminal_state(tmp_path: Path) -> None:
-    store = ResearchArtifactStore(tmp_path)
+    store, clock = reconcilable_store(tmp_path)
     run_id = store.create_run(job_type="refresh")
     evidence = write_registration_evidence(store, run_id)
     store.prepare_decision(
@@ -334,7 +354,9 @@ def test_inconclusive_reconciliation_does_not_invent_terminal_state(tmp_path: Pa
         source_url=SOURCE_URL,
         decision=decision(evidence),
         committed_status=committed_status(),
+        producer_deadline_seconds=90,
     )
+    clock.advance(180)
 
     results = store.reconcile_prepared(
         lambda _prepared: QueueResolution.inconclusive("database unavailable")
@@ -351,3 +373,86 @@ def test_inconclusive_reconciliation_does_not_invent_terminal_state(tmp_path: Pa
         lambda _prepared: QueueResolution.inconclusive("still unavailable")
     )
     assert repeated[0].reconciliation_reference == results[0].reconciliation_reference
+
+
+def test_prepared_run_stamps_producer_deadline_into_prepared_json(tmp_path: Path) -> None:
+    store = ResearchArtifactStore(tmp_path)
+    run_id = store.create_run(job_type="refresh")
+    evidence = write_registration_evidence(store, run_id)
+
+    prepared = store.prepare_decision(
+        run_id,
+        source_url=SOURCE_URL,
+        decision=decision(evidence),
+        committed_status=committed_status(),
+        producer_deadline_seconds=90,
+    )
+
+    payload = store.read_artifact(prepared)
+    assert payload["content"]["producer_deadline_seconds"] == 90.0
+    with pytest.raises(ArtifactLimitError, match="Producer deadline"):
+        another_run = store.create_run(job_type="refresh")
+        store.prepare_decision(
+            another_run,
+            source_url=SOURCE_URL,
+            decision=decision(write_registration_evidence(store, another_run)),
+            committed_status=committed_status(),
+            producer_deadline_seconds=0,
+        )
+
+
+def test_reconcile_skips_prepared_run_younger_than_twice_its_stamped_cap(
+    tmp_path: Path,
+) -> None:
+    store, clock = reconcilable_store(tmp_path)
+    run_id = store.create_run(job_type="refresh")
+    evidence = write_registration_evidence(store, run_id)
+    store.prepare_decision(
+        run_id,
+        source_url=SOURCE_URL,
+        decision=decision(evidence),
+        committed_status=committed_status(),
+        producer_deadline_seconds=90,
+    )
+
+    resolver_calls: list[object] = []
+
+    def resolve(prepared: object) -> QueueResolution:
+        resolver_calls.append(prepared)
+        return QueueResolution.absent()
+
+    clock.advance(179)
+    assert store.reconcile_prepared(resolve) == ()
+    assert resolver_calls == []
+    assert not (tmp_path / run_id / "terminal.json").exists()
+
+    clock.advance(1)  # exactly twice the stamped cap: no longer in-flight
+    results = store.reconcile_prepared(resolve)
+
+    assert len(results) == 1
+    assert results[0].state is QueueResolutionState.ABSENT
+    assert len(resolver_calls) == 1
+    assert (tmp_path / run_id / "terminal.json").exists()
+
+
+def test_reconcile_uses_conservative_default_for_legacy_prepared_files(
+    tmp_path: Path,
+) -> None:
+    store, clock = reconcilable_store(tmp_path)
+    run_id = store.create_run(job_type="refresh")
+    evidence = write_registration_evidence(store, run_id)
+    store.prepare_decision(
+        run_id,
+        source_url=SOURCE_URL,
+        decision=decision(evidence),
+        committed_status=committed_status(),
+    )
+
+    clock.advance(2 * LEGACY_PRODUCER_DEADLINE_SECONDS - 1)
+    assert store.reconcile_prepared(lambda _prepared: QueueResolution.absent()) == ()
+
+    clock.advance(1)
+    results = store.reconcile_prepared(lambda _prepared: QueueResolution.absent())
+
+    assert len(results) == 1
+    assert results[0].state is QueueResolutionState.ABSENT

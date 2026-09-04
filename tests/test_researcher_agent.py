@@ -178,6 +178,126 @@ def valid_update_decision() -> dict[str, object]:
     }
 
 
+def valid_profile_decision(*, page_is_event: bool = True) -> dict[str, object]:
+    return {
+        "action": "profile_event",
+        "summary": "The captured page is the event's own page.",
+        "confidence": 0.9,
+        "page_is_event": page_is_event,
+        "draft": {
+            "source_url": "https://example.com/marathon",
+            "name": "Example Marathon",
+            "city": "Karlsruhe",
+            "country": "Germany",
+            "timezone": "Europe/Berlin",
+            "event_date": "2027-09-19",
+            "distances": ["marathon"],
+            "regions": ["eu", "de"],
+            "official_url": "https://example.com/marathon",
+            "registration_url": "https://example.com/register",
+            "registration_url_candidates": [
+                {"url": "https://example.com/register", "link_text": "Register"}
+            ],
+            "summary": "Official page for the Example Marathon 2027.",
+            "confidence": 0.9,
+        },
+    }
+
+
+def test_profile_assessment_returns_cited_profile_draft() -> None:
+    result = assess_decision(valid_profile_decision(), mode="profile")
+
+    assert result.state is AgentRunState.SUCCEEDED
+    assert result.decision is not None
+    assert result.decision.action == "profile_event"
+    assert result.decision.page_is_event is True
+    assert result.decision.draft is not None
+    assert result.decision.draft.name == "Example Marathon"
+    assert result.decision.draft.registration_url_candidates[0].as_pair == (
+        "https://example.com/register",
+        "Register",
+    )
+    assert result.decision.evidence == [artifact_reference()]
+
+
+def test_profile_assessment_rejects_evidence_request_branch() -> None:
+    outcome = {
+        "action": "request_evidence",
+        "purpose": "registration_status",
+        "query": "Example Marathon official registration status",
+        "gap": "The captured page does not state registration status.",
+    }
+
+    result = assess_decision(outcome, mode="profile")
+
+    assert result.state is AgentRunState.INCONCLUSIVE
+    assert result.error_code == "evidence_validation_failed"
+    assert result.decision is None
+    assert result.evidence_request is None
+
+
+@pytest.mark.parametrize(
+    ("mode", "outcome"),
+    [
+        ("profile", valid_update_decision()),
+        (
+            "profile",
+            {
+                "action": "no_change",
+                "summary": "A refresh-only branch inside a profile assessment.",
+            },
+        ),
+        ("refresh", valid_profile_decision()),
+    ],
+    ids=["profile-propose-update", "profile-no-change", "refresh-profile-event"],
+)
+def test_mode_mismatched_decision_branches_are_rejected(
+    mode: str,
+    outcome: dict[str, object],
+) -> None:
+    result = assess_decision(outcome, mode=mode)
+
+    assert result.state is AgentRunState.INCONCLUSIVE
+    assert result.error_code == "evidence_validation_failed"
+    assert result.decision is None
+
+
+def test_profile_locate_scout_searches_once_without_domain_filter() -> None:
+    runner = FakeRunner(
+        fake_result(
+            ScoutOutput(candidates=(candidate(),)),
+            web_search_calls=1,
+        )
+    )
+    job = ResearchAgentJob(
+        instructions="Locate the official event page.",
+        prompt_reference="research_agent:v1",
+        budget=ResearchBudget(
+            max_web_searches_per_job=2,
+            max_wall_time_seconds_per_job=10,
+        ),
+        runner=runner,
+    )
+
+    result = asyncio.run(
+        job.scout(
+            ScoutRequest(
+                mode="profile",
+                query='"Example Marathon" Karlsruhe Germany official event website',
+                context=(FrozenContextField(name="name", value="Example Marathon"),),
+            )
+        )
+    )
+
+    assert result.state is AgentRunState.SUCCEEDED
+    tool = runner.calls[0]["starting_agent"].tools[0]
+    assert isinstance(tool, WebSearchTool)
+    assert tool.filters is None
+    assert runner.calls[0]["starting_agent"].model_settings.extra_args == {
+        "max_tool_calls": 1
+    }
+
+
 def test_scout_uses_luna_web_search_and_explicit_provider_limits() -> None:
     runner = FakeRunner(
         fake_result(

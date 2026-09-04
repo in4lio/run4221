@@ -62,6 +62,24 @@ def test_researcher_settings_reject_invalid_configuration_without_revealing_key(
     assert secret not in str(error.value)
 
 
+def test_profile_wall_cap_is_shorter_than_refresh_and_env_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = ResearcherSettings(_env_file=None, openai_api_key="test-api-key")
+
+    assert settings.max_wall_time_seconds_per_profile_job == 60
+    assert (
+        settings.max_wall_time_seconds_per_profile_job
+        < settings.max_wall_time_seconds_per_job
+    )
+    assert settings.budget.max_wall_time_seconds_per_profile_job == 60
+
+    monkeypatch.setenv("RESEARCHER_MAX_WALL_TIME_SECONDS_PER_PROFILE_JOB", "45")
+    configured = ResearcherSettings(_env_file=None, openai_api_key="test-api-key")
+
+    assert configured.budget.max_wall_time_seconds_per_profile_job == 45
+
+
 def test_researcher_prompt_loads_from_file(tmp_path: Path) -> None:
     prompts_dir = tmp_path / "prompts"
     prompts_dir.mkdir()

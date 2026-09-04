@@ -23,6 +23,7 @@ from run4221.ingestion.page_snapshot import (
     PageFetchError,
     PageSnapshot,
     blocked_page_reason,
+    fetch_enriched_page_snapshot,
     fetch_page_snapshot,
 )
 from run4221.researcher.agent import (
@@ -40,6 +41,7 @@ from run4221.researcher.schemas import (
     ArtifactReference,
     AssessmentVerdict,
     DecisionAction,
+    EventProfileDraft,
     EventUpdateField,
     EvidenceRequest,
     EvidenceRequestPurpose,
@@ -171,6 +173,15 @@ class SnapshotFetcher(Protocol):
     ) -> Awaitable[PageSnapshot]: ...
 
 
+class EnrichedSnapshotFetcher(Protocol):
+    def __call__(
+        self,
+        url: str,
+        *,
+        max_linked_pages: int,
+    ) -> Awaitable[PageSnapshot]: ...
+
+
 class ResearchAgent(Protocol):
     async def scout(self, request: ScoutRequest) -> ScoutRunResult: ...
 
@@ -185,6 +196,16 @@ class ResearchJobResult:
     queue_reference: str | None = None
 
 
+@dataclass(frozen=True)
+class ProfileJobResult:
+    """One profile run's terminal truth: a cited draft or a typed failure."""
+
+    run_id: str
+    status: ResearchRunStatus
+    terminal_reference: ArtifactReference
+    draft: EventProfileDraft | None = None
+
+
 class ResearcherService:
     """Deterministic bridge from captured evidence to proposal-only queues."""
 
@@ -196,6 +217,7 @@ class ResearcherService:
         agent: ResearchAgent,
         budget: ResearchBudget,
         fetch_snapshot: SnapshotFetcher = fetch_page_snapshot,
+        fetch_enriched_snapshot: EnrichedSnapshotFetcher = fetch_enriched_page_snapshot,
         persist_queue: bool = True,
         on_run_started: Callable[[str], None] | None = None,
     ) -> None:
@@ -204,6 +226,7 @@ class ResearcherService:
         self.agent = agent
         self.budget = budget
         self.fetch_snapshot = fetch_snapshot
+        self.fetch_enriched_snapshot = fetch_enriched_snapshot
         self.persist_queue = persist_queue
         self.on_run_started = on_run_started
 
@@ -496,7 +519,7 @@ class ResearcherService:
                 RunOutcome.INCONCLUSIVE,
                 "Refresh decisions cannot create new-event suggestions.",
             )
-        if not self._valid_refresh_references(decision, captures=tuple(captures)):
+        if not self._valid_cited_references(decision, captures=tuple(captures)):
             return self._finish_without_queue(
                 run_id,
                 source.url,
@@ -545,6 +568,7 @@ class ResearcherService:
             source_url=source.url,
             decision=prepared_decision,
             committed_status=committed_status,
+            producer_deadline_seconds=self.budget.max_wall_time_seconds_per_job,
         )
         cited_captures = _decision_captures(prepared_decision, tuple(captures))
         evidence_lines = _moderation_evidence(
@@ -599,6 +623,259 @@ class ResearcherService:
             committed_status,
             terminal,
             queue_reference=queue_reference,
+        )
+
+    async def profile(self, url: str) -> ProfileJobResult:
+        """Draft one cited event profile from one enriched capture; never touch queues."""
+
+        run_id = self.artifacts.create_run(
+            job_type="profile",
+            metadata={"source_url": url},
+        )
+        self._announce_run(run_id)
+        try:
+            async with asyncio.timeout(self.budget.max_wall_time_seconds_per_profile_job):
+                return await self._profile_started(run_id, url)
+        except TimeoutError:
+            return self._finish_profile(
+                run_id,
+                url,
+                RunState.CAPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Profile wall-time budget was exhausted.",
+            )
+
+    async def _profile_started(self, run_id: str, url: str) -> ProfileJobResult:
+        try:
+            captured = await self._capture_enriched(run_id, url)
+        except PageFetchError as error:
+            return self._finish_profile(
+                run_id,
+                url,
+                RunState.FAILED,
+                RunOutcome.INCONCLUSIVE,
+                f"Profile page capture failed ({type(error).__name__}).",
+            )
+        if reason := blocked_page_reason(captured.snapshot):
+            return self._finish_profile(
+                run_id,
+                url,
+                RunState.SKIPPED,
+                RunOutcome.INCONCLUSIVE,
+                f"Profile page was unusable: {reason}.",
+            )
+
+        decision, failure = await self._profile_assessment(
+            run_id,
+            url,
+            captured,
+            context=(FrozenContextField(name="requested_url", value=url),),
+        )
+        if failure is not None:
+            return failure
+        assert decision is not None
+        if decision.page_is_event is not False:
+            return self._finish_profile_draft(run_id, url, decision)
+
+        # The captured page is not the event's own page: run exactly one
+        # bounded locating search, capture the official page, assess once more.
+        assert decision.draft is not None
+        if self.budget.max_web_searches_per_job < 1:
+            return self._finish_profile(
+                run_id,
+                url,
+                RunState.CAPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Profile locate-search budget was exhausted.",
+            )
+        context = _profile_locate_context(url, decision.draft)
+        scout = await self.agent.scout(
+            ScoutRequest(
+                mode="profile",
+                query=_locate_profile_query(decision.draft),
+                context=context,
+            )
+        )
+        self._record_scout(run_id, url, scout)
+        if scout.state is not AgentRunState.SUCCEEDED:
+            return self._finish_profile_agent_outcome(run_id, url, scout)
+        if scout.metadata.web_search_calls > 1:
+            return self._finish_profile(
+                run_id,
+                url,
+                RunState.CAPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Profile scout exceeded its one-search provider cap.",
+            )
+        official_url = _locate_candidate_url(
+            scout.candidates,
+            captured_urls=frozenset(
+                {normalize_url(url), normalize_url(captured.snapshot.final_url)}
+            ),
+        )
+        if official_url is None:
+            return self._finish_profile(
+                run_id,
+                url,
+                RunState.SKIPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Locating search produced no new official-page candidate.",
+            )
+        try:
+            official = await self._capture_enriched(run_id, official_url)
+        except PageFetchError as error:
+            return self._finish_profile(
+                run_id,
+                url,
+                RunState.FAILED,
+                RunOutcome.INCONCLUSIVE,
+                f"Official page capture failed ({type(error).__name__}).",
+            )
+        if reason := blocked_page_reason(official.snapshot):
+            return self._finish_profile(
+                run_id,
+                url,
+                RunState.SKIPPED,
+                RunOutcome.INCONCLUSIVE,
+                f"Official page was unusable: {reason}.",
+            )
+        located_decision, failure = await self._profile_assessment(
+            run_id,
+            url,
+            official,
+            context=context,
+        )
+        if failure is not None:
+            return failure
+        assert located_decision is not None
+        if located_decision.page_is_event is False:
+            return self._finish_profile(
+                run_id,
+                url,
+                RunState.SKIPPED,
+                RunOutcome.INCONCLUSIVE,
+                "The located page still was not the event's own page.",
+            )
+        return self._finish_profile_draft(run_id, url, located_decision)
+
+    async def _profile_assessment(
+        self,
+        run_id: str,
+        url: str,
+        capture: CapturedPage,
+        *,
+        context: tuple[FrozenContextField, ...],
+    ) -> tuple[ResearchDecision | None, ProfileJobResult | None]:
+        assessment = await self.agent.assess(
+            AssessmentRequest(
+                mode="profile",
+                context=context,
+                evidence=(capture.as_agent_evidence(),),
+            )
+        )
+        self._record_assessment(run_id, url, assessment)
+        if assessment.state is not AgentRunState.SUCCEEDED or assessment.decision is None:
+            return None, self._finish_profile_agent_outcome(run_id, url, assessment)
+        try:
+            decision = ResearchDecision.model_validate(
+                assessment.decision.model_dump(mode="python")
+            )
+        except Exception:
+            return None, self._finish_profile(
+                run_id,
+                url,
+                RunState.SKIPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Terminal decision failed host schema validation.",
+            )
+        if decision.action is DecisionAction.INCONCLUSIVE:
+            return None, self._finish_profile(
+                run_id,
+                url,
+                RunState.SKIPPED,
+                RunOutcome.INCONCLUSIVE,
+                decision.summary,
+            )
+        if decision.action is not DecisionAction.PROFILE_EVENT or decision.draft is None:
+            return None, self._finish_profile(
+                run_id,
+                url,
+                RunState.SKIPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Profile assessments can only profile the captured page.",
+            )
+        if not self._valid_cited_references(decision, captures=(capture,)):
+            return None, self._finish_profile(
+                run_id,
+                url,
+                RunState.SKIPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Profile decision cited uncaptured or unverifiable evidence.",
+            )
+        return decision, None
+
+    async def _capture_enriched(self, run_id: str, url: str) -> CapturedPage:
+        # The root fetch plus every enrichment sub-fetch must stay inside the
+        # static-page budget for the whole job.
+        max_linked_pages = max(0, self.budget.max_static_pages_per_job - 1)
+        try:
+            snapshot = await self.fetch_enriched_snapshot(
+                url,
+                max_linked_pages=max_linked_pages,
+            )
+        except PageFetchError:
+            raise
+        except Exception as error:
+            raise PageFetchError("Page capture failed.") from error
+        reference = self.artifacts.write_page_snapshot(run_id, snapshot)
+        return CapturedPage(snapshot=snapshot, reference=reference)
+
+    def _finish_profile(
+        self,
+        run_id: str,
+        source_url: str,
+        state: RunState,
+        outcome: RunOutcome,
+        detail: str,
+    ) -> ProfileJobResult:
+        status = ResearchRunStatus(status=state, outcome=outcome, detail=detail[:1_000])
+        terminal = self.artifacts.finalize_without_queue(
+            run_id,
+            source_url=source_url,
+            status=status,
+        )
+        return ProfileJobResult(run_id, status, terminal)
+
+    def _finish_profile_draft(
+        self,
+        run_id: str,
+        source_url: str,
+        decision: ResearchDecision,
+    ) -> ProfileJobResult:
+        status = ResearchRunStatus(
+            status=RunState.SUCCEEDED,
+            outcome=RunOutcome.PROFILE_COMPLETED,
+            detail=decision.summary[:1_000],
+        )
+        terminal = self.artifacts.finalize_without_queue(
+            run_id,
+            source_url=source_url,
+            status=status,
+        )
+        return ProfileJobResult(run_id, status, terminal, draft=decision.draft)
+
+    def _finish_profile_agent_outcome(
+        self,
+        run_id: str,
+        source_url: str,
+        result: ScoutRunResult | AssessmentRunResult,
+    ) -> ProfileJobResult:
+        return self._finish_profile(
+            run_id,
+            source_url,
+            _AGENT_TERMINAL_STATES[result.state],
+            RunOutcome.INCONCLUSIVE,
+            result.detail or result.error_code or "Agent returned no usable decision.",
         )
 
     async def _capture(
@@ -675,7 +952,7 @@ class ResearcherService:
         captures: tuple[CapturedPage, ...],
         event: TrackedEvent,
     ) -> bool:
-        if decision.conflicts or not self._valid_refresh_references(decision, captures=captures):
+        if decision.conflicts or not self._valid_cited_references(decision, captures=captures):
             return False
         cited = set(decision.evidence)
         qualified = _qualified_capture_references(captures, event)
@@ -721,7 +998,7 @@ class ResearcherService:
         except Exception:
             return None
 
-    def _valid_refresh_references(
+    def _valid_cited_references(
         self,
         decision: ResearchDecision,
         *,
@@ -749,16 +1026,10 @@ class ResearcherService:
         source_url: str,
         result: ScoutRunResult | AssessmentRunResult,
     ) -> ResearchJobResult:
-        state = {
-            AgentRunState.SUCCEEDED: RunState.SKIPPED,
-            AgentRunState.FAILED: RunState.FAILED,
-            AgentRunState.CAPPED: RunState.CAPPED,
-            AgentRunState.INCONCLUSIVE: RunState.SKIPPED,
-        }[result.state]
         return self._finish_without_queue(
             run_id,
             source_url,
-            state,
+            _AGENT_TERMINAL_STATES[result.state],
             RunOutcome.INCONCLUSIVE,
             result.detail or result.error_code or "Agent returned no usable decision.",
         )
@@ -790,6 +1061,47 @@ class ResearcherService:
         status = ResearchRunStatus(status=state, outcome=outcome, detail=detail)
         terminal = self.artifacts.finalize_uncommitted(prepared, status=status)
         return ResearchJobResult(prepared.run_id, status, terminal)
+
+
+_AGENT_TERMINAL_STATES = {
+    AgentRunState.SUCCEEDED: RunState.SKIPPED,
+    AgentRunState.FAILED: RunState.FAILED,
+    AgentRunState.CAPPED: RunState.CAPPED,
+    AgentRunState.INCONCLUSIVE: RunState.SKIPPED,
+}
+
+
+def _locate_profile_query(draft: EventProfileDraft) -> str:
+    year = draft.event_date[:4] if draft.event_date else ""
+    parts = (f'"{draft.name}"', draft.city, draft.country, year, "official event website")
+    return " ".join(part for part in parts if part)[:500]
+
+
+def _profile_locate_context(
+    url: str,
+    draft: EventProfileDraft,
+) -> tuple[FrozenContextField, ...]:
+    values = {
+        "requested_url": url,
+        "name": draft.name,
+        "city": draft.city,
+        "country": draft.country,
+        "event_date": draft.event_date or "",
+        "distances": ", ".join(draft.distances),
+    }
+    return tuple(FrozenContextField(name=name, value=str(value)) for name, value in values.items())
+
+
+def _locate_candidate_url(
+    candidates: tuple[ResearchCandidate, ...],
+    *,
+    captured_urls: frozenset[str],
+) -> str | None:
+    for candidate in candidates:
+        if normalize_url(candidate.source_url) in captured_urls:
+            continue
+        return candidate.source_url
+    return None
 
 
 @dataclass(frozen=True)

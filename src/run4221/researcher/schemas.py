@@ -42,6 +42,49 @@ class ResearchCandidate(ResearchSchema):
     _validate_source_url = field_validator("source_url")(validate_http_url)
 
 
+class RegistrationLinkCandidate(ResearchSchema):
+    """One (url, link_text) registration-link pair surfaced for the moderator flow."""
+
+    url: Annotated[str, Field(min_length=1, max_length=2_048)]
+    link_text: Annotated[str, Field(max_length=240)] = ""
+
+    _validate_url = field_validator("url")(validate_http_url)
+
+    @property
+    def as_pair(self) -> tuple[str, str]:
+        return (self.url, self.link_text)
+
+
+class EventProfileDraft(ResearchSchema):
+    """A cited, human-confirmable event profile drafted from one captured page."""
+
+    source_url: Annotated[str, Field(min_length=1, max_length=2_048)]
+    name: ShortText
+    public_id: ShortText | None = None
+    city: ShortText
+    country: ShortText
+    timezone: ShortText
+    event_date: Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")] | None = None
+    distances: Annotated[tuple[ShortText, ...], Field(max_length=12)] = ()
+    regions: Annotated[tuple[ShortText, ...], Field(max_length=12)] = ()
+    official_url: Annotated[str, Field(min_length=1, max_length=2_048)]
+    registration_url: Annotated[str, Field(min_length=1, max_length=2_048)] | None = None
+    registration_url_candidates: Annotated[
+        tuple[RegistrationLinkCandidate, ...],
+        Field(max_length=8),
+    ] = ()
+    summary: SummaryText
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    _validate_source_url = field_validator("source_url")(validate_http_url)
+    _validate_official_url = field_validator("official_url")(validate_http_url)
+
+    @field_validator("registration_url")
+    @classmethod
+    def validate_registration_url(cls, value: str | None) -> str | None:
+        return None if value is None else validate_http_url(value)
+
+
 class AssessmentVerdict(StrEnum):
     CONFIRMED = "confirmed"
     REJECTED = "rejected"
@@ -145,6 +188,7 @@ class DecisionAction(StrEnum):
     NO_CHANGE = "no_change"
     PROPOSE_UPDATE = "propose_update"
     INCONCLUSIVE = "inconclusive"
+    PROFILE_EVENT = "profile_event"
 
 
 class EvidenceRequestPurpose(StrEnum):
@@ -274,6 +318,12 @@ class AssessorUpdateDecision(AssessorTerminalDecision):
         return self
 
 
+class AssessorProfileDecision(AssessorTerminalDecision):
+    action: Literal[DecisionAction.PROFILE_EVENT]
+    draft: EventProfileDraft
+    page_is_event: bool = True
+
+
 class EvidenceRequest(ResearchSchema):
     action: Literal["request_evidence"]
     purpose: EvidenceRequestPurpose
@@ -282,12 +332,12 @@ class EvidenceRequest(ResearchSchema):
 
 
 AssessorDecision = Annotated[
-    AssessorNoPayloadDecision | AssessorUpdateDecision,
+    AssessorNoPayloadDecision | AssessorUpdateDecision | AssessorProfileDecision,
     Field(discriminator="action"),
 ]
 
 AssessorOutcome = Annotated[
-    AssessorNoPayloadDecision | AssessorUpdateDecision | EvidenceRequest,
+    AssessorNoPayloadDecision | AssessorUpdateDecision | AssessorProfileDecision | EvidenceRequest,
     Field(discriminator="action"),
 ]
 
@@ -344,6 +394,8 @@ class ResearchDecision(ResearchSchema):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     candidate: ResearchCandidate | None = None
     proposed_fields: ProposedEventChanges | None = None
+    draft: EventProfileDraft | None = None
+    page_is_event: bool | None = None
     evidence: Annotated[list[ArtifactReference], Field(max_length=8)] = Field(default_factory=list)
     uncertainty: SummaryText | None = None
     applicability: Annotated[
@@ -407,6 +459,11 @@ class ResearchDecision(ResearchSchema):
             raise ValueError("Non-persisting actions cannot include a queue payload.")
         if self.action is not DecisionAction.PROPOSE_UPDATE and self.field_support:
             raise ValueError("Only propose_update can include field_support.")
+        if self.action is DecisionAction.PROFILE_EVENT:
+            if self.draft is None:
+                raise ValueError("profile_event requires a draft.")
+        elif self.draft is not None or self.page_is_event is not None:
+            raise ValueError("Only profile_event can include a profile draft payload.")
         return self
 
 
@@ -420,6 +477,7 @@ class ResearchBudget(ResearchSchema):
     max_retries_per_job: int = Field(default=2, ge=0, le=10)
     max_output_tokens_per_job: int = Field(default=2_000, ge=128, le=16_000)
     max_wall_time_seconds_per_job: int = Field(default=90, ge=10, le=900)
+    max_wall_time_seconds_per_profile_job: int = Field(default=60, ge=10, le=900)
     max_pending_suggestions: int = Field(
         default=RESEARCHER_MAX_PENDING_SUGGESTIONS,
         ge=0,
@@ -439,6 +497,7 @@ class RunOutcome(StrEnum):
     NO_CHANGE = "no_change"
     PROPOSAL_CREATED = "proposal_created"
     INCONCLUSIVE = "inconclusive"
+    PROFILE_COMPLETED = "profile_completed"
 
 
 class ResearchRunStatus(ResearchSchema):

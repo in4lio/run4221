@@ -32,6 +32,7 @@ from run4221.researcher.schemas import (
     ArtifactReference,
     AssessorOutcome,
     AssessorTerminalDecision,
+    DecisionAction,
     EvidenceRequest,
     ResearchBudget,
     ResearchCandidate,
@@ -92,7 +93,7 @@ class FrozenContextField(ResearchSchema):
 
 
 class ScoutRequest(ResearchSchema):
-    mode: Literal["refresh"]
+    mode: Literal["refresh", "profile"]
     query: Annotated[str, Field(min_length=1, max_length=500)]
     approved_source_url: Annotated[str, Field(max_length=2_048)] | None = None
     context: Annotated[tuple[FrozenContextField, ...], Field(max_length=MAX_CONTEXT_FIELDS)] = ()
@@ -130,7 +131,7 @@ class CapturedSnapshotEvidence(ResearchSchema):
 
 
 class AssessmentRequest(ResearchSchema):
-    mode: Literal["refresh"]
+    mode: Literal["refresh", "profile"]
     context: Annotated[tuple[FrozenContextField, ...], Field(max_length=MAX_CONTEXT_FIELDS)] = ()
     evidence: Annotated[
         tuple[CapturedSnapshotEvidence, ...],
@@ -139,6 +140,22 @@ class AssessmentRequest(ResearchSchema):
 
 
 _ASSESSOR_OUTCOME_ADAPTER = TypeAdapter(AssessorOutcome)
+
+_ALLOWED_DECISION_ACTIONS: dict[str, frozenset[DecisionAction]] = {
+    "refresh": frozenset(
+        {
+            DecisionAction.NO_CHANGE,
+            DecisionAction.PROPOSE_UPDATE,
+            DecisionAction.INCONCLUSIVE,
+        }
+    ),
+    "profile": frozenset(
+        {
+            DecisionAction.PROFILE_EVENT,
+            DecisionAction.INCONCLUSIVE,
+        }
+    ),
+}
 
 
 class AgentRunState(StrEnum):
@@ -339,6 +356,16 @@ class ResearchAgentJob:
             )
 
         if isinstance(assessed, EvidenceRequest):
+            if request.mode != "refresh":
+                # A profile assessment is a single pass and never opens an
+                # evidence loop; treat the wrong branch exactly like other
+                # host-validation failures.
+                return AssessmentRunResult(
+                    state=AgentRunState.INCONCLUSIVE,
+                    metadata=metadata,
+                    error_code="evidence_validation_failed",
+                    detail=_SAFE_DETAILS["evidence_validation_failed"],
+                )
             return AssessmentRunResult(
                 state=AgentRunState.SUCCEEDED,
                 metadata=metadata,
@@ -348,6 +375,14 @@ class ResearchAgentJob:
         try:
             decision = _resolve_assessor_decision(assessed, request)
         except (TypeError, ValueError, ValidationError):
+            return AssessmentRunResult(
+                state=AgentRunState.INCONCLUSIVE,
+                metadata=metadata,
+                error_code="evidence_validation_failed",
+                detail=_SAFE_DETAILS["evidence_validation_failed"],
+            )
+
+        if decision.action not in _ALLOWED_DECISION_ACTIONS[request.mode]:
             return AssessmentRunResult(
                 state=AgentRunState.INCONCLUSIVE,
                 metadata=metadata,
@@ -367,8 +402,19 @@ class ResearchAgentJob:
         request: ScoutRequest,
     ) -> Agent[None]:
         assert limits.max_tool_calls is not None
-        assert request.approved_source_url is not None
-        allowed_domains = [source_domain(request.approved_source_url)]
+        if request.approved_source_url is not None:
+            search_tool = WebSearchTool(
+                filters={"allowed_domains": [source_domain(request.approved_source_url)]},
+                search_context_size="low",
+                external_web_access=True,
+            )
+        else:
+            # Profile-locate: one open search for the official page of the
+            # event named in the frozen context.
+            search_tool = WebSearchTool(
+                search_context_size="low",
+                external_web_access=True,
+            )
         return Agent(
             name="Run4221 event scout",
             instructions=(
@@ -377,13 +423,7 @@ class ResearchAgentJob:
                 f"{self.budget.policy.max_candidates_per_cycle}.\n\n"
             ),
             model=self.model,
-            tools=[
-                WebSearchTool(
-                    filters={"allowed_domains": allowed_domains},
-                    search_context_size="low",
-                    external_web_access=True,
-                )
-            ],
+            tools=[search_tool],
             output_type=ScoutOutput,
             model_settings=ModelSettings(
                 parallel_tool_calls=False,

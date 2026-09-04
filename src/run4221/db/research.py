@@ -137,6 +137,47 @@ def get_research_source(
         )
 
 
+def get_refresh_source(
+    event_id: str,
+    *,
+    database_url: str | None = None,
+) -> ResearchSourceRecord | None:
+    """Return the active registration_page source when present, else top priority.
+
+    A one-shot refresh watches where registration actually happens; the
+    registration page outranks the official site whenever both are active.
+    """
+
+    normalized_event_id = normalize_event_id(event_id)
+    ensure_database_schema(database_url)
+    with session_scope(database_url) as session:
+        source = session.scalar(
+            select(models.EventSource)
+            .join(models.Event, models.Event.id == models.EventSource.event_id)
+            .where(
+                models.EventSource.event_id == normalized_event_id,
+                models.EventSource.active.is_(True),
+                models.Event.removed_at.is_(None),
+                models.Event.status == "monitoring",
+            )
+            .order_by(
+                models.EventSource.source_type != "registration_page",
+                models.EventSource.priority,
+                models.EventSource.id,
+            )
+            .limit(1)
+        )
+        if source is None:
+            return None
+        event = session.scalar(base_event_query().where(models.Event.id == source.event_id))
+        assert event is not None
+        return ResearchSourceRecord(
+            source_id=source.id,
+            event=event_to_domain(event),
+            url=source.url,
+        )
+
+
 def find_research_queue_reference(
     queue_kind: ResearchQueueKind,
     *,
