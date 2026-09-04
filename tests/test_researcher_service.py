@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -11,6 +12,7 @@ from pathlib import Path
 from run4221.db.repository import (
     EventCreate,
     add_event,
+    count_event_suggestions,
     count_proposed_event_updates,
     find_event,
     list_proposed_event_updates,
@@ -20,6 +22,7 @@ from run4221.ingestion.page_snapshot import (
     PageFetchError,
     PageLink,
     PageSnapshot,
+    fetch_enriched_page_snapshot,
     fetch_page_snapshot,
 )
 from run4221.researcher.agent import (
@@ -30,12 +33,17 @@ from run4221.researcher.agent import (
 )
 from run4221.researcher.artifacts import ResearchArtifactStore
 from run4221.researcher.schemas import (
+    EventProfileDraft,
     EvidenceRequest,
     ResearchBudget,
     ResearchCandidate,
     ResearchDecision,
 )
-from run4221.researcher.service import ResearcherService, ResearchJobResult
+from run4221.researcher.service import (
+    ProfileJobResult,
+    ResearcherService,
+    ResearchJobResult,
+)
 
 
 def database_url(tmp_path: Path, *, query: str = "") -> str:
@@ -298,6 +306,11 @@ def test_ae1_refresh_creates_proposal_without_mutating_event(tmp_path: Path) -> 
     assert any("researcher-decision:v1" in line for line in updates[0].evidence)
     assert any("stored approved event source" in line for line in updates[0].evidence)
     assert any("captured_at=2026-08-31T14:00:00+00:00" in line for line in updates[0].evidence)
+    prepared_payload = json.loads(
+        (tmp_path / "runs" / result.run_id / "prepared.json").read_text(encoding="utf-8")
+    )
+    # KTD9: the producing run stamps its own wall cap into prepared.json.
+    assert prepared_payload["content"]["producer_deadline_seconds"] == 10.0
 
 
 def test_refresh_discards_unchanged_echoed_fields_and_their_support(tmp_path: Path) -> None:
@@ -1740,6 +1753,371 @@ def test_refresh_still_rejects_mini_marathon_evidence_for_mixed_distance_event(
 
     assert result.status.status == "skipped"
     assert result.status.outcome == "inconclusive"
+    assert count_proposed_event_updates(database_url=url) == 0
+
+
+PROFILE_URL = "https://news.example/karlsruhe-marathon-report"
+OFFICIAL_URL = "https://baden.example/events/marathon"
+
+
+def profile_draft_payload(source_url: str) -> dict[str, object]:
+    return {
+        "source_url": source_url,
+        "name": "Baden Marathon",
+        "public_id": "badenmarathon.42",
+        "city": "Karlsruhe",
+        "country": "Germany",
+        "timezone": "Europe/Berlin",
+        "event_date": "2027-09-19",
+        "distances": ("marathon",),
+        "regions": ("global", "eu", "de"),
+        "official_url": OFFICIAL_URL,
+        "registration_url": "https://baden.example/registration",
+        "registration_url_candidates": (
+            {"url": "https://baden.example/registration", "link_text": "Registration"},
+        ),
+        "summary": "The captured page profiles the Baden Marathon 2027.",
+        "confidence": 0.9,
+    }
+
+
+def profile_decision(request, *, page_is_event: bool = True) -> ResearchDecision:
+    evidence = request.evidence[0]
+    return ResearchDecision.model_validate(
+        {
+            "action": "profile_event",
+            "summary": "The captured page yields a grounded event profile.",
+            "confidence": 0.9,
+            "draft": profile_draft_payload(evidence.final_url),
+            "page_is_event": page_is_event,
+            "evidence": [evidence.reference],
+        }
+    )
+
+
+def profile_service(
+    tmp_path: Path,
+    *,
+    url: str,
+    agent: FakeAgent,
+    fetch,
+    budget: ResearchBudget | None = None,
+    persist_queue: bool = True,
+    enriched_calls: list[tuple[str, int]] | None = None,
+) -> ResearcherService:
+    async def fetch_enriched(source_url: str, *, max_linked_pages: int) -> PageSnapshot:
+        if enriched_calls is not None:
+            enriched_calls.append((source_url, max_linked_pages))
+        return await fetch(source_url)
+
+    return ResearcherService(
+        database_url=url,
+        artifacts=ResearchArtifactStore(tmp_path / "runs"),
+        agent=agent,
+        budget=budget
+        or ResearchBudget(
+            max_wall_time_seconds_per_job=10,
+            max_wall_time_seconds_per_profile_job=10,
+        ),
+        fetch_enriched_snapshot=fetch_enriched,
+        persist_queue=persist_queue,
+    )
+
+
+def test_default_profile_fetcher_is_the_dedicated_enriched_seam() -> None:
+    parameters = inspect.signature(ResearcherService).parameters
+
+    assert parameters["fetch_enriched_snapshot"].default is fetch_enriched_page_snapshot
+    # The dedicated seam leaves the pinned single-page refresh seam untouched.
+    assert parameters["fetch_snapshot"].default is fetch_page_snapshot
+
+
+def test_ae1_profile_grounded_event_page_yields_cited_draft(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    agent = FakeAgent(decide=profile_decision)
+    enriched_calls: list[tuple[str, int]] = []
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url, title="Baden Marathon 2027")
+
+    result = asyncio.run(
+        profile_service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=fetch,
+            enriched_calls=enriched_calls,
+        ).profile(OFFICIAL_URL)
+    )
+
+    assert isinstance(result, ProfileJobResult)
+    assert result.status.status == "succeeded"
+    assert result.status.outcome == "profile_completed"
+    assert isinstance(result.draft, EventProfileDraft)
+    assert result.draft.name == "Baden Marathon"
+    assert result.draft.official_url == OFFICIAL_URL
+    assert result.draft.registration_url_candidates[0].as_pair == (
+        "https://baden.example/registration",
+        "Registration",
+    )
+    # One merged enriched capture, assessed once, with zero locating searches.
+    assert enriched_calls == [(OFFICIAL_URL, 3)]
+    assert agent.scout_calls == []
+    assert len(agent.assessment_calls) == 1
+    assert agent.assessment_calls[0].mode == "profile"
+    assert len(agent.assessment_calls[0].evidence) == 1
+
+
+def test_ae2_blocked_profile_page_terminates_inconclusive_without_draft(
+    tmp_path: Path,
+) -> None:
+    url = database_url(tmp_path)
+    agent = FakeAgent(decide=profile_decision)
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url, status_code=403, text="Access denied by protection.")
+
+    result = asyncio.run(
+        profile_service(tmp_path, url=url, agent=agent, fetch=fetch).profile(OFFICIAL_URL)
+    )
+
+    assert result.status.status == "skipped"
+    assert result.status.outcome == "inconclusive"
+    assert "unusable" in (result.status.detail or "")
+    assert result.draft is None
+    assert agent.assessment_calls == []
+
+
+def test_ae2_wrong_event_profile_assessment_terminates_inconclusive_with_reason(
+    tmp_path: Path,
+) -> None:
+    url = database_url(tmp_path)
+    reason = "The captured page describes a different event than requested."
+    agent = FakeAgent(
+        decide=lambda request: ResearchDecision(
+            action="inconclusive",
+            summary=reason,
+            evidence=[request.evidence[0].reference],
+        )
+    )
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url, title="Some Other Race")
+
+    result = asyncio.run(
+        profile_service(tmp_path, url=url, agent=agent, fetch=fetch).profile(PROFILE_URL)
+    )
+
+    assert result.status.status == "skipped"
+    assert result.status.outcome == "inconclusive"
+    assert result.status.detail == reason
+    assert result.draft is None
+
+
+def test_profile_wall_cap_applies_not_refresh_cap(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    agent = FakeAgent(decide=profile_decision)
+    budget = ResearchBudget(max_wall_time_seconds_per_job=900).model_copy(
+        update={"max_wall_time_seconds_per_profile_job": 0.01}
+    )
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        await asyncio.sleep(0.05)
+        return snapshot(source_url)
+
+    result = asyncio.run(
+        profile_service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=fetch,
+            budget=budget,
+        ).profile(OFFICIAL_URL)
+    )
+
+    assert result.status.status == "capped"
+    assert result.status.outcome == "inconclusive"
+    assert result.status.detail == "Profile wall-time budget was exhausted."
+    assert result.draft is None
+    assert agent.assessment_calls == []
+
+
+def test_profile_writes_no_queue_rows_even_with_persist_queue_true(
+    tmp_path: Path,
+) -> None:
+    url = database_url(tmp_path)
+    add_event(event_payload(), database_url=url)
+    agent = FakeAgent(decide=profile_decision)
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url)
+
+    result = asyncio.run(
+        profile_service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=fetch,
+            persist_queue=True,
+        ).profile(OFFICIAL_URL)
+    )
+
+    assert result.status.outcome == "profile_completed"
+    assert count_proposed_event_updates(database_url=url) == 0
+    assert count_event_suggestions(database_url=url) == 0
+
+
+def test_profile_enrichment_sub_fetches_stay_inside_static_page_budget(
+    tmp_path: Path,
+) -> None:
+    url = database_url(tmp_path)
+    agent = FakeAgent(decide=profile_decision)
+    enriched_calls: list[tuple[str, int]] = []
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url)
+
+    result = asyncio.run(
+        profile_service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=fetch,
+            budget=ResearchBudget(
+                max_static_pages_per_job=2,
+                max_wall_time_seconds_per_job=10,
+                max_wall_time_seconds_per_profile_job=10,
+            ),
+            enriched_calls=enriched_calls,
+        ).profile(OFFICIAL_URL)
+    )
+
+    assert result.status.outcome == "profile_completed"
+    # The root fetch plus at most one linked sub-fetch: two static pages total.
+    assert enriched_calls == [(OFFICIAL_URL, 1)]
+
+
+def test_profile_non_event_page_locates_official_page_with_one_search(
+    tmp_path: Path,
+) -> None:
+    url = database_url(tmp_path)
+    agent = FakeAgent(
+        candidates=(
+            ResearchCandidate(
+                source_url=OFFICIAL_URL,
+                title="Baden Marathon",
+                snippet="Official event page.",
+            ),
+        ),
+        assessments=(
+            lambda request: profile_decision(request, page_is_event=False),
+            lambda request: profile_decision(request),
+        ),
+    )
+    enriched_calls: list[tuple[str, int]] = []
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url, title="Baden Marathon 2027")
+
+    result = asyncio.run(
+        profile_service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=fetch,
+            enriched_calls=enriched_calls,
+        ).profile(PROFILE_URL)
+    )
+
+    assert result.status.outcome == "profile_completed"
+    assert isinstance(result.draft, EventProfileDraft)
+    assert [call_url for call_url, _ in enriched_calls] == [PROFILE_URL, OFFICIAL_URL]
+    assert len(agent.scout_calls) == 1
+    assert agent.scout_calls[0].mode == "profile"
+    assert agent.scout_calls[0].approved_source_url is None
+    assert "Baden Marathon" in agent.scout_calls[0].query
+    assert len(agent.assessment_calls) == 2
+    assert agent.assessment_calls[1].evidence[0].final_url == OFFICIAL_URL
+
+
+def test_profile_locate_runs_at_most_once_then_terminates_inconclusive(
+    tmp_path: Path,
+) -> None:
+    url = database_url(tmp_path)
+    agent = FakeAgent(
+        candidates=(
+            ResearchCandidate(
+                source_url=OFFICIAL_URL,
+                title="Baden Marathon",
+                snippet="Still an aggregator listing.",
+            ),
+        ),
+        assessments=(
+            lambda request: profile_decision(request, page_is_event=False),
+            lambda request: profile_decision(request, page_is_event=False),
+        ),
+    )
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url)
+
+    result = asyncio.run(
+        profile_service(tmp_path, url=url, agent=agent, fetch=fetch).profile(PROFILE_URL)
+    )
+
+    assert result.status.status == "skipped"
+    assert result.status.outcome == "inconclusive"
+    assert result.draft is None
+    assert len(agent.scout_calls) == 1
+    assert len(agent.assessment_calls) == 2
+
+
+def test_profile_locate_without_search_budget_is_capped_without_draft(
+    tmp_path: Path,
+) -> None:
+    url = database_url(tmp_path)
+    agent = FakeAgent(
+        assessments=(lambda request: profile_decision(request, page_is_event=False),)
+    )
+
+    result = asyncio.run(
+        profile_service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=lambda source_url: _snapshot_async(source_url),
+            budget=ResearchBudget(
+                max_web_searches_per_job=0,
+                max_wall_time_seconds_per_job=10,
+                max_wall_time_seconds_per_profile_job=10,
+            ),
+        ).profile(PROFILE_URL)
+    )
+
+    assert result.status.status == "capped"
+    assert result.status.outcome == "inconclusive"
+    assert result.draft is None
+    assert agent.scout_calls == []
+
+
+async def _snapshot_async(source_url: str) -> PageSnapshot:
+    return snapshot(source_url)
+
+
+def test_profile_rejects_refresh_style_decision_without_draft(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    agent = FakeAgent(decide=refresh_decision)
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url)
+
+    result = asyncio.run(
+        profile_service(tmp_path, url=url, agent=agent, fetch=fetch).profile(OFFICIAL_URL)
+    )
+
+    assert result.status.status == "skipped"
+    assert result.status.outcome == "inconclusive"
+    assert result.draft is None
     assert count_proposed_event_updates(database_url=url) == 0
 
 

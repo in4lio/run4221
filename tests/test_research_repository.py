@@ -6,7 +6,7 @@ from threading import Barrier
 import pytest
 
 from run4221.db.bootstrap import initialize_database
-from run4221.db.models import ProposedEventUpdate
+from run4221.db.models import EventSource, ProposedEventUpdate
 from run4221.db.repository import (
     EventCreate,
     EventSuggestionCreate,
@@ -22,6 +22,7 @@ from run4221.db.research import (
     admit_proposed_update,
     admit_suggestion,
     find_research_queue_reference,
+    get_refresh_source,
     list_due_sources,
     mark_source_checked,
 )
@@ -98,6 +99,42 @@ def test_research_facade_lists_due_sources_and_marks_last_check(tmp_path) -> Non
         limit=10,
         database_url=url,
     ) == ()
+
+
+def test_get_refresh_source_prefers_active_registration_page(tmp_path) -> None:
+    url = database_url(tmp_path)
+    registration_url = "https://register.example/zurich-marathon"
+    event = add_event(
+        replace(event_payload(), registration_url=registration_url),
+        database_url=url,
+    )
+
+    preferred = get_refresh_source(event.id, database_url=url)
+
+    assert preferred is not None
+    assert preferred.url == registration_url
+    assert preferred.event.id == event.id
+
+    with session_scope(url) as session:
+        for source in session.query(EventSource).all():
+            if source.source_type == "registration_page":
+                source.active = False
+
+    fallback = get_refresh_source(event.id, database_url=url)
+
+    assert fallback is not None
+    assert fallback.url == "https://example.com/zurich-marathon"
+    assert get_refresh_source("missing.42", database_url=url) is None
+
+
+def test_get_refresh_source_falls_back_to_official_site(tmp_path) -> None:
+    url = database_url(tmp_path)
+    event = add_event(event_payload(), database_url=url)
+
+    source = get_refresh_source(event.id, database_url=url)
+
+    assert source is not None
+    assert source.url == "https://example.com/zurich-marathon"
 
 
 @pytest.mark.parametrize("existing_status", ["tracked", "pending", "converted", "removed"])

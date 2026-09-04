@@ -6,7 +6,7 @@ import os
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from hashlib import sha256
 from pathlib import Path
@@ -33,6 +33,9 @@ DEFAULT_MAX_JSON_BYTES = 256_000
 MAX_ARTIFACT_TYPE_CHARS = 48
 MAX_METADATA_KEY_CHARS = 120
 MAX_QUEUE_REFERENCE_CHARS = 240
+# Legacy prepared.json files carry no producer wall cap; assume the largest
+# cap any job may configure so reconciliation never races an in-flight run.
+LEGACY_PRODUCER_DEADLINE_SECONDS = 900.0
 TRUNCATION_MARKER = "...[truncated]"
 _ARTIFACT_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 
@@ -198,24 +201,35 @@ class ResearchArtifactStore:
         source_url: str,
         decision: ResearchDecision,
         committed_status: ResearchRunStatus,
+        producer_deadline_seconds: float | None = None,
     ) -> ArtifactReference:
         self._require_run(run_id)
         if (self._run_dir(run_id) / "terminal.json").exists():
             raise ArtifactLifecycleError("A terminal run cannot prepare another decision.")
         self._validate_prepared_status(decision, committed_status)
+        if producer_deadline_seconds is not None and (
+            not isinstance(producer_deadline_seconds, int | float)
+            or isinstance(producer_deadline_seconds, bool)
+            or not math.isfinite(producer_deadline_seconds)
+            or producer_deadline_seconds <= 0
+        ):
+            raise ArtifactLimitError("Producer deadline must be a positive finite number.")
         for evidence in decision.evidence:
             if evidence.run_id != run_id:
                 raise ArtifactLifecycleError("Prepared evidence must belong to the same run.")
             self.verify_artifact(evidence)
+        content: dict[str, object] = {
+            "decision": decision.model_dump(mode="json"),
+            "committed_status": committed_status.model_dump(mode="json"),
+        }
+        if producer_deadline_seconds is not None:
+            content["producer_deadline_seconds"] = float(producer_deadline_seconds)
         return self._write_named_artifact(
             run_id,
             artifact_name="prepared.json",
             artifact_type="prepared_decision",
             source_url=source_url,
-            content={
-                "decision": decision.model_dump(mode="json"),
-                "committed_status": committed_status.model_dump(mode="json"),
-            },
+            content=content,
         )
 
     def finalize_committed(
@@ -301,6 +315,8 @@ class ResearchArtifactStore:
             if not prepared_path.is_file() or prepared_path.is_symlink():
                 continue
             prepared_reference = self._reference_from_path(prepared_path)
+            if self._prepared_may_still_be_running(prepared_reference):
+                continue
             prepared = self._read_prepared(prepared_reference)
             try:
                 resolution = resolver(prepared)
@@ -416,6 +432,31 @@ class ResearchArtifactStore:
             )
         except ArtifactExistsError:
             return self._reference_from_path(path)
+
+    def _prepared_may_still_be_running(self, reference: ArtifactReference) -> bool:
+        """Skip prepared runs younger than twice their producer-stamped wall cap."""
+
+        payload = self.read_artifact(reference)
+        content = payload.get("content")
+        cap = (
+            content.get("producer_deadline_seconds")
+            if isinstance(content, Mapping)
+            else None
+        )
+        if (
+            not isinstance(cap, int | float)
+            or isinstance(cap, bool)
+            or not math.isfinite(cap)
+            or cap <= 0
+        ):
+            cap = LEGACY_PRODUCER_DEADLINE_SECONDS
+        try:
+            created_at = datetime.fromisoformat(str(payload.get("created_at")))
+        except ValueError:
+            return False
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        return self._utc_now() - created_at < timedelta(seconds=2 * float(cap))
 
     def _read_prepared(self, reference: ArtifactReference) -> PreparedDecision:
         if reference.artifact_name != "prepared.json":

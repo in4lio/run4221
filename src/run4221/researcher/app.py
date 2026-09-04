@@ -10,8 +10,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
-from agents import set_default_openai_key
-
 from run4221.db.prompts import PromptVersionRecord
 from run4221.db.research import (
     ResearchSourceRecord,
@@ -21,13 +19,13 @@ from run4221.db.research import (
     mark_source_checked,
 )
 from run4221.db.session import require_initialized_database
-from run4221.researcher.agent import ResearchAgentJob
 from run4221.researcher.artifacts import (
     QueueResolution,
     ReconciliationResult,
     ResearchArtifactStore,
 )
 from run4221.researcher.config import ResearcherSettings, load_researcher_prompt
+from run4221.researcher.engine import ResearchEngine, build_engine
 from run4221.researcher.health import HealthStore, check_researcher_health
 from run4221.researcher.lock import ProcessLock
 from run4221.researcher.schemas import ResearchBudget, ResearchRunStatus, RunOutcome, RunState
@@ -97,6 +95,7 @@ class ResearcherWorker:
         self.now = now or (lambda: datetime.now(UTC))
         self.sleep = sleep
         self.service_factory = service_factory or self._default_service_factory
+        self._engine: ResearchEngine | None = None
 
     def initialize_health(self) -> None:
         self.health.initialize(enabled=self.settings.schedule_enabled)
@@ -130,6 +129,9 @@ class ResearcherWorker:
         return await self._execute_refresh(source, shadow=shadow)
 
     async def run_cycle(self, *, shadow: bool = False) -> CycleResult:
+        # Finish any interrupted queue lifecycle before starting new work, on
+        # every cycle rather than once per process.
+        self.reconcile_prepared()
         self.health.set_idle(enabled=self.settings.schedule_enabled)
         if not self.settings.schedule_enabled:
             return CycleResult()
@@ -265,24 +267,11 @@ class ResearcherWorker:
         shadow: bool,
         on_run_started: Callable[[str], None],
     ) -> ResearcherService:
-        checked = self.checked or check_config(self.settings)
-        set_default_openai_key(
-            self.settings.openai_api_key.get_secret_value(),
-            use_for_tracing=False,
-        )
-        prompt_reference = (
-            f"{checked.prompt.prompt_key}:{checked.prompt.source}:v{checked.prompt.version}"
-        )
-        return ResearcherService(
-            database_url=self.settings.database_url,
-            artifacts=ResearchArtifactStore(self.settings.artifact_dir),
-            agent=ResearchAgentJob(
-                instructions=checked.prompt.content,
-                prompt_reference=prompt_reference,
-                budget=checked.budget,
-                model=checked.model,
-            ),
-            budget=checked.budget,
+        # The facade is the single construction point for per-job services;
+        # building it once keeps the provider-key injection one-time.
+        if self._engine is None:
+            self._engine = build_engine(self.settings)
+        return self._engine.build_service(
             persist_queue=not shadow,
             on_run_started=on_run_started,
         )
