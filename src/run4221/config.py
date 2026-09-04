@@ -34,11 +34,9 @@ class Settings(TelegramChannelSettings):
     telegram_moderator_accounts: str = ""
     telegram_moderator_ids: str = ""
     telegram_moderator_usernames: str = ""
-    ai_extractor_provider: Literal["heuristic", "openai"] = "heuristic"
     run4221_prompt_source: Literal["file", "db"] = "file"
     run4221_prompt_dir: str = "private/prompts"
     openai_api_key: SecretStr | None = None
-    openai_extract_model: str = "gpt-5.4-mini"
 
     def configured_moderator_accounts(self) -> ModeratorAccounts:
         combined = ",".join(

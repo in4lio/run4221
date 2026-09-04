@@ -1688,7 +1688,7 @@ def test_service_boundary_has_no_direct_apply_or_registration_orchestration() ->
         node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module
     }
 
-    assert "run4221.ai.registration_window" not in imported
+    assert all(not module.startswith("run4221.bot") for module in imported)
     assert "update_registration_window" not in source
     assert "auto_confirm" not in inspect.signature(ResearcherService.refresh).parameters
 

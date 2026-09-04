@@ -226,7 +226,6 @@ def test_agent_adapter_has_no_privileged_imports() -> None:
         "run4221.agent",
         "run4221.bot",
         "run4221.db",
-        "run4221.ai.registration_window",
         "run4221.events",
     }
     violations: list[str] = []

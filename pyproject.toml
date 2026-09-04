@@ -14,7 +14,7 @@ dependencies = [
     "aiogram>=3.22,<4",
     "alembic>=1.13,<2",
     "httpx>=0.27,<1",
-    "openai>=2,<3",
+    "openai-agents>=0.20,<0.21",
     "pydantic-settings>=2.7,<3",
     "python-dotenv>=1.0,<2",
     "sqlalchemy>=2.0,<3",
@@ -24,9 +24,6 @@ dependencies = [
 dev = [
     "pytest>=8.3,<9",
     "ruff>=0.9,<1",
-]
-researcher = [
-    "openai-agents>=0.20,<0.21",
 ]
 
 [project.scripts]
