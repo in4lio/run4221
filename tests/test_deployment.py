@@ -143,7 +143,12 @@ def test_deploy_preflights_researcher_before_replacement_and_restores_topology()
         "docker compose run --rm -T --interactive=false --no-deps bot uv run python -c"
         in workflow
     )
-    assert "from run4221.researcher.engine import build_engine; build_engine()" in workflow
+    assert "from run4221.researcher.engine import build_engine" in workflow
+    assert "build_engine()" in workflow
+    # A failing bot-engine preflight prints an actionable hint before exiting.
+    assert "bot engine preflight failed: {error}" in workflow
+    assert "OPENAI_API_KEY and the shared RESEARCHER_* block" in workflow
+    assert "see private deployment notes" in workflow
     assert workflow.index("build_engine()") < workflow.index("service_replaced=true")
     assert "docker image tag" in workflow
     assert "--remove-orphans" in workflow

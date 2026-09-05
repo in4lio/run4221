@@ -7,6 +7,8 @@ from dataclasses import asdict, dataclass
 from typing import Protocol
 from urllib.parse import urlparse
 
+from pydantic import ValidationError
+
 from run4221.db.models import RESEARCH_DECISION_MARKER_PREFIX
 from run4221.db.research import (
     ProposedEventUpdateCreate,
@@ -205,6 +207,9 @@ class ProfileJobResult:
     status: ResearchRunStatus
     terminal_reference: ArtifactReference
     draft: EventProfileDraft | None = None
+    # True when the draft came from a page located via web search rather than
+    # from the moderator-supplied URL; callers must surface that provenance.
+    located: bool = False
 
 
 class ResearcherService:
@@ -261,6 +266,17 @@ class ResearcherService:
                 RunState.CAPPED,
                 RunOutcome.INCONCLUSIVE,
                 "Refresh wall-time budget was exhausted.",
+            )
+        except ValidationError:
+            # Request construction failed (e.g. an oversized context value):
+            # fail closed with a terminal artifact instead of leaking the
+            # error and leaving the run directory without terminal.json.
+            return self._finish_without_queue(
+                run_id,
+                source.url,
+                RunState.FAILED,
+                RunOutcome.INCONCLUSIVE,
+                "Refresh request construction failed schema validation.",
             )
 
     async def _refresh_started(
@@ -538,6 +554,17 @@ class ResearcherService:
                 RunOutcome.NO_CHANGE,
                 "No supported tracked-event field changed.",
             )
+        if _proposes_stale_event_date(changed_fields, frozen_event):
+            # Stale-edition guard: a page proposing a date strictly before the
+            # stored event date is evidence about an older edition, never a
+            # forward correction.
+            return self._finish_without_queue(
+                run_id,
+                source.url,
+                RunState.SKIPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Proposed event date is older than the stored event date.",
+            )
         prepared_decision = self._validated_refresh_update(
             decision,
             captures=tuple(captures),
@@ -646,10 +673,28 @@ class ResearcherService:
                 RunOutcome.INCONCLUSIVE,
                 "Profile wall-time budget was exhausted.",
             )
+        except ValidationError:
+            # Request construction failed (e.g. a URL longer than the frozen
+            # context allows): fail closed with a terminal artifact instead of
+            # leaking the error and leaving the run directory unterminated.
+            return self._finish_profile(
+                run_id,
+                url,
+                RunState.FAILED,
+                RunOutcome.INCONCLUSIVE,
+                "Profile request construction failed schema validation.",
+            )
 
     async def _profile_started(self, run_id: str, url: str) -> ProfileJobResult:
+        # The root fetch plus every enrichment sub-fetch of BOTH captures must
+        # stay inside the static-page budget for the whole job.
+        first_linked_pages = max(0, self.budget.max_static_pages_per_job - 1)
         try:
-            captured = await self._capture_enriched(run_id, url)
+            captured = await self._capture_enriched(
+                run_id,
+                url,
+                max_linked_pages=first_linked_pages,
+            )
         except PageFetchError as error:
             return self._finish_profile(
                 run_id,
@@ -672,11 +717,23 @@ class ResearcherService:
             url,
             captured,
             context=(FrozenContextField(name="requested_url", value=url),),
+            # The first assessment must leave room for a potential locate
+            # scout plus a second assessment (mirrors the refresh reserve).
+            reserve_continuation=True,
         )
         if failure is not None:
             return failure
         assert decision is not None
         if decision.page_is_event is not False:
+            assert decision.draft is not None
+            if not _draft_matches_capture(decision.draft, captured.snapshot):
+                return self._finish_profile(
+                    run_id,
+                    url,
+                    RunState.SKIPPED,
+                    RunOutcome.INCONCLUSIVE,
+                    "Draft URLs did not match the captured evidence.",
+                )
             return self._finish_profile_draft(run_id, url, decision)
 
         # The captured page is not the event's own page: run exactly one
@@ -724,7 +781,16 @@ class ResearcherService:
                 "Locating search produced no new official-page candidate.",
             )
         try:
-            official = await self._capture_enriched(run_id, official_url)
+            # The locate capture may only enrich with whatever linked-page
+            # allowance the first enriched capture left unspent.
+            official = await self._capture_enriched(
+                run_id,
+                official_url,
+                max_linked_pages=max(
+                    0,
+                    self.budget.max_static_pages_per_job - 1 - first_linked_pages,
+                ),
+            )
         except PageFetchError as error:
             return self._finish_profile(
                 run_id,
@@ -758,7 +824,16 @@ class ResearcherService:
                 RunOutcome.INCONCLUSIVE,
                 "The located page still was not the event's own page.",
             )
-        return self._finish_profile_draft(run_id, url, located_decision)
+        assert located_decision.draft is not None
+        if not _draft_matches_capture(located_decision.draft, official.snapshot):
+            return self._finish_profile(
+                run_id,
+                url,
+                RunState.SKIPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Draft URLs did not match the captured evidence.",
+            )
+        return self._finish_profile_draft(run_id, url, located_decision, located=True)
 
     async def _profile_assessment(
         self,
@@ -767,12 +842,14 @@ class ResearcherService:
         capture: CapturedPage,
         *,
         context: tuple[FrozenContextField, ...],
+        reserve_continuation: bool = False,
     ) -> tuple[ResearchDecision | None, ProfileJobResult | None]:
         assessment = await self.agent.assess(
             AssessmentRequest(
                 mode="profile",
                 context=context,
                 evidence=(capture.as_agent_evidence(),),
+                reserve_continuation=reserve_continuation,
             )
         )
         self._record_assessment(run_id, url, assessment)
@@ -816,10 +893,13 @@ class ResearcherService:
             )
         return decision, None
 
-    async def _capture_enriched(self, run_id: str, url: str) -> CapturedPage:
-        # The root fetch plus every enrichment sub-fetch must stay inside the
-        # static-page budget for the whole job.
-        max_linked_pages = max(0, self.budget.max_static_pages_per_job - 1)
+    async def _capture_enriched(
+        self,
+        run_id: str,
+        url: str,
+        *,
+        max_linked_pages: int,
+    ) -> CapturedPage:
         try:
             snapshot = await self.fetch_enriched_snapshot(
                 url,
@@ -853,6 +933,8 @@ class ResearcherService:
         run_id: str,
         source_url: str,
         decision: ResearchDecision,
+        *,
+        located: bool = False,
     ) -> ProfileJobResult:
         status = ResearchRunStatus(
             status=RunState.SUCCEEDED,
@@ -864,7 +946,13 @@ class ResearcherService:
             source_url=source_url,
             status=status,
         )
-        return ProfileJobResult(run_id, status, terminal, draft=decision.draft)
+        return ProfileJobResult(
+            run_id,
+            status,
+            terminal,
+            draft=decision.draft,
+            located=located,
+        )
 
     def _finish_profile_agent_outcome(
         self,
@@ -1098,6 +1186,38 @@ def _profile_locate_context(
         "distances": ", ".join(draft.distances),
     }
     return tuple(FrozenContextField(name=name, value=str(value)) for name, value in values.items())
+
+
+def _draft_matches_capture(draft: EventProfileDraft, snapshot: PageSnapshot) -> bool:
+    """A returned draft must describe the page this run actually captured.
+
+    Mirrors the deleted ``_candidate_matches_capture``: the draft's source URL
+    must be the captured page (requested or final URL), and an optional
+    official URL must stay on the captured page's domain.
+    """
+
+    captured_urls = {
+        normalize_url(snapshot.source_url),
+        normalize_url(snapshot.final_url),
+    }
+    if normalize_url(draft.source_url) not in captured_urls:
+        return False
+    return draft.official_url is None or _same_source_domain(
+        draft.official_url,
+        snapshot.final_url,
+    )
+
+
+def _proposes_stale_event_date(
+    changed_fields: dict[str, object],
+    event: TrackedEvent,
+) -> bool:
+    proposed = changed_fields.get("event_date")
+    return (
+        isinstance(proposed, str)
+        and event.event_date is not None
+        and proposed < event.event_date
+    )
 
 
 def _locate_candidate_url(

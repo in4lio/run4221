@@ -3,6 +3,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from run4221.bot import moderator
 from run4221.bot.auth import is_moderator_account, is_moderator_id, is_moderator_username
@@ -97,7 +98,7 @@ from run4221.db.repository import (
     normalize_public_id,
 )
 from run4221.events import DISTANCE_CODE_TO_KEY, DISTANCE_LABELS, TrackedEvent
-from run4221.researcher.engine import EngineConfigError
+from run4221.researcher.engine import EngineConfigError, SourceNotFoundError
 from run4221.researcher.schemas import (
     ArtifactReference,
     EventProfileDraft,
@@ -240,13 +241,23 @@ def profile_result(
     status: str = "succeeded",
     outcome: str = "profile_completed",
     detail: str | None = None,
+    located: bool = False,
 ) -> ProfileJobResult:
     return ProfileJobResult(
         run_id=run_id,
         status=ResearchRunStatus(status=status, outcome=outcome, detail=detail),
         terminal_reference=artifact_reference(run_id),
         draft=draft,
+        located=located,
     )
+
+
+def sample_validation_error() -> ValidationError:
+    try:
+        EventProfileDraft.model_validate({})
+    except ValidationError as error:
+        return error
+    raise AssertionError("EventProfileDraft.model_validate({}) must fail")
 
 
 def refresh_result(
@@ -1733,7 +1744,7 @@ def test_manual_update_event_runs_engine_refresh(monkeypatch) -> None:
 def test_update_event_without_active_source_reports_not_found(monkeypatch) -> None:
     event = sample_event()
     engine = FakeEngine(
-        refresh_error=ValueError("No active research source for event: berlin.42")
+        refresh_error=SourceNotFoundError("No active research source for event: berlin.42")
     )
     monkeypatch.setattr(moderator, "find_database_event", lambda event_id: event)
     install_engine(monkeypatch, engine)
@@ -1745,6 +1756,23 @@ def test_update_event_without_active_source_reports_not_found(monkeypatch) -> No
     assert message.answers[-1] == (
         "I could not find an active source for event <code>berlin.42</code>."
     )
+    assert not moderator._refreshing_events
+
+
+def test_update_event_validation_error_is_not_reported_as_missing_source(
+    monkeypatch,
+) -> None:
+    event = sample_event()
+    engine = FakeEngine(refresh_error=sample_validation_error())
+    monkeypatch.setattr(moderator, "find_database_event", lambda event_id: event)
+    install_engine(monkeypatch, engine)
+
+    message = FakeMessage()
+    asyncio.run(moderator.update_event_registration_by_id(message, "berlin.42"))
+
+    failure = message.answers[-1]
+    assert failure.startswith("Registration check failed.")
+    assert "could not find an active source" not in failure
     assert not moderator._refreshing_events
 
 
@@ -1913,7 +1941,7 @@ def test_draft_to_state_substitutes_captured_page_for_missing_official_url() -> 
     assert state_data["official_url"] == "https://www.badenmarathon.de/"
 
 
-def test_add_event_url_without_draft_fails_closed(monkeypatch) -> None:
+def test_add_event_url_without_draft_continues_with_manual_entry(monkeypatch) -> None:
     engine = FakeEngine(
         profile_result=profile_result(
             None,
@@ -1931,13 +1959,143 @@ def test_add_event_url_without_draft_fails_closed(monkeypatch) -> None:
         moderator.start_add_event_from_url(message, state, "https://www.badenmarathon.de/")
     )
 
-    failure = message.answers[-1]
+    failure = message.answers[1]
     assert "<b>Event page parsing</b>" in failure
     assert "The captured evidence did not support a validated change." in failure
     assert "Profile page was unusable: site protection challenge page." in failure
     assert f"<b>Run ID</b>: <code>{RUN_ID}</code>" in failure
+    assert "Continuing with manual entry - fill each field." in message.answers[2]
+    # The guided flow continues with an empty manual state: the URL is kept
+    # and every draft field waits for the moderator; nothing is invented.
+    assert state.state == AddEventStates.name.state
+    assert state.data["source_url"] == "https://www.badenmarathon.de/"
+    assert state.data["name"] is None
+    assert state.data["city"] is None
+    assert state.data["official_url"] is None
+    assert state.data["registration_url"] is None
+    assert state.data["distances"] is None
+    assert state.data["registration_url_candidates"] == ()
+    assert "<b>💬 Event name</b>" in message.answers[3]
+    assert not moderator._parsing_chats
+
+
+def test_manual_entry_after_failed_parse_still_cancels(monkeypatch) -> None:
+    engine = FakeEngine(
+        profile_result=profile_result(
+            None,
+            status="failed",
+            outcome="inconclusive",
+            detail="Profile page capture failed (PageFetchError).",
+        )
+    )
+    install_engine(monkeypatch, engine)
+    monkeypatch.setattr(moderator, "list_events_by_url", lambda url: ())
+
+    message = FakeMessage()
+    state = FakeState()
+
+    async def scenario() -> None:
+        await moderator.start_add_event_from_url(
+            message, state, "https://www.badenmarathon.de/"
+        )
+        assert state.state == AddEventStates.name.state
+        await moderator.handle_cancel(FakeMessage(text="/cancel"), state)
+
+    asyncio.run(scenario())
+
     assert state.state is None
     assert state.data == {}
+    assert not moderator._parsing_chats
+
+
+def test_concurrent_add_event_starts_run_exactly_one_parse(monkeypatch) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingEngine:
+        def __init__(self) -> None:
+            self.profile_calls: list[str] = []
+
+        async def profile(self, url: str) -> ProfileJobResult:
+            self.profile_calls.append(url)
+            started.set()
+            await release.wait()
+            return profile_result(sample_profile_draft())
+
+    async def yielding_warn(message, url) -> None:
+        # Force a real suspension point before the engine call so a racing
+        # second start would sneak past a non-atomic check-then-add guard.
+        await asyncio.sleep(0)
+
+    engine = BlockingEngine()
+    install_engine(monkeypatch, engine)
+    monkeypatch.setattr(moderator, "warn_existing_url_events", yielding_warn)
+
+    first_message, second_message = FakeMessage(), FakeMessage()
+    first_state, second_state = FakeState(), FakeState()
+
+    async def scenario() -> None:
+        first = asyncio.create_task(
+            moderator.start_add_event_from_url(
+                first_message, first_state, "https://www.badenmarathon.de/"
+            )
+        )
+        second = asyncio.create_task(
+            moderator.start_add_event_from_url(
+                second_message, second_state, "https://www.badenmarathon.de/"
+            )
+        )
+        await started.wait()
+        release.set()
+        await asyncio.gather(first, second)
+
+    asyncio.run(scenario())
+
+    assert engine.profile_calls == ["https://www.badenmarathon.de/"]
+    assert second_message.answers == [PARSE_IN_PROGRESS_MESSAGE]
+    assert first_state.state == AddEventStates.name.state
+    assert not moderator._parsing_chats
+
+
+def test_distance_step_drops_article_registration_fallback(monkeypatch) -> None:
+    async def allow(message):
+        return True
+
+    monkeypatch.setattr(moderator, "require_moderator", allow)
+    state = FakeState()
+    state.state = AddEventStates.distance.state
+    state.data = {
+        "name": "Baden Marathon",
+        "registration_url": "https://baden.example/news/2026/03/05/race-day-recap",
+        "registration_url_candidates": (),
+    }
+
+    message = FakeMessage(text="42,21")
+    asyncio.run(moderator.handle_add_event_distance(message, state))
+
+    # A dated-article draft URL is dropped even for a multi-distance event;
+    # the moderator fills the field instead of inheriting a guess.
+    assert state.data["distances"] == ("marathon", "half_marathon")
+    assert state.data["registration_url"] is None
+
+
+def test_distance_step_keeps_clean_registration_fallback(monkeypatch) -> None:
+    async def allow(message):
+        return True
+
+    monkeypatch.setattr(moderator, "require_moderator", allow)
+    state = FakeState()
+    state.state = AddEventStates.distance.state
+    state.data = {
+        "name": "Baden Marathon",
+        "registration_url": "https://baden.example/anmeldung",
+        "registration_url_candidates": (),
+    }
+
+    message = FakeMessage(text="42,21")
+    asyncio.run(moderator.handle_add_event_distance(message, state))
+
+    assert state.data["registration_url"] == "https://baden.example/anmeldung"
 
 
 def test_ae6_cancel_during_parse_discards_draft_without_resurrection(monkeypatch) -> None:
@@ -2919,6 +3077,44 @@ def test_draft_summary_omits_derived_label_for_model_timezone() -> None:
     assert "(derived)" not in summary
 
 
+def test_draft_summary_names_locate_provenance_only_when_located() -> None:
+    draft = sample_profile_draft()
+
+    located = format_draft_summary(
+        draft,
+        run_id=RUN_ID,
+        timezone="Europe/Berlin",
+        located=True,
+    )
+    direct = format_draft_summary(draft, run_id=RUN_ID, timezone="Europe/Berlin")
+
+    assert (
+        "Located via web search: www.badenmarathon.de "
+        "— verify this is the official site." in located
+    )
+    assert "Located via web search" not in direct
+
+
+def test_add_event_flow_surfaces_locate_provenance(monkeypatch) -> None:
+    engine = FakeEngine(
+        profile_result=profile_result(sample_profile_draft(), located=True)
+    )
+    install_engine(monkeypatch, engine)
+    monkeypatch.setattr(moderator, "list_events_by_url", lambda url: ())
+
+    message = FakeMessage()
+    state = FakeState()
+    asyncio.run(
+        moderator.start_add_event_from_url(
+            message, state, "https://news.example/marathon-report"
+        )
+    )
+
+    summary = message.answers[1]
+    assert "<b>✨ Draft extracted from URL</b>" in summary
+    assert "Located via web search: www.badenmarathon.de" in summary
+
+
 def test_refresh_outcome_maps_provider_failures_to_limits_wording() -> None:
     outcome = format_refresh_outcome(
         refresh_result(
@@ -2931,6 +3127,29 @@ def test_refresh_outcome_maps_provider_failures_to_limits_wording() -> None:
     assert "check its configuration or usage limits" in outcome
     assert "OpenAI rate limit was reached." in outcome
     assert f"<b>Run ID</b>: <code>{RUN_ID}</code>" in outcome
+
+
+def test_refresh_outcome_free_text_failure_detail_stays_generic() -> None:
+    # Only the typed provider error details map to the limits wording; free
+    # detail text that merely mentions a timeout must not.
+    outcome = format_refresh_outcome(
+        refresh_result(
+            status="failed",
+            outcome="inconclusive",
+            detail="Page fetch timed out",
+        )
+    )
+
+    assert "The check failed before reaching a decision." in outcome
+    assert "configuration or usage limits" not in outcome
+
+
+def test_refresh_outcome_maps_bare_provider_error_codes_to_limits_wording() -> None:
+    outcome = format_refresh_outcome(
+        refresh_result(status="failed", outcome="inconclusive", detail="rate_limit")
+    )
+
+    assert "check its configuration or usage limits" in outcome
 
 
 def test_refresh_outcome_maps_queue_full_and_budget_caps() -> None:

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import os
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from run4221.db.prompts import (
@@ -80,6 +81,17 @@ class ResearcherSettings(BaseSettings):
         le=RESEARCHER_MAX_PENDING_SUGGESTIONS,
     )
     max_pending_updates: int = Field(default=50, ge=0, le=500)
+
+    @model_validator(mode="after")
+    def reject_renamed_schedule_flag(self) -> Self:
+        # Fail fast on the pre-rename flag so production cannot silently run
+        # with a scheduling switch that is no longer read.
+        if os.environ.get("RESEARCHER_ENABLED") is not None:
+            raise ValueError(
+                "RESEARCHER_ENABLED is no longer read; "
+                "set RESEARCHER_SCHEDULE_ENABLED instead."
+            )
+        return self
 
     @property
     def budget(self) -> ResearchBudget:

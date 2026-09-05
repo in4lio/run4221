@@ -72,6 +72,8 @@ from run4221.events import (
     normalize_event_id,
 )
 from run4221.ingestion.event_identity import (
+    conflicts_with_event_identity,
+    is_likely_article_url,
     resolve_timezone,
     select_registration_url_for_distances,
 )
@@ -88,6 +90,8 @@ from run4221.posting.ledger import (
     retry_channel_message,
 )
 from run4221.posting.publisher import publish_channel_message
+from run4221.researcher.engine import SourceNotFoundError
+from run4221.researcher.policy import source_domain
 from run4221.researcher.schemas import EventProfileDraft
 
 if TYPE_CHECKING:
@@ -468,35 +472,37 @@ async def start_add_event_from_url(
     source_suggestion_note: str | None = None,
 ) -> None:
     chat_id = message_chat_id(message)
-    if chat_id in _parsing_chats:
+    # KTD8 parse lock: the check and the insert happen in one synchronous step
+    # (no await in between), so two concurrent starts can never both pass.
+    if not try_begin_parse(chat_id):
         await message.answer(PARSE_IN_PROGRESS_MESSAGE)
         return
 
-    await warn_existing_url_events(message, url)
-
-    engine = await acquire_engine(message)
-    if engine is None:
-        return
-
-    # KTD8 parse lock: enter the parsing state with a fresh run token before
-    # the engine call; the returned draft is discarded unless both still match.
-    parse_token = uuid4().hex
-    await state.set_state(AddEventStates.parsing)
-    await state.update_data(parse_token=parse_token)
-    await message.answer("Parsing the event page...")
-
-    _parsing_chats.add(chat_id)
     try:
-        result = await engine.profile(url)
-    except Exception as error:
-        if await parse_is_current(state, parse_token):
-            await state.clear()
-            await message.answer(
-                "Event page parsing failed. Try again later.\n"
-                f"Error: {escape(str(error))}",
-                reply_markup=remove_dialog_keyboard(),
-            )
-        return
+        await warn_existing_url_events(message, url)
+
+        engine = await acquire_engine(message)
+        if engine is None:
+            return
+
+        # Enter the parsing state with a fresh run token before the engine
+        # call; the returned draft is discarded unless both still match.
+        parse_token = uuid4().hex
+        await state.set_state(AddEventStates.parsing)
+        await state.update_data(parse_token=parse_token)
+        await message.answer("Parsing the event page...")
+
+        try:
+            result = await engine.profile(url)
+        except Exception as error:
+            if await parse_is_current(state, parse_token):
+                await state.clear()
+                await message.answer(
+                    "Event page parsing failed. Try again later.\n"
+                    f"Error: {escape(str(error))}",
+                    reply_markup=remove_dialog_keyboard(),
+                )
+            return
     finally:
         _parsing_chats.discard(chat_id)
 
@@ -505,11 +511,20 @@ async def start_add_event_from_url(
         return
 
     if result.draft is None:
-        await state.clear()
+        # No draft: continue the guided flow with an empty manual state so the
+        # moderator types every value; nothing is invented on their behalf.
         await message.answer(
             format_profile_failure(result),
             reply_markup=remove_dialog_keyboard(),
         )
+        state_data = manual_entry_state(url)
+        if source_suggestion_id is not None:
+            state_data["source_suggestion_id"] = source_suggestion_id
+            state_data["source_suggestion_note"] = source_suggestion_note
+        await state.update_data(**state_data)
+        await message.answer("Continuing with manual entry - fill each field.")
+        await state.set_state(AddEventStates.name)
+        await ask_field_confirmation(message, "name", None)
         return
 
     state_data = draft_to_state(result.draft)
@@ -522,10 +537,43 @@ async def start_add_event_from_url(
             result.draft,
             run_id=result.run_id,
             timezone=str(state_data["timezone"]),
+            located=result.located,
         )
     )
     await state.set_state(AddEventStates.name)
     await ask_field_confirmation(message, "name", result.draft.name)
+
+
+def try_begin_parse(chat_id: int | None) -> bool:
+    """Atomically claim the per-chat parse marker; True when this call owns it."""
+
+    if chat_id in _parsing_chats:
+        return False
+    _parsing_chats.add(chat_id)
+    return True
+
+
+def manual_entry_state(source_url: str) -> dict[str, object]:
+    """Guided-flow state for manual entry: URL kept, every draft field empty."""
+
+    return {
+        "source_url": source_url,
+        "name": None,
+        "public_id": None,
+        "city": None,
+        "country": None,
+        "timezone": None,
+        "event_date": None,
+        "distances": None,
+        "regions": None,
+        "official_url": None,
+        "registration_url": None,
+        "registration_status": "unknown",
+        "registration_open_at": None,
+        "registration_open_precision": "unknown",
+        "registration_close_at": None,
+        "registration_url_candidates": (),
+    }
 
 
 async def parse_is_current(state: FSMContext, parse_token: str) -> bool:
@@ -683,11 +731,35 @@ async def handle_add_event_distance(message: Message, state: FSMContext) -> None
     registration_url = select_registration_url_for_distances(
         tuple(data.get("registration_url_candidates") or ()),
         distances,
-        fallback=optional_string(data.get("registration_url")),
+        fallback=screened_registration_fallback(
+            optional_string(data.get("registration_url")),
+            event_name=str(data.get("name") or ""),
+            distances=distances,
+        ),
     )
     await state.update_data(distances=distances, registration_url=registration_url)
     await state.set_state(AddEventStates.regions)
     await ask_field_confirmation(message, "regions", (await state.get_data()).get("regions"))
+
+
+def screened_registration_fallback(
+    url: str | None,
+    *,
+    event_name: str,
+    distances: tuple[str, ...],
+) -> str | None:
+    """Drop a drafted registration URL that looks like an article or a
+    different event/category; the moderator then fills the field instead."""
+
+    if url is None:
+        return None
+    if is_likely_article_url(url) or conflicts_with_event_identity(
+        url,
+        event_name,
+        distances,
+    ):
+        return None
+    return url
 
 
 @router.message(AddEventStates.regions)
@@ -952,7 +1024,7 @@ async def run_background_registration_check(
     try:
         result = await engine.refresh_source(event.id)
         text = format_refresh_outcome(result)
-    except ValueError:
+    except SourceNotFoundError:
         text = (
             "I could not find an active source for event "
             f"<code>{escape(event.public_id)}</code>."
@@ -1173,7 +1245,7 @@ async def update_event_registration_by_id(
     _refreshing_events.add(event.id)
     try:
         result = await engine.refresh_source(event.id)
-    except ValueError:
+    except SourceNotFoundError:
         await message.answer(
             "I could not find an active source for event "
             f"<code>{escape(event.public_id)}</code>."
@@ -3447,6 +3519,7 @@ def format_draft_summary(
     *,
     run_id: str,
     timezone: str | None = None,
+    located: bool = False,
 ) -> str:
     lines = [
         format_major_title("Draft extracted from URL"),
@@ -3456,6 +3529,11 @@ def format_draft_summary(
         format_field_line("Name", draft.name),
         format_field_line("Captured page", draft.source_url),
     ]
+    if located:
+        lines.append(
+            f"Located via web search: {escape(source_domain(draft.source_url))} "
+            "— verify this is the official site."
+        )
     if timezone and timezone != draft.timezone:
         lines.append(format_field_line("Timezone", f"{timezone} (derived)"))
     if draft.summary:
@@ -3482,7 +3560,7 @@ def format_profile_failure(result: ProfileJobResult) -> str:
         "<b>Event page parsing</b>",
         "",
         escape(research_outcome_headline(result), quote=False),
-        "No draft was produced, so the add flow was stopped.",
+        "No draft was produced.",
     ]
     if result.status.detail:
         lines.append(format_bounded_field_line("Detail", result.status.detail, max_html_chars=700))

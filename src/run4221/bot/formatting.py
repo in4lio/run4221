@@ -333,13 +333,19 @@ def format_event_list(events: tuple[TrackedEvent, ...], *, title: str) -> str:
     return "\n".join(lines)
 
 
-_PROVIDER_LIMIT_TERMS = (
-    "authentication",
-    "quota",
-    "rate limit",
-    "rate_limit",
-    "timed out",
-    "timeout",
+# Typed provider-limit failure classification. A run status carries only the
+# agent's safe detail sentence (or its bare error code when no detail exists),
+# so match those exact values instead of substring-scanning free text.
+_PROVIDER_LIMIT_ERROR_CODES = frozenset(
+    {"authentication", "quota", "rate_limit", "timeout"}
+)
+_PROVIDER_LIMIT_DETAILS = frozenset(
+    {
+        "openai authentication failed.",
+        "openai quota is unavailable.",
+        "openai rate limit was reached.",
+        "the bounded agent call timed out.",
+    }
 )
 _QUEUE_FULL_TERMS = ("queue is full", "queue-full", "queue_full")
 
@@ -357,7 +363,7 @@ def research_outcome_headline(result) -> str:
     outcome = str(status.outcome)
     detail = (status.detail or "").casefold()
     if state == "failed":
-        if any(term in detail for term in _PROVIDER_LIMIT_TERMS):
+        if detail in _PROVIDER_LIMIT_DETAILS or detail.strip() in _PROVIDER_LIMIT_ERROR_CODES:
             return (
                 "The researcher provider rejected the run: "
                 "check its configuration or usage limits."

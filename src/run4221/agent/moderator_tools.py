@@ -43,6 +43,7 @@ from run4221.db.repository import (
     update_event as repo_update_event,
 )
 from run4221.events import TrackedEvent, normalize_event_id
+from run4221.researcher.engine import SourceNotFoundError
 
 if TYPE_CHECKING:
     from run4221.researcher.engine import ResearchEngine
@@ -280,7 +281,7 @@ class ModeratorAgentTools:
             return AgentToolResult.failure(f"Researcher engine is not configured: {error}")
         try:
             result = await engine.refresh_source(event.id)
-        except ValueError as error:
+        except SourceNotFoundError as error:
             return AgentToolResult.failure(str(error))
         except Exception as error:
             return AgentToolResult.failure(f"Could not update event: {error}")

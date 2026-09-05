@@ -10,7 +10,12 @@ from run4221.db.repository import EventCreate, add_event
 from run4221.researcher import engine as engine_module
 from run4221.researcher.agent import ResearchAgentJob
 from run4221.researcher.config import ResearcherSettings
-from run4221.researcher.engine import EngineConfigError, ResearchEngine, build_engine
+from run4221.researcher.engine import (
+    EngineConfigError,
+    ResearchEngine,
+    SourceNotFoundError,
+    build_engine,
+)
 from run4221.researcher.service import ResearcherService
 
 
@@ -194,8 +199,12 @@ def test_refresh_source_without_active_source_fails_closed(
     install_fake_service(monkeypatch)
     engine = build_engine(settings(tmp_path))
 
-    with pytest.raises(ValueError, match="No active research source"):
+    with pytest.raises(SourceNotFoundError, match="No active research source"):
         asyncio.run(engine.refresh_source("ghost.42"))
+    # The typed error must never be a ValueError: callers map the type to a
+    # "no active source" message and a pydantic ValidationError (a ValueError
+    # subclass) has to keep surfacing through the generic failure path.
+    assert not issubclass(SourceNotFoundError, ValueError)
 
 
 def test_engine_caches_only_settings_and_prompt(tmp_path: Path) -> None:

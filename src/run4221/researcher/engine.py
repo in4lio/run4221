@@ -20,6 +20,15 @@ class EngineConfigError(Exception):
     """The researcher engine cannot be configured from settings or its prompt."""
 
 
+class SourceNotFoundError(LookupError):
+    """No active research source exists for the requested event.
+
+    Deliberately not a ValueError: callers map this exact condition to a
+    "no active source" message, and a pydantic ValidationError (a ValueError
+    subclass) must keep surfacing through the generic failure path instead.
+    """
+
+
 class ResearchEngine:
     """One AI lever, two entry points.
 
@@ -81,7 +90,7 @@ class ResearchEngine:
 
         source = get_refresh_source(event_id, database_url=self._settings.database_url)
         if source is None:
-            raise ValueError(f"No active research source for event: {event_id}")
+            raise SourceNotFoundError(f"No active research source for event: {event_id}")
         return await self.build_service(persist_queue=True).refresh(source)
 
 
