@@ -3368,22 +3368,23 @@ async def require_moderator_callback(callback: CallbackQuery) -> bool:
 
 
 def draft_to_state(draft: EventProfileDraft) -> dict[str, object]:
+    regions = normalize_draft_regions(draft.regions)
     return {
         "source_url": draft.source_url,
         "name": draft.name,
-        "public_id": draft.public_id,
+        "public_id": normalize_draft_public_id(draft.public_id),
         "city": draft.city,
         "country": draft.country,
         "timezone": resolve_timezone(
             draft.timezone,
             country=draft.country,
-            regions=draft.regions,
+            regions=regions or (),
             city=draft.city,
         ),
         "event_date": draft.event_date,
-        "distances": draft.distances,
-        "regions": draft.regions,
-        "official_url": draft.official_url,
+        "distances": normalize_draft_distances(draft.distances),
+        "regions": regions,
+        "official_url": draft.official_url or draft.source_url,
         "registration_url": draft.registration_url,
         "registration_status": "unknown",
         "registration_open_at": None,
@@ -3393,6 +3394,52 @@ def draft_to_state(draft: EventProfileDraft) -> dict[str, object]:
             candidate.as_pair for candidate in draft.registration_url_candidates
         ),
     }
+
+
+PARENTHESIZED_ANNOTATION = re.compile(r"\([^()]*\)")
+
+
+def normalize_draft_distances(values: tuple[str, ...]) -> tuple[str, ...] | None:
+    """Map draft distance texts onto the manual-input vocabulary.
+
+    Each value goes through the exact parser the guided distance step uses
+    (retried once with parenthesized annotations such as "(42.195 km)"
+    stripped). Values the parser rejects are dropped; when nothing survives
+    the field is left empty so the guided step asks the moderator.
+    """
+
+    distances: list[str] = []
+    for value in values:
+        for candidate in (value, PARENTHESIZED_ANNOTATION.sub(" ", value)):
+            try:
+                distances.extend(parse_distances(candidate))
+            except ValueError:
+                continue
+            break
+    return tuple(dict.fromkeys(distances)) or None
+
+
+def normalize_draft_regions(values: tuple[str, ...]) -> tuple[str, ...] | None:
+    """Keep only draft region texts the manual-input parser accepts."""
+
+    regions: list[str] = []
+    for value in values:
+        try:
+            regions.extend(parse_regions(value))
+        except ValueError:
+            continue
+    return tuple(dict.fromkeys(regions)) or None
+
+
+def normalize_draft_public_id(value: str | None) -> str | None:
+    """Normalize a draft public ID with the manual-input rules, or drop it."""
+
+    if not value:
+        return None
+    normalized = normalize_event_id(value)
+    if public_id_distance_code(normalized) not in DISTANCE_CODE_TO_KEY:
+        return None
+    return normalized
 
 
 def format_draft_summary(

@@ -220,6 +220,22 @@ def test_profile_assessment_returns_cited_profile_draft() -> None:
     assert result.decision.evidence == [artifact_reference()]
 
 
+def test_profile_assessment_accepts_draft_without_official_url() -> None:
+    # The page may not print its own URL; the host substitutes the captured
+    # page URL downstream, so the schema must not force the model to guess one.
+    decision = valid_profile_decision()
+    draft = dict(decision["draft"])
+    del draft["official_url"]
+    decision["draft"] = draft
+
+    result = assess_decision(decision, mode="profile")
+
+    assert result.state is AgentRunState.SUCCEEDED
+    assert result.decision is not None
+    assert result.decision.draft is not None
+    assert result.decision.draft.official_url is None
+
+
 def test_profile_assessment_rejects_evidence_request_branch() -> None:
     outcome = {
         "action": "request_evidence",

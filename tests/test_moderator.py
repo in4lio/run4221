@@ -1881,6 +1881,38 @@ def test_ae1_add_event_url_feeds_engine_draft_into_field_confirmation(monkeypatc
     assert not moderator._parsing_chats
 
 
+def test_draft_to_state_normalizes_display_text_to_manual_vocabulary() -> None:
+    # The engine draft may carry display text; the host maps it through the
+    # exact parsers the manual input path uses and drops what they reject.
+    draft = sample_profile_draft(
+        public_id="Baden Marathon 42",
+        distances=("Marathon (42.195 km)",),
+        regions=("Europe",),
+    )
+
+    state_data = moderator.draft_to_state(draft)
+
+    assert state_data["distances"] == ("marathon",)
+    assert state_data["regions"] is None
+    assert state_data["public_id"] is None
+
+
+def test_draft_to_state_keeps_canonical_vocabulary_untouched() -> None:
+    state_data = moderator.draft_to_state(sample_profile_draft())
+
+    assert state_data["public_id"] == "karlsruhe.42"
+    assert state_data["distances"] == ("marathon",)
+    assert state_data["regions"] == ("global", "eu", "de")
+
+
+def test_draft_to_state_substitutes_captured_page_for_missing_official_url() -> None:
+    draft = sample_profile_draft(official_url=None)
+
+    state_data = moderator.draft_to_state(draft)
+
+    assert state_data["official_url"] == "https://www.badenmarathon.de/"
+
+
 def test_add_event_url_without_draft_fails_closed(monkeypatch) -> None:
     engine = FakeEngine(
         profile_result=profile_result(

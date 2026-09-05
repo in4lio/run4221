@@ -88,6 +88,8 @@ jobs:
             "umask 077 \
               && mkdir -p '$remote_private_dir' \
               && tar -C '$remote_private_dir' -xzf - \
+              && rm -f '$remote_private_dir/prompts/discover_event_profile.instructions.txt' \
+                '$remote_private_dir/prompts/update_registration_window.instructions.txt' \
               && chmod 700 '$remote_private_dir' \
                 '$remote_private_dir/data' '$remote_private_dir/prompts' \
               && find '$remote_private_dir/data' '$remote_private_dir/prompts' \
