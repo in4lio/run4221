@@ -1,6 +1,8 @@
 import asyncio
 import inspect
 
+from pydantic import ValidationError
+
 from run4221.agent.moderator_tools import (
     ModeratorAgentTools,
     moderator_agent_tool_specs,
@@ -16,7 +18,7 @@ from run4221.db.repository import (
 )
 from run4221.db.seed import seed_initial_data
 from run4221.db.session import session_scope
-from run4221.researcher.engine import EngineConfigError
+from run4221.researcher.engine import EngineConfigError, SourceNotFoundError
 from run4221.researcher.schemas import (
     ArtifactReference,
     EventProfileDraft,
@@ -399,7 +401,9 @@ def test_moderator_agent_update_event_without_source_fails_with_named_error(
     assert tools_for_create.create_event(event_fields()).ok is True
 
     engine = FakeEngine(
-        refresh_error=ValueError("No active research source for event: agent-test.42")
+        refresh_error=SourceNotFoundError(
+            "No active research source for event: agent-test.42"
+        )
     )
     tools = ModeratorAgentTools(database_url=url, engine=engine)  # type: ignore[arg-type]
 
@@ -407,6 +411,29 @@ def test_moderator_agent_update_event_without_source_fails_with_named_error(
 
     assert result.ok is False
     assert result.error == "No active research source for event: agent-test.42"
+
+
+def test_moderator_agent_update_event_validation_error_is_a_generic_failure(
+    tmp_path,
+) -> None:
+    url = database_url(tmp_path)
+    initialize_database(url)
+    tools_for_create = ModeratorAgentTools(database_url=url)
+    assert tools_for_create.create_event(event_fields()).ok is True
+
+    try:
+        EventProfileDraft.model_validate({})
+        raise AssertionError("EventProfileDraft.model_validate({}) must fail")
+    except ValidationError as error:
+        validation_error = error
+    engine = FakeEngine(refresh_error=validation_error)
+    tools = ModeratorAgentTools(database_url=url, engine=engine)  # type: ignore[arg-type]
+
+    result = asyncio.run(tools.update_event("agent-test.42"))
+
+    assert result.ok is False
+    assert (result.error or "").startswith("Could not update event:")
+    assert "No active research source" not in (result.error or "")
 
 
 def test_moderator_agent_tools_fail_closed_when_engine_is_not_configured(

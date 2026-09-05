@@ -114,8 +114,18 @@ jobs:
             uv run run4221-researcher --check-config
           docker compose run --rm -T --interactive=false --no-deps researcher uv run python -c \
             'from run4221.researcher.config import ResearcherSettings; s = ResearcherSettings(); assert not s.schedule_enabled and not s.rendering_enabled, "researcher must deploy ready-paused"'
-          docker compose run --rm -T --interactive=false --no-deps bot uv run python -c \
-            'from run4221.researcher.engine import build_engine; build_engine(); print("bot engine config ok")'
+          docker compose run --rm -T --interactive=false --no-deps bot uv run python -c '
+          from run4221.researcher.engine import build_engine
+          try:
+              build_engine()
+          except Exception as error:
+              raise SystemExit(
+                  f"bot engine preflight failed: {error}. Ensure bot.env carries "
+                  "OPENAI_API_KEY and the shared RESEARCHER_* block "
+                  "(see private deployment notes)."
+              )
+          print("bot engine config ok")
+          '
           service_replaced=true
           docker compose stop researcher
           docker compose up -d --build --no-deps --wait --wait-timeout 90 bot

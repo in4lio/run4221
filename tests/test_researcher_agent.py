@@ -314,6 +314,136 @@ def test_profile_locate_scout_searches_once_without_domain_filter() -> None:
     }
 
 
+def test_scout_boundary_is_mode_aware() -> None:
+    refresh_runner = FakeRunner(
+        fake_result(ScoutOutput(candidates=(candidate(),)), web_search_calls=1)
+    )
+    refresh_job = ResearchAgentJob(
+        instructions="Find event pages.",
+        prompt_reference="research_agent:v1",
+        budget=ResearchBudget(max_wall_time_seconds_per_job=10),
+        runner=refresh_runner,
+    )
+    asyncio.run(
+        refresh_job.scout(
+            ScoutRequest(
+                mode="refresh",
+                query="official registration status",
+                approved_source_url="https://events.example.com/marathon",
+            )
+        )
+    )
+    profile_runner = FakeRunner(
+        fake_result(ScoutOutput(candidates=(candidate(),)), web_search_calls=1)
+    )
+    profile_job = ResearchAgentJob(
+        instructions="Locate the official event page.",
+        prompt_reference="research_agent:v1",
+        budget=ResearchBudget(max_wall_time_seconds_per_job=10),
+        runner=profile_runner,
+    )
+    asyncio.run(
+        profile_job.scout(
+            ScoutRequest(
+                mode="profile",
+                query='"Example Marathon" Karlsruhe official event website',
+                context=(FrozenContextField(name="name", value="Example Marathon"),),
+            )
+        )
+    )
+
+    refresh_instructions = refresh_runner.calls[0]["starting_agent"].instructions
+    profile_instructions = profile_runner.calls[0]["starting_agent"].instructions
+    # Refresh stays pinned to the approved source's domain.
+    assert "same-domain" in refresh_instructions
+    assert "never repeat the approved source URL" in refresh_instructions
+    # Profile-locate hunts the event's official page on any domain instead.
+    assert "official page of the event" in profile_instructions
+    assert "whatever domain hosts it" in profile_instructions
+    assert "never repeat the already-captured page URL" in profile_instructions
+    assert "same-domain" not in profile_instructions
+    # Both variants keep the one-search provider cap.
+    for call in (refresh_runner.calls[0], profile_runner.calls[0]):
+        assert call["starting_agent"].model_settings.extra_args == {"max_tool_calls": 1}
+
+
+def test_profile_first_assessment_reserves_budget_for_locate_and_second_assessment() -> None:
+    # A verbose (unmetered) first assessment must still leave the locate scout
+    # and the follow-up assessment their reserves instead of starving them.
+    runner = FakeRunner(
+        fake_result(valid_profile_decision(page_is_event=False), output_tokens=None),
+        fake_result(
+            ScoutOutput(candidates=(candidate(),)),
+            web_search_calls=1,
+            output_tokens=None,
+        ),
+        fake_result(valid_profile_decision(), output_tokens=40),
+    )
+    job = ResearchAgentJob(
+        instructions="Assess only captured pages.",
+        prompt_reference="research_agent:v1",
+        budget=ResearchBudget(
+            max_agent_turns_per_job=6,
+            max_web_searches_per_job=2,
+            max_output_tokens_per_job=2_000,
+            max_retries_per_job=2,
+            max_wall_time_seconds_per_job=90,
+        ),
+        runner=runner,
+    )
+    request = AssessmentRequest(
+        mode="profile",
+        evidence=(
+            CapturedSnapshotEvidence(
+                reference=artifact_reference(),
+                final_url="https://example.com/marathon",
+                fetched_at=datetime(2026, 8, 31, tzinfo=UTC),
+                normalized_text="An aggregator listing for the marathon.",
+                text_hash="b" * 64,
+            ),
+        ),
+        reserve_continuation=True,
+    )
+
+    first = asyncio.run(job.assess(request))
+    scout = asyncio.run(
+        job.scout(
+            ScoutRequest(
+                mode="profile",
+                query='"Example Marathon" official event website',
+            )
+        )
+    )
+    second = asyncio.run(job.assess(assessment_request_profile()))
+
+    assert first.state is AgentRunState.SUCCEEDED
+    assert scout.state is AgentRunState.SUCCEEDED
+    assert second.state is AgentRunState.SUCCEEDED
+    first_call, scout_call, second_call = runner.calls
+    # The first assessment holds back two follow-up reserves (scout + assess).
+    assert first_call["starting_agent"].model_settings.max_tokens == 2_000 - 2 * 768
+    assert first_call["max_turns"] == 4
+    # After an unmetered first pass, the scout still gets a full reserve and
+    # itself holds back the final assessment's reserve.
+    assert scout_call["starting_agent"].model_settings.max_tokens == 768
+    assert second_call["starting_agent"].model_settings.max_tokens == 768
+
+
+def assessment_request_profile() -> AssessmentRequest:
+    return AssessmentRequest(
+        mode="profile",
+        evidence=(
+            CapturedSnapshotEvidence(
+                reference=artifact_reference(),
+                final_url="https://example.com/marathon",
+                fetched_at=datetime(2026, 8, 31, tzinfo=UTC),
+                normalized_text="Official marathon details.",
+                text_hash="b" * 64,
+            ),
+        ),
+    )
+
+
 def test_scout_uses_luna_web_search_and_explicit_provider_limits() -> None:
     runner = FakeRunner(
         fake_result(

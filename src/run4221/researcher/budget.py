@@ -61,8 +61,14 @@ class JobBudgetTracker:
         self,
         *,
         needs_web_search: bool,
-        reserve_assessment: bool = False,
+        reserve_followups: int = 0,
     ) -> ProviderCallLimits:
+        """Bound one provider call, holding back budget for `reserve_followups` calls.
+
+        A refresh scout reserves one follow-up (its assessor); the first profile
+        assessment reserves two (a potential locate scout plus its assessor).
+        """
+
         wall_time_seconds = self._deadline - self._clock()
         if wall_time_seconds <= 0:
             raise BudgetExhausted(BudgetCap.WALL_TIME)
@@ -76,10 +82,10 @@ class JobBudgetTracker:
         max_turns = self.remaining_turns
         max_output_tokens = self.remaining_output_tokens
         max_retries = self.remaining_retries
-        if reserve_assessment:
-            max_turns -= 1
-            max_output_tokens -= self._assessment_output_reserve()
-            wall_time_seconds -= self._assessment_wall_time_reserve()
+        if reserve_followups > 0:
+            max_turns -= reserve_followups
+            max_output_tokens -= reserve_followups * self._assessment_output_reserve()
+            wall_time_seconds -= reserve_followups * self._assessment_wall_time_reserve()
             if max_turns <= 0:
                 raise BudgetExhausted(BudgetCap.TURNS)
             if max_output_tokens <= 0:
@@ -104,6 +110,7 @@ class JobBudgetTracker:
         observation: BudgetObservation,
         *,
         preserve_assessment_reserve: bool = False,
+        preserved_followups: int = 1,
     ) -> BudgetCap | None:
         turns = max(1, observation.turns)
         turn_overrun = turns > self.remaining_turns
@@ -122,7 +129,7 @@ class JobBudgetTracker:
             self.remaining_output_tokens = (
                 min(
                     self.remaining_output_tokens,
-                    self._assessment_output_reserve(),
+                    preserved_followups * self._assessment_output_reserve(),
                 )
                 if preserve_assessment_reserve
                 else 0
@@ -146,11 +153,12 @@ class JobBudgetTracker:
         *,
         exhaust_turns: bool = False,
         preserve_assessment_reserve: bool = False,
+        preserved_followups: int = 1,
     ) -> None:
+        floor = preserved_followups if preserve_assessment_reserve else 0
         if exhaust_turns:
-            self.remaining_turns = 1 if preserve_assessment_reserve else 0
+            self.remaining_turns = floor
         else:
-            floor = 1 if preserve_assessment_reserve else 0
             self.remaining_turns = max(floor, self.remaining_turns - 1)
 
     def candidate_cap_exceeded(self, count: int) -> bool:

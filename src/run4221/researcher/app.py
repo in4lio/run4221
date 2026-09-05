@@ -83,14 +83,12 @@ class ResearcherWorker:
         self,
         settings: ResearcherSettings,
         *,
-        checked: CheckedConfig | None = None,
         service_factory: ServiceFactory | None = None,
         health: HealthStore | None = None,
         now: Callable[[], datetime] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self.settings = settings
-        self.checked = checked
         self.health = health or HealthStore(settings.health_path)
         self.now = now or (lambda: datetime.now(UTC))
         self.sleep = sleep
@@ -318,12 +316,12 @@ async def async_main(argv: list[str] | None = None) -> int:
         parser.error("--once and --event-id must be used together")
 
     settings = ResearcherSettings()
-    checked = check_config(settings)
+    check_config(settings)
     if args.check_config:
         print("run4221 researcher configuration passed")
         return 0
 
-    worker = ResearcherWorker(settings, checked=checked)
+    worker = ResearcherWorker(settings)
     if args.once:
         async def operation() -> object:
             return await worker.run_event(args.event_id, shadow=args.shadow)

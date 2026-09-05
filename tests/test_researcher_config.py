@@ -62,6 +62,21 @@ def test_researcher_settings_reject_invalid_configuration_without_revealing_key(
     assert secret not in str(error.value)
 
 
+def test_renamed_researcher_enabled_env_flag_fails_fast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The scheduling flag was renamed; a stale RESEARCHER_ENABLED in the
+    # environment must fail startup instead of being silently ignored.
+    monkeypatch.setenv("RESEARCHER_ENABLED", "true")
+
+    with pytest.raises(ValidationError, match="RESEARCHER_SCHEDULE_ENABLED"):
+        ResearcherSettings(_env_file=None, openai_api_key="test-api-key")
+
+    monkeypatch.delenv("RESEARCHER_ENABLED")
+    settings = ResearcherSettings(_env_file=None, openai_api_key="test-api-key")
+    assert settings.schedule_enabled is False
+
+
 def test_profile_wall_cap_is_shorter_than_refresh_and_env_configurable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

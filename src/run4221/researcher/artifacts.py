@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from run4221.ingestion.page_snapshot import PageSnapshot
 from run4221.researcher.schemas import (
@@ -317,7 +317,22 @@ class ResearchArtifactStore:
             prepared_reference = self._reference_from_path(prepared_path)
             if self._prepared_may_still_be_running(prepared_reference):
                 continue
-            prepared = self._read_prepared(prepared_reference)
+            try:
+                prepared = self._read_prepared(prepared_reference)
+            except (ArtifactIntegrityError, ValidationError):
+                # A legacy prepared.json whose decision no longer validates
+                # (e.g. a deleted action) must not poison reconciliation for
+                # every other run: park it behind a truthful failed terminal
+                # and keep processing.
+                terminal = self._write_incompatible_prepared_terminal(prepared_reference)
+                results.append(
+                    ReconciliationResult(
+                        run_id,
+                        QueueResolutionState.INCONCLUSIVE,
+                        terminal_reference=terminal,
+                    )
+                )
+                continue
             try:
                 resolution = resolver(prepared)
             except Exception as error:
@@ -433,6 +448,30 @@ class ResearchArtifactStore:
         except ArtifactExistsError:
             return self._reference_from_path(path)
 
+    def _write_incompatible_prepared_terminal(
+        self,
+        reference: ArtifactReference,
+    ) -> ArtifactReference:
+        """Terminate a run whose prepared decision no longer parses (append-only)."""
+
+        status = ResearchRunStatus(
+            status=RunState.FAILED,
+            outcome=RunOutcome.INCONCLUSIVE,
+            detail="Prepared decision is incompatible with the current schema.",
+        )
+        return self._write_named_artifact(
+            reference.run_id,
+            artifact_name="terminal.json",
+            artifact_type="terminal",
+            source_url=reference.source_url,
+            content={
+                "queue_state": QueueResolutionState.INCONCLUSIVE.value,
+                "queue_reference": None,
+                "prepared_artifact": reference.model_dump(mode="json"),
+                "status": status.model_dump(mode="json"),
+            },
+        )
+
     def _prepared_may_still_be_running(self, reference: ArtifactReference) -> bool:
         """Skip prepared runs younger than twice their producer-stamped wall cap."""
 
@@ -453,7 +492,9 @@ class ResearchArtifactStore:
         try:
             created_at = datetime.fromisoformat(str(payload.get("created_at")))
         except ValueError:
-            return False
+            # An unreadable creation time cannot prove the producer finished:
+            # treat the run as possibly still in flight and skip it this cycle.
+            return True
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=UTC)
         return self._utc_now() - created_at < timedelta(seconds=2 * float(cap))

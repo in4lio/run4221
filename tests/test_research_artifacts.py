@@ -435,6 +435,104 @@ def test_reconcile_skips_prepared_run_younger_than_twice_its_stamped_cap(
     assert (tmp_path / run_id / "terminal.json").exists()
 
 
+def rewrite_prepared_payload(store_root: Path, run_id: str, mutate) -> None:
+    """Hand-edit prepared.json like a legacy producer would have written it."""
+
+    prepared_path = store_root / run_id / "prepared.json"
+    payload = json.loads(prepared_path.read_text(encoding="utf-8"))
+    mutate(payload)
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    prepared_path.write_text(f"{serialized}\n", encoding="utf-8")
+
+
+def test_reconcile_parks_incompatible_legacy_prepared_run_and_continues(
+    tmp_path: Path,
+) -> None:
+    store, clock = reconcilable_store(tmp_path)
+    legacy_run = store.create_run(job_type="refresh")
+    store.prepare_decision(
+        legacy_run,
+        source_url=SOURCE_URL,
+        decision=decision(write_registration_evidence(store, legacy_run)),
+        committed_status=committed_status(),
+        producer_deadline_seconds=90,
+    )
+    healthy_run = store.create_run(job_type="refresh")
+    store.prepare_decision(
+        healthy_run,
+        source_url=SOURCE_URL,
+        decision=decision(write_registration_evidence(store, healthy_run)),
+        committed_status=committed_status(),
+        producer_deadline_seconds=90,
+    )
+    # A deleted decision action makes the stored payload unparsable today.
+    rewrite_prepared_payload(
+        tmp_path,
+        legacy_run,
+        lambda payload: payload["content"]["decision"].update(action="suggest_event"),
+    )
+    clock.advance(180)
+    resolved_runs: list[str] = []
+
+    def resolve(prepared) -> QueueResolution:
+        resolved_runs.append(prepared.reference.run_id)
+        return QueueResolution.absent()
+
+    results = {result.run_id: result for result in store.reconcile_prepared(resolve)}
+
+    # The incompatible run is parked behind a truthful failed terminal without
+    # ever reaching the resolver; the healthy run reconciles normally.
+    assert resolved_runs == [healthy_run]
+    assert set(results) == {legacy_run, healthy_run}
+    assert results[legacy_run].state is QueueResolutionState.INCONCLUSIVE
+    legacy_terminal = store.read_artifact(results[legacy_run].terminal_reference)
+    assert legacy_terminal["content"]["status"] == {
+        "detail": "Prepared decision is incompatible with the current schema.",
+        "outcome": "inconclusive",
+        "status": "failed",
+    }
+    assert legacy_terminal["content"]["queue_state"] == "inconclusive"
+    assert results[healthy_run].state is QueueResolutionState.ABSENT
+    # Both runs now hold terminals, so the next cycle has nothing left to do.
+    assert store.reconcile_prepared(resolve) == ()
+
+
+def test_reconcile_treats_unparsable_created_at_as_still_running(
+    tmp_path: Path,
+) -> None:
+    store, clock = reconcilable_store(tmp_path)
+    run_id = store.create_run(job_type="refresh")
+    store.prepare_decision(
+        run_id,
+        source_url=SOURCE_URL,
+        decision=decision(write_registration_evidence(store, run_id)),
+        committed_status=committed_status(),
+        producer_deadline_seconds=90,
+    )
+    rewrite_prepared_payload(
+        tmp_path,
+        run_id,
+        lambda payload: payload.update(created_at="not-a-timestamp"),
+    )
+    clock.advance(10 * LEGACY_PRODUCER_DEADLINE_SECONDS)
+    resolver_calls: list[object] = []
+
+    def resolve(prepared) -> QueueResolution:
+        resolver_calls.append(prepared)
+        return QueueResolution.absent()
+
+    # An unreadable creation time cannot prove the producer finished, so the
+    # run is conservatively skipped instead of being reconciled.
+    assert store.reconcile_prepared(resolve) == ()
+    assert resolver_calls == []
+    assert not (tmp_path / run_id / "terminal.json").exists()
+
+
 def test_reconcile_uses_conservative_default_for_legacy_prepared_files(
     tmp_path: Path,
 ) -> None:
