@@ -67,7 +67,7 @@ class EventProfileDraft(ResearchSchema):
     event_date: Annotated[str, Field(pattern=r"^\d{4}-\d{2}-\d{2}$")] | None = None
     distances: Annotated[tuple[ShortText, ...], Field(max_length=12)] = ()
     regions: Annotated[tuple[ShortText, ...], Field(max_length=12)] = ()
-    official_url: Annotated[str, Field(min_length=1, max_length=2_048)]
+    official_url: Annotated[str, Field(min_length=1, max_length=2_048)] | None = None
     registration_url: Annotated[str, Field(min_length=1, max_length=2_048)] | None = None
     registration_url_candidates: Annotated[
         tuple[RegistrationLinkCandidate, ...],
@@ -77,11 +77,10 @@ class EventProfileDraft(ResearchSchema):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
 
     _validate_source_url = field_validator("source_url")(validate_http_url)
-    _validate_official_url = field_validator("official_url")(validate_http_url)
 
-    @field_validator("registration_url")
+    @field_validator("official_url", "registration_url")
     @classmethod
-    def validate_registration_url(cls, value: str | None) -> str | None:
+    def validate_optional_url(cls, value: str | None) -> str | None:
         return None if value is None else validate_http_url(value)
 
 

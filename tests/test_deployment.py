@@ -190,6 +190,21 @@ def test_bootstrap_restores_owner_only_private_file_permissions_after_sync() -> 
     assert "-type f -exec chmod 600 {} +" in sync_step
 
 
+def test_bootstrap_prunes_superseded_prompt_files_after_sync() -> None:
+    workflow = read_project_file(".github/workflows/bootstrap-production.yml")
+    sync_step = workflow[
+        workflow.index("      - name: Sync private data to VPS") :
+        workflow.index("      - name: Seed prompts")
+    ]
+
+    prune_index = sync_step.index(
+        "rm -f '$remote_private_dir/prompts/discover_event_profile.instructions.txt'"
+    )
+    assert "'$remote_private_dir/prompts/update_registration_window.instructions.txt'" in sync_step
+    # The prune runs on the extracted tree, before glob seeding can see the files.
+    assert sync_step.index("tar -C '$remote_private_dir' -xzf -") < prune_index
+
+
 def test_bootstrap_stops_both_writers_and_checkpoints_wal_before_reset() -> None:
     workflow = read_project_file(".github/workflows/bootstrap-production.yml")
     reset_step = workflow[workflow.index("      - name: Reset database and seed suggestions") :]
