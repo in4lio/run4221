@@ -279,6 +279,93 @@ def test_reconcile_absent_prepared_decision_records_truthful_terminal(
     }
 
 
+def test_second_reconcile_walk_skips_previously_terminal_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, clock = reconcilable_store(tmp_path)
+    run_id = store.create_run(job_type="refresh")
+    evidence = write_registration_evidence(store, run_id)
+    store.prepare_decision(
+        run_id,
+        source_url=SOURCE_URL,
+        decision=decision(evidence),
+        committed_status=committed_status(),
+    )
+    clock.advance(2 * LEGACY_PRODUCER_DEADLINE_SECONDS)
+    resolver_calls: list[str] = []
+
+    def resolve(prepared) -> QueueResolution:
+        resolver_calls.append(prepared.reference.run_id)
+        return QueueResolution.absent()
+
+    first = store.reconcile_prepared(resolve)
+    assert [item.state for item in first] == [QueueResolutionState.ABSENT]
+    assert resolver_calls == [run_id]
+
+    # Deleting the terminal would make an uncached walk reconcile the
+    # prepared run again; the in-process terminal cache must skip the whole
+    # directory without a single artifact read or resolver call.
+    (tmp_path / run_id / "terminal.json").unlink()
+    reads: list[str] = []
+    original_read = ResearchArtifactStore.read_artifact
+
+    def counting_read(self, reference):
+        reads.append(reference.artifact_name)
+        return original_read(self, reference)
+
+    monkeypatch.setattr(ResearchArtifactStore, "read_artifact", counting_read)
+
+    assert store.reconcile_prepared(resolve) == ()
+    assert reads == []
+    assert resolver_calls == [run_id]
+
+
+def test_prune_removes_only_expired_terminal_runs(tmp_path: Path) -> None:
+    store, clock = reconcilable_store(tmp_path)
+    expired_terminal = store.create_run(job_type="refresh")
+    store.finalize_without_queue(
+        expired_terminal,
+        source_url=SOURCE_URL,
+        status=ResearchRunStatus(status="skipped", outcome="inconclusive"),
+    )
+    expired_open = store.create_run(job_type="refresh")
+    clock.advance(30 * 24 * 3_600)
+    young_terminal = store.create_run(job_type="refresh")
+    store.finalize_without_queue(
+        young_terminal,
+        source_url=SOURCE_URL,
+        status=ResearchRunStatus(status="skipped", outcome="inconclusive"),
+    )
+
+    pruned = store.prune_terminal_runs(older_than=clock.now - timedelta(days=7))
+
+    assert pruned == 1
+    assert not (tmp_path / expired_terminal).exists()
+    # A run without terminal.json is never touched, however old it is.
+    assert (tmp_path / expired_open).exists()
+    assert (tmp_path / young_terminal).exists()
+
+
+def test_prune_uses_directory_mtime_when_run_manifest_is_unreadable(
+    tmp_path: Path,
+) -> None:
+    store = ResearchArtifactStore(tmp_path)
+    run_id = store.create_run(job_type="refresh")
+    store.finalize_without_queue(
+        run_id,
+        source_url=SOURCE_URL,
+        status=ResearchRunStatus(status="skipped", outcome="inconclusive"),
+    )
+    run_dir = tmp_path / run_id
+    (run_dir / "run.json").write_bytes(b"not json")
+    stale = (datetime.now(UTC) - timedelta(days=10)).timestamp()
+    os.utime(run_dir, (stale, stale))
+
+    assert store.prune_terminal_runs(older_than=datetime.now(UTC) - timedelta(days=5)) == 1
+    assert not run_dir.exists()
+
+
 def test_non_queue_outcome_can_finalize_without_prepared_decision(tmp_path: Path) -> None:
     store = ResearchArtifactStore(tmp_path)
     run_id = store.create_run(job_type="refresh")

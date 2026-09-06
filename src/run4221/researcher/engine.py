@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 
 from agents import set_default_openai_key
 
+from run4221.db.bootstrap import ensure_database_schema
 from run4221.db.prompts import PromptVersionRecord
 from run4221.db.research import get_refresh_source
 from run4221.researcher.agent import ResearchAgentJob
@@ -32,9 +34,9 @@ class SourceNotFoundError(LookupError):
 class ResearchEngine:
     """One AI lever, two entry points.
 
-    Cached state is only the validated settings and the loaded prompt record;
-    every call constructs a fresh single-use job and service so each entry
-    point starts with a full budget.
+    Cached state is only the validated settings, the loaded prompt record,
+    and a schema-initialization flag; every call constructs a fresh
+    single-use job and service so each entry point starts with a full budget.
     """
 
     def __init__(
@@ -45,6 +47,7 @@ class ResearchEngine:
     ) -> None:
         self._settings = settings
         self._prompt = prompt
+        self._schema_ready = False
 
     @property
     def settings(self) -> ResearcherSettings:
@@ -62,6 +65,11 @@ class ResearchEngine:
     ) -> ResearcherService:
         """Construct one fresh single-job service; the engine's only factory."""
 
+        if not self._schema_ready:
+            # Schema creation runs once per engine, not once per service call:
+            # the per-job accessor functions must never pay create_all again.
+            ensure_database_schema(self._settings.database_url)
+            self._schema_ready = True
         prompt_reference = (
             f"{self._prompt.prompt_key}:{self._prompt.source}:v{self._prompt.version}"
         )
@@ -83,15 +91,21 @@ class ResearchEngine:
     async def profile(self, url: str) -> ProfileJobResult:
         """Draft one cited event profile; profile never persists by construction."""
 
-        return await self.build_service(persist_queue=True).profile(url)
+        service = await asyncio.to_thread(self.build_service, persist_queue=True)
+        return await service.profile(url)
 
     async def refresh_source(self, event_id: str) -> ResearchJobResult:
         """Refresh the event's registration page source, else its top source."""
 
-        source = get_refresh_source(event_id, database_url=self._settings.database_url)
+        source = await asyncio.to_thread(
+            get_refresh_source,
+            event_id,
+            database_url=self._settings.database_url,
+        )
         if source is None:
             raise SourceNotFoundError(f"No active research source for event: {event_id}")
-        return await self.build_service(persist_queue=True).refresh(source)
+        service = await asyncio.to_thread(self.build_service, persist_queue=True)
+        return await service.refresh(source)
 
 
 def build_engine(settings: ResearcherSettings | None = None) -> ResearchEngine:

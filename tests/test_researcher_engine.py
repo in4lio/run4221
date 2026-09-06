@@ -207,6 +207,29 @@ def test_refresh_source_without_active_source_fails_closed(
     assert not issubclass(SourceNotFoundError, ValueError)
 
 
+def test_build_service_runs_schema_creation_once_per_engine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initialize(tmp_path)
+    ensured: list[str | None] = []
+    monkeypatch.setattr(
+        engine_module,
+        "ensure_database_schema",
+        lambda database_url=None: ensured.append(database_url),
+    )
+    config = settings(tmp_path)
+    engine = ResearchEngine(
+        settings=config,
+        prompt=engine_module.load_researcher_prompt(config),
+    )
+
+    engine.build_service(persist_queue=False)
+    engine.build_service(persist_queue=False)
+
+    assert ensured == [config.database_url]
+
+
 def test_engine_caches_only_settings_and_prompt(tmp_path: Path) -> None:
     initialize(tmp_path)
     config = settings(tmp_path)

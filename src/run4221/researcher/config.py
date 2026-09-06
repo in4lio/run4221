@@ -81,6 +81,9 @@ class ResearcherSettings(BaseSettings):
         le=RESEARCHER_MAX_PENDING_SUGGESTIONS,
     )
     max_pending_updates: int = Field(default=50, ge=0, le=500)
+    # Terminal run directories older than this many days are pruned at cycle
+    # start; 0 keeps them forever.
+    run_retention_days: int = Field(default=90, ge=0, le=3_650)
 
     @model_validator(mode="after")
     def reject_renamed_schedule_flag(self) -> Self:
