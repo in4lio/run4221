@@ -1333,6 +1333,64 @@ def test_refresh_rejects_prior_edition_after_capture(tmp_path: Path) -> None:
     assert len(agent.assessment_calls) == 1
 
 
+def test_refresh_accepts_anchor_page_with_stale_title_year(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    source = tracked_source(url)
+    agent = FakeAgent(
+        decide=lambda request: supported_update(
+            request,
+            summary="The approved page banner announces the registration opening.",
+        ),
+    )
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(
+            source_url,
+            title="Baden Marathon | 19 - 20 SEPT 2026",
+            text=(
+                "Registration opens on Tuesday, 8 September at 12:00 PM! "
+                "See you on September 19th and 20th, 2027."
+            ),
+        )
+
+    result = asyncio.run(service(tmp_path, url=url, agent=agent, fetch=fetch).refresh(source))
+
+    assert result.status.outcome == "proposal_created"
+    assert count_proposed_event_updates(database_url=url) == 1
+
+
+def test_refresh_accepts_anchor_page_with_localized_event_name(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    payload = replace(
+        event_payload(),
+        official_url="https://generalibademarathon.example/",
+    )
+    add_event(payload, database_url=url)
+    source = list_due_sources(
+        due_before=datetime.now(UTC),
+        limit=1,
+        database_url=url,
+    )[0]
+    agent = FakeAgent(
+        decide=lambda request: supported_update(
+            request,
+            summary="The approved page banner announces the registration opening.",
+        ),
+    )
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(
+            source_url,
+            title="Generali Bade Marathon | 19 - 20 SEPT 2027",
+            text="Les inscriptions ouvrent le mardi 8 septembre a 12h00 !",
+        )
+
+    result = asyncio.run(service(tmp_path, url=url, agent=agent, fetch=fetch).refresh(source))
+
+    assert result.status.outcome == "proposal_created"
+    assert count_proposed_event_updates(database_url=url) == 1
+
+
 def test_refresh_rejects_different_same_year_event_after_capture(tmp_path: Path) -> None:
     url = database_url(tmp_path)
     source = tracked_source(url)

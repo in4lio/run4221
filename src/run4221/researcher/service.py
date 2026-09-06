@@ -510,6 +510,7 @@ class ResearcherService:
                 decision,
                 captures=tuple(captures),
                 event=frozen_event,
+                anchor_url=source.url,
             ):
                 return await self._finish_without_queue(
                     run_id,
@@ -574,6 +575,7 @@ class ResearcherService:
             captures=tuple(captures),
             event=frozen_event,
             changed_fields=changed_fields,
+            anchor_url=source.url,
         )
         if prepared_decision is None:
             return await self._finish_without_queue(
@@ -1069,11 +1071,12 @@ class ResearcherService:
         *,
         captures: tuple[CapturedPage, ...],
         event: TrackedEvent,
+        anchor_url: str | None = None,
     ) -> bool:
         if decision.conflicts or not self._valid_cited_references(decision, captures=captures):
             return False
         cited = set(decision.evidence)
-        qualified = _qualified_capture_references(captures, event)
+        qualified = _qualified_capture_references(captures, event, anchor_url=anchor_url)
         return any(
             item.evidence in cited
             and item.evidence in qualified
@@ -1091,6 +1094,7 @@ class ResearcherService:
         captures: tuple[CapturedPage, ...],
         event: TrackedEvent,
         changed_fields: dict[str, object],
+        anchor_url: str | None = None,
     ) -> ResearchDecision | None:
         retained_support = tuple(
             item for item in decision.field_support if item.field.value in changed_fields
@@ -1102,7 +1106,7 @@ class ResearcherService:
             not set(item.evidence).issubset(cited) for item in retained_support
         ):
             return None
-        qualified = _qualified_capture_references(captures, event)
+        qualified = _qualified_capture_references(captures, event, anchor_url=anchor_url)
         if any(not set(item.evidence).issubset(qualified) for item in retained_support):
             return None
         try:
@@ -1456,7 +1460,12 @@ _GENERIC_EVENT_IDENTITY_TERMS = frozenset(
 )
 
 
-def _matches_tracked_event_identity(snapshot: PageSnapshot, event: TrackedEvent) -> bool:
+def _matches_tracked_event_identity(
+    snapshot: PageSnapshot,
+    event: TrackedEvent,
+    *,
+    trusted_identity: bool = False,
+) -> bool:
     searchable = f"{snapshot.title or ''} {_snapshot_primary_text(snapshot)[:2_000]}"
     captured_tokens = event_identity_tokens(snapshot.final_url, searchable)
     expected_tokens = event_identity_tokens("", event.name) - _GENERIC_EVENT_IDENTITY_TERMS
@@ -1466,8 +1475,13 @@ def _matches_tracked_event_identity(snapshot: PageSnapshot, event: TrackedEvent)
         event_year is not None
         and explicit_identity_years
         and event_year not in explicit_identity_years
+        # A stale <title> year alone must not condemn a page whose body
+        # already talks about the stored edition's year.
+        and event_year not in re.findall(r"\b20\d{2}\b", snapshot.normalized_text)
     ):
         return False
+    if trusted_identity:
+        return True
     if expected_tokens:
         required_name_tokens = min(2, len(expected_tokens))
         return len(expected_tokens & captured_tokens) >= required_name_tokens
@@ -1493,13 +1507,33 @@ def _snapshot_primary_text(snapshot: PageSnapshot) -> str:
 def _qualified_capture_references(
     captures: tuple[CapturedPage, ...],
     event: TrackedEvent,
+    *,
+    anchor_url: str | None = None,
 ) -> frozenset[ArtifactReference]:
+    # The moderator vouched that the stored approved source belongs to this
+    # event, so the anchor capture skips the name-token guess (a localized
+    # page, e.g. "Genève" vs "Geneva", must not disqualify it). The edition
+    # year and distance-conflict checks still apply to every capture.
     return frozenset(
         capture.reference
         for capture in captures
         if not _conflicts_with_tracked_event(capture.snapshot, event)
-        and _matches_tracked_event_identity(capture.snapshot, event)
+        and _matches_tracked_event_identity(
+            capture.snapshot,
+            event,
+            trusted_identity=_is_anchor_capture(capture, anchor_url),
+        )
     )
+
+
+def _is_anchor_capture(capture: CapturedPage, anchor_url: str | None) -> bool:
+    if not anchor_url:
+        return False
+    normalized = normalize_url(anchor_url)
+    return normalized in {
+        normalize_url(capture.snapshot.source_url),
+        normalize_url(capture.snapshot.final_url),
+    }
 
 
 def _explicit_identity_years(snapshot: PageSnapshot) -> frozenset[str]:
