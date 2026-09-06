@@ -1536,6 +1536,45 @@ def test_update_review_confirmation_formats_action() -> None:
     assert "<b>Event ID</b>: <code>barcelona.42</code>" in text
 
 
+def test_update_review_confirmation_shows_proposed_changes() -> None:
+    update = researcher_update()
+
+    text = format_update_review_confirmation(update, action="apply")
+
+    assert len(text) <= 4_096
+    assert "<b>What's changed</b>" in text
+    assert "unknown" in text
+    assert "open" in text
+    assert text.index("<b>What's changed</b>") < text.index("Source check")
+    assert "This will apply the proposed fields to the tracked event." in text
+
+
+def test_update_review_confirmation_names_a_no_change_proposal() -> None:
+    update = replace(
+        researcher_update(),
+        current_fields={"registration_status": "open"},
+        proposed_fields={"registration_status": "open"},
+    )
+
+    text = format_update_review_confirmation(update, action="apply")
+
+    assert "<b>What's changed</b>" not in text
+    assert "Proposed values match the stored event" in text
+
+
+def test_update_detail_names_a_no_change_proposal() -> None:
+    update = replace(
+        researcher_update(),
+        current_fields={"registration_status": "open"},
+        proposed_fields={"registration_status": "open"},
+    )
+
+    detail = format_proposed_update_detail(update)
+
+    assert "<b>What's changed</b>" not in detail
+    assert "Proposed values match the stored event" in detail
+
+
 def test_apply_update_id_asks_for_confirmation(monkeypatch) -> None:
     update = ProposedEventUpdateRecord(
         id=3,
@@ -2503,10 +2542,8 @@ def test_researcher_update_detail_shows_validated_field_support_and_conflicts() 
 
     detail = format_proposed_update_detail(update)
 
-    assert (
-        "<b>Field support</b>: registration_status &lt;- "
-        "page_snapshot-status.json#bbbbbbbbbbbb"
-    ) in detail
+    assert "<b>Supported fields</b>: registration_status" in detail
+    assert "<b>Field support</b>" not in detail
     assert (
         "<b>Conflict</b>: event_date &lt;- "
         "page_snapshot-overview.json#cccccccccccc, "
@@ -2578,9 +2615,8 @@ def test_researcher_update_detail_bounds_complete_maximal_provenance() -> None:
     assert len(detail) <= 4_096
     assert detail.count("<blockquote>") == detail.count("</blockquote>") == 1
     assert detail.count("<code>") == detail.count("</code>")
-    assert detail.count("<b>Field support</b>") == len(fields)
-    for index, field in enumerate(fields, start=1):
-        assert f"{field} &lt;- E{index}.json#{str(index) * 12}" in detail
+    assert detail.count("<b>Supported fields</b>") == 1
+    assert f"<b>Supported fields</b>: {', '.join(fields)}" in detail
     assert f"<b>Run ID</b>: <code>{run_id}</code>" in detail
 
 

@@ -167,6 +167,9 @@ UPDATE_PARTIAL_APPLY_CALLBACK_PREFIX = "update:partial_apply:"
 UPDATE_APPLY_CONFIRM_CALLBACK_PREFIX = "update:confirm_apply:"
 UPDATE_REJECT_CONFIRM_CALLBACK_PREFIX = "update:confirm_reject:"
 UPDATE_REVIEW_CANCEL_CALLBACK = "update:review_cancel"
+PROPOSED_VALUES_MATCH_STORED_NOTE = (
+    "Proposed values match the stored event; applying will change nothing."
+)
 INPUT_RECEIVED_MESSAGE = "Got it."
 PANEL_CANCEL_CALLBACK = "panel:cancel"
 SUGGESTION_LIST_DEFAULT_LIMIT = 10
@@ -3532,7 +3535,6 @@ def format_draft_summary(
     lines = [
         format_major_title("Draft extracted from URL"),
         "",
-        "Draft fields come from the researcher engine over captured page evidence.",
         format_field_line("Confidence", f"{draft.confidence:.2f}"),
         format_field_line("Name", draft.name),
         format_field_line("Captured page", draft.source_url),
@@ -4625,11 +4627,26 @@ def format_update_review_confirmation(
         format_field_line("Event ID", update.event_id, kind="id"),
         format_field_line("Type", update.update_type),
     ]
-    lines.append(consequence)
-    _append_researcher_source_check(
-        lines,
-        update.evidence,
+    changed_field_count = max(1, len(proposed_update_changed_field_names(update)))
+    changes = proposed_update_changes(
+        update,
+        max_value_html_chars=min(450, max(120, 1_600 // (2 * changed_field_count))),
     )
+    if changes:
+        lines.extend(["", "<b>What's changed</b>"])
+        lines.extend(changes)
+    elif proposed_update_has_field_values(update):
+        lines.extend(["", PROPOSED_VALUES_MATCH_STORED_NOTE])
+    lines.extend(["", consequence])
+    provenance = parse_researcher_provenance(update.evidence)
+    if provenance is not None:
+        base = "\n".join(lines)
+        source_check = format_researcher_source_check(
+            provenance,
+            max_html_chars=4_096 - len(base) - 2,
+        )
+        if source_check:
+            lines.extend(["", source_check])
     return "\n".join(lines)
 
 
@@ -4806,6 +4823,8 @@ def format_proposed_update_detail(
     if changes:
         lines.extend(["", "<b>What's changed</b>"])
         lines.extend(changes)
+    elif proposed_update_has_field_values(update):
+        lines.extend(["", PROPOSED_VALUES_MATCH_STORED_NOTE])
 
     if provenance is not None:
         base = "\n".join(lines)
@@ -4863,6 +4882,13 @@ def proposed_update_changed_field_names(update: ProposedEventUpdateRecord) -> li
         if not is_empty_proposed_update_value(proposed_value)
         and update.current_fields.get(field) != proposed_value
     ]
+
+
+def proposed_update_has_field_values(update: ProposedEventUpdateRecord) -> bool:
+    return any(
+        not is_empty_proposed_update_value(value)
+        for value in update.proposed_fields.values()
+    )
 
 
 def encode_update_field_mask(
