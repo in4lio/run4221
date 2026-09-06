@@ -1,0 +1,54 @@
+name: Env Rename (one-shot)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: production-mutation
+  cancel-in-progress: false
+
+jobs:
+  rename:
+    name: Rename researcher schedule flag
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+
+    steps:
+      - name: Configure SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "${{ secrets.VPS_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Rename RESEARCHER_ENABLED to RESEARCHER_SCHEDULE_ENABLED
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+            bash -s <<'REMOTE'
+          set -euo pipefail
+          cd ~/.config/run4221
+          sed -i.bak-20260906 's/^RESEARCHER_ENABLED=/RESEARCHER_SCHEDULE_ENABLED=/' \
+            researcher.env bot.env
+          chmod 600 researcher.env.bak-20260906 bot.env.bak-20260906
+          if grep -q '^RESEARCHER_ENABLED=' researcher.env bot.env; then
+            echo "RENAME-FAILED" >&2
+            exit 1
+          fi
+          echo "RENAME-OK"
+          echo "--- variable names in bot.env ---"
+          grep -oE '^[A-Za-z_][A-Za-z0-9_]*' bot.env | sort
+          echo "--- variable names in researcher.env ---"
+          grep -oE '^[A-Za-z_][A-Za-z0-9_]*' researcher.env | sort
+          REMOTE
