@@ -2297,6 +2297,132 @@ def test_profile_locate_capture_shares_the_static_page_budget(tmp_path: Path) ->
     assert enriched_calls == [(PROFILE_URL, 2), (OFFICIAL_URL, 0)]
 
 
+def test_profile_locate_accepts_candidate_linked_from_first_capture(tmp_path: Path) -> None:
+    url = database_url(tmp_path)
+    located_url = "https://runfest.example/registration"
+    agent = FakeAgent(
+        candidates=(
+            ResearchCandidate(
+                source_url=located_url,
+                title="Run Fest",
+                snippet="Official event page.",
+            ),
+        ),
+        assessments=(
+            lambda request: profile_decision(request, page_is_event=False),
+            # The located domain differs from the draft's official URL domain,
+            # so the second draft must not carry a cross-domain official URL.
+            lambda request: draft_profile_decision(request, official_url=None),
+        ),
+    )
+    enriched_calls: list[tuple[str, int]] = []
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        links = (
+            (PageLink(url="https://runfest.example/home", text="event site"),)
+            if source_url == PROFILE_URL
+            else ()
+        )
+        return snapshot(source_url, links=links)
+
+    result = asyncio.run(
+        profile_service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=fetch,
+            enriched_calls=enriched_calls,
+        ).profile(PROFILE_URL)
+    )
+
+    # "runfest.example" shares no event-name token; the first capture's link
+    # to that domain is what corroborates the located page.
+    assert result.status.outcome == "profile_completed"
+    assert result.located is True
+    assert [call_url for call_url, _ in enriched_calls] == [PROFILE_URL, located_url]
+
+
+def test_profile_locate_accepts_candidate_domain_sharing_event_name_token(
+    tmp_path: Path,
+) -> None:
+    url = database_url(tmp_path)
+    located_url = "https://baden-events.example/marathon"
+    agent = FakeAgent(
+        candidates=(
+            ResearchCandidate(
+                source_url=located_url,
+                title="Baden Marathon",
+                snippet="Official event page.",
+            ),
+        ),
+        assessments=(
+            lambda request: profile_decision(request, page_is_event=False),
+            lambda request: draft_profile_decision(request, official_url=None),
+        ),
+    )
+    enriched_calls: list[tuple[str, int]] = []
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url)
+
+    result = asyncio.run(
+        profile_service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=fetch,
+            enriched_calls=enriched_calls,
+        ).profile(PROFILE_URL)
+    )
+
+    # No link and no mention of the domain in the first capture: the shared
+    # significant name token ("baden") corroborates; "marathon" alone is too
+    # generic to count.
+    assert result.status.outcome == "profile_completed"
+    assert result.located is True
+    assert [call_url for call_url, _ in enriched_calls] == [PROFILE_URL, located_url]
+
+
+def test_profile_locate_rejects_uncorroborated_candidate_before_second_capture(
+    tmp_path: Path,
+) -> None:
+    url = database_url(tmp_path)
+    agent = FakeAgent(
+        candidates=(
+            ResearchCandidate(
+                source_url="https://unrelated.example/race",
+                title="Some Race",
+                snippet="Search listing.",
+            ),
+        ),
+        assessments=(lambda request: profile_decision(request, page_is_event=False),),
+    )
+    enriched_calls: list[tuple[str, int]] = []
+
+    async def fetch(source_url: str) -> PageSnapshot:
+        return snapshot(source_url)
+
+    result = asyncio.run(
+        profile_service(
+            tmp_path,
+            url=url,
+            agent=agent,
+            fetch=fetch,
+            enriched_calls=enriched_calls,
+        ).profile(PROFILE_URL)
+    )
+
+    assert result.status.status == "skipped"
+    assert result.status.outcome == "inconclusive"
+    assert result.status.detail == (
+        "Located page could not be corroborated by the captured evidence."
+    )
+    assert result.draft is None
+    # Rejected deterministically before any second capture or assessment.
+    assert [call_url for call_url, _ in enriched_calls] == [PROFILE_URL]
+    assert len(agent.assessment_calls) == 1
+
+
 def test_profile_with_oversized_url_finalizes_failed_terminal(tmp_path: Path) -> None:
     url = database_url(tmp_path)
     agent = FakeAgent(decide=profile_decision)

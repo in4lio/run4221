@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import sys
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from run4221.db.prompts import PromptVersionRecord
 from run4221.db.research import (
     ResearchSourceRecord,
     find_research_queue_reference,
-    get_research_source,
+    get_refresh_source,
     list_due_sources,
     mark_source_checked,
 )
@@ -25,7 +26,7 @@ from run4221.researcher.artifacts import (
     ResearchArtifactStore,
 )
 from run4221.researcher.config import ResearcherSettings, load_researcher_prompt
-from run4221.researcher.engine import ResearchEngine, build_engine
+from run4221.researcher.engine import ResearchEngine, SourceNotFoundError, build_engine
 from run4221.researcher.health import HealthStore, check_researcher_health
 from run4221.researcher.lock import ProcessLock
 from run4221.researcher.schemas import ResearchBudget, ResearchRunStatus, RunOutcome, RunState
@@ -94,14 +95,22 @@ class ResearcherWorker:
         self.sleep = sleep
         self.service_factory = service_factory or self._default_service_factory
         self._engine: ResearchEngine | None = None
+        self._store: ResearchArtifactStore | None = None
 
     def initialize_health(self) -> None:
         self.health.initialize(enabled=self.settings.schedule_enabled)
 
+    def _artifact_store(self) -> ResearchArtifactStore:
+        # One store per worker: its terminal-run cache is what lets later
+        # reconcile cycles skip directories that already reached a terminal.
+        if self._store is None:
+            self._store = ResearchArtifactStore(self.settings.artifact_dir)
+        return self._store
+
     def reconcile_prepared(self) -> tuple[ReconciliationResult, ...]:
         """Finish interrupted queue lifecycles before accepting new work."""
 
-        store = ResearchArtifactStore(self.settings.artifact_dir)
+        store = self._artifact_store()
 
         def resolve(prepared):
             try:
@@ -121,28 +130,37 @@ class ResearcherWorker:
         return store.reconcile_prepared(resolve)
 
     async def run_event(self, event_id: str, *, shadow: bool = False) -> JobExecution:
-        source = get_research_source(event_id, database_url=self.settings.database_url)
+        # One-shot runs resolve the source with the same preference the
+        # engine applies: the registration page outranks the official site.
+        source = await asyncio.to_thread(
+            get_refresh_source,
+            event_id,
+            database_url=self.settings.database_url,
+        )
         if source is None:
-            raise ValueError(f"No active research source for event: {event_id}")
+            raise SourceNotFoundError(f"No active research source for event: {event_id}")
         return await self._execute_refresh(source, shadow=shadow)
 
     async def run_cycle(self, *, shadow: bool = False) -> CycleResult:
         # Finish any interrupted queue lifecycle before starting new work, on
         # every cycle rather than once per process.
-        self.reconcile_prepared()
+        await asyncio.to_thread(self.reconcile_prepared)
+        await asyncio.to_thread(self.prune_expired_runs)
         self.health.set_idle(enabled=self.settings.schedule_enabled)
         if not self.settings.schedule_enabled:
             return CycleResult()
 
         now = self.now()
-        sources = list_due_sources(
+        sources = await asyncio.to_thread(
+            list_due_sources,
             due_before=now - DAILY_WINDOW,
             limit=self.settings.max_events_per_cycle,
             database_url=self.settings.database_url,
         )
         attempted = failed = 0
         for source in sources:
-            if not mark_source_checked(
+            if not await asyncio.to_thread(
+                mark_source_checked,
                 source.source_id,
                 checked_at=now,
                 database_url=self.settings.database_url,
@@ -154,6 +172,19 @@ class ResearcherWorker:
 
         self.health.set_idle(enabled=True)
         return CycleResult(attempted=attempted, failed=failed)
+
+    def prune_expired_runs(self) -> int:
+        """Delete terminal run directories older than the retention window."""
+
+        retention_days = self.settings.run_retention_days
+        if retention_days < 1:
+            return 0
+        pruned = self._artifact_store().prune_terminal_runs(
+            older_than=self.now() - timedelta(days=retention_days)
+        )
+        if pruned:
+            LOGGER.info("Pruned %d expired research run directories.", pruned)
+        return pruned
 
     async def run_loop(self, *, shadow: bool = False, max_cycles: int | None = None) -> None:
         cycles = 0
@@ -202,7 +233,8 @@ class ResearcherWorker:
             result = await invoke(service)
         except Exception as error:
             LOGGER.exception("Researcher job failed: %s", label)
-            result = self._audit_failure(
+            result = await asyncio.to_thread(
+                self._audit_failure,
                 service,
                 announced_run_id=announced_run_id,
                 source_url=source_url,
@@ -331,7 +363,11 @@ async def async_main(argv: list[str] | None = None) -> int:
     else:
         async def operation() -> object:
             return await worker.run_loop(shadow=args.shadow)
-    await run_with_lock(worker, operation)
+    try:
+        await run_with_lock(worker, operation)
+    except SourceNotFoundError as error:
+        print(f"run4221-researcher: {error}", file=sys.stderr)
+        return 2
     return 0
 
 

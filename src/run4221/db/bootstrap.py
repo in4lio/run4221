@@ -1,16 +1,28 @@
 from __future__ import annotations
 
-from sqlalchemy import select
+from weakref import WeakSet
+
+from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
 from run4221.db.models import Base, Event, EventSuggestion
 from run4221.db.seed import seed_initial_data
 from run4221.db.session import get_engine, session_scope
 
+# Engines whose schema this process already created. create_all is idempotent
+# but issues per-table reflection queries on every call; accessor functions
+# call this on every operation, so repeat calls must be cheap. Keyed by the
+# live Engine object: a reset (which clears the engine cache) or an evicted
+# engine naturally drops out and gets create_all again.
+_schema_ready_engines: WeakSet[Engine] = WeakSet()
+
 
 def ensure_database_schema(database_url: str | None = None) -> None:
     engine = get_engine(database_url)
+    if engine in _schema_ready_engines:
+        return
     Base.metadata.create_all(engine)
+    _schema_ready_engines.add(engine)
 
 
 def initialize_database(

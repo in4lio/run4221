@@ -241,7 +241,8 @@ class ResearcherService:
 
         frozen_event = source.event
         frozen_fields = _current_fields(frozen_event)
-        run_id = self.artifacts.create_run(
+        run_id = await asyncio.to_thread(
+            self.artifacts.create_run,
             job_type="refresh",
             metadata={
                 "event_id": frozen_event.id,
@@ -260,7 +261,7 @@ class ResearcherService:
                     frozen_fields,
                 )
         except TimeoutError:
-            return self._finish_without_queue(
+            return await self._finish_without_queue(
                 run_id,
                 source.url,
                 RunState.CAPPED,
@@ -271,7 +272,7 @@ class ResearcherService:
             # Request construction failed (e.g. an oversized context value):
             # fail closed with a terminal artifact instead of leaking the
             # error and leaving the run directory without terminal.json.
-            return self._finish_without_queue(
+            return await self._finish_without_queue(
                 run_id,
                 source.url,
                 RunState.FAILED,
@@ -289,7 +290,7 @@ class ResearcherService:
         try:
             captured = await self._capture(run_id, source.url)
         except PageFetchError as error:
-            return self._finish_without_queue(
+            return await self._finish_without_queue(
                 run_id,
                 source.url,
                 RunState.FAILED,
@@ -297,7 +298,7 @@ class ResearcherService:
                 f"Approved source capture failed ({type(error).__name__}).",
             )
         if reason := blocked_page_reason(captured.snapshot):
-            return self._finish_without_queue(
+            return await self._finish_without_queue(
                 run_id,
                 source.url,
                 RunState.SKIPPED,
@@ -305,7 +306,7 @@ class ResearcherService:
                 f"Approved source was unusable: {reason}.",
             )
         if not _same_source_domain(captured.snapshot.final_url, source.url):
-            return self._finish_without_queue(
+            return await self._finish_without_queue(
                 run_id,
                 source.url,
                 RunState.SKIPPED,
@@ -329,16 +330,16 @@ class ResearcherService:
                     evidence=tuple(item.as_agent_evidence() for item in captures),
                 )
             )
-            self._record_assessment(run_id, source.url, assessment)
+            await asyncio.to_thread(self._record_assessment, run_id, source.url, assessment)
             if assessment.state is not AgentRunState.SUCCEEDED:
-                return self._finish_agent_outcome(run_id, source.url, assessment)
+                return await self._finish_agent_outcome(run_id, source.url, assessment)
             if assessment.decision is not None:
                 try:
                     decision = ResearchDecision.model_validate(
                         assessment.decision.model_dump(mode="python")
                     )
                 except Exception:
-                    return self._finish_without_queue(
+                    return await self._finish_without_queue(
                         run_id,
                         source.url,
                         RunState.SKIPPED,
@@ -349,7 +350,7 @@ class ResearcherService:
 
             evidence_request = assessment.evidence_request
             if not isinstance(evidence_request, EvidenceRequest):
-                return self._finish_without_queue(
+                return await self._finish_without_queue(
                     run_id,
                     source.url,
                     RunState.SKIPPED,
@@ -359,7 +360,7 @@ class ResearcherService:
             normalized_query = _normalize_refresh_query(evidence_request.query)
             purpose = evidence_request.purpose
             if len(completed_purposes) >= MAX_REFRESH_CONTINUATIONS:
-                return self._finish_without_queue(
+                return await self._finish_without_queue(
                     run_id,
                     source.url,
                     RunState.CAPPED,
@@ -367,7 +368,7 @@ class ResearcherService:
                     "Refresh continuation budget was exhausted.",
                 )
             if normalized_query in normalized_queries or purpose in completed_purposes:
-                return self._finish_without_queue(
+                return await self._finish_without_queue(
                     run_id,
                     source.url,
                     RunState.SKIPPED,
@@ -379,7 +380,7 @@ class ResearcherService:
                 self.budget.max_static_pages_per_job,
             )
             if successful_captures >= capture_limit:
-                return self._finish_without_queue(
+                return await self._finish_without_queue(
                     run_id,
                     source.url,
                     RunState.CAPPED,
@@ -401,7 +402,7 @@ class ResearcherService:
                     MAX_REFRESH_WEB_SEARCHES,
                     self.budget.max_web_searches_per_job,
                 ):
-                    return self._finish_without_queue(
+                    return await self._finish_without_queue(
                         run_id,
                         source.url,
                         RunState.CAPPED,
@@ -420,11 +421,11 @@ class ResearcherService:
                         context=context,
                     )
                 )
-                self._record_scout(run_id, source.url, scout)
+                await asyncio.to_thread(self._record_scout, run_id, source.url, scout)
                 if scout.state is not AgentRunState.SUCCEEDED:
-                    return self._finish_agent_outcome(run_id, source.url, scout)
+                    return await self._finish_agent_outcome(run_id, source.url, scout)
                 if scout.metadata.web_search_calls > 1:
-                    return self._finish_without_queue(
+                    return await self._finish_without_queue(
                         run_id,
                         source.url,
                         RunState.CAPPED,
@@ -438,7 +439,7 @@ class ResearcherService:
                     approved_source_url=source.url,
                 )
             if not candidate_urls:
-                return self._finish_without_queue(
+                return await self._finish_without_queue(
                     run_id,
                     source.url,
                     RunState.SKIPPED,
@@ -450,7 +451,7 @@ class ResearcherService:
             rejected_candidates: list[str] = []
             for candidate_url in candidate_urls:
                 if successful_captures >= capture_limit:
-                    return self._finish_without_queue(
+                    return await self._finish_without_queue(
                         run_id,
                         source.url,
                         RunState.CAPPED,
@@ -488,7 +489,7 @@ class ResearcherService:
                 qualified = followup
                 break
             if qualified is None:
-                return self._finish_without_queue(
+                return await self._finish_without_queue(
                     run_id,
                     source.url,
                     RunState.SKIPPED,
@@ -504,12 +505,13 @@ class ResearcherService:
             completed_purposes.add(purpose)
 
         if decision.action in {DecisionAction.NO_CHANGE, DecisionAction.INCONCLUSIVE}:
-            if decision.action is DecisionAction.NO_CHANGE and not self._valid_refresh_no_change(
+            if decision.action is DecisionAction.NO_CHANGE and not await asyncio.to_thread(
+                self._valid_refresh_no_change,
                 decision,
                 captures=tuple(captures),
                 event=frozen_event,
             ):
-                return self._finish_without_queue(
+                return await self._finish_without_queue(
                     run_id,
                     source.url,
                     RunState.SKIPPED,
@@ -521,7 +523,7 @@ class ResearcherService:
                 if decision.action is DecisionAction.NO_CHANGE
                 else RunOutcome.INCONCLUSIVE
             )
-            return self._finish_without_queue(
+            return await self._finish_without_queue(
                 run_id,
                 source.url,
                 RunState.SUCCEEDED if outcome is RunOutcome.NO_CHANGE else RunState.SKIPPED,
@@ -529,15 +531,17 @@ class ResearcherService:
                 decision.summary,
             )
         if decision.action is not DecisionAction.PROPOSE_UPDATE:
-            return self._finish_without_queue(
+            return await self._finish_without_queue(
                 run_id,
                 source.url,
                 RunState.SKIPPED,
                 RunOutcome.INCONCLUSIVE,
                 "Refresh decisions cannot create new-event suggestions.",
             )
-        if not self._valid_cited_references(decision, captures=tuple(captures)):
-            return self._finish_without_queue(
+        if not await asyncio.to_thread(
+            self._valid_cited_references, decision, captures=tuple(captures)
+        ):
+            return await self._finish_without_queue(
                 run_id,
                 source.url,
                 RunState.SKIPPED,
@@ -547,7 +551,7 @@ class ResearcherService:
 
         changed_fields = _changed_supported_fields(decision, frozen_fields)
         if not changed_fields:
-            return self._finish_without_queue(
+            return await self._finish_without_queue(
                 run_id,
                 source.url,
                 RunState.SKIPPED,
@@ -558,7 +562,7 @@ class ResearcherService:
             # Stale-edition guard: a page proposing a date strictly before the
             # stored event date is evidence about an older edition, never a
             # forward correction.
-            return self._finish_without_queue(
+            return await self._finish_without_queue(
                 run_id,
                 source.url,
                 RunState.SKIPPED,
@@ -572,7 +576,7 @@ class ResearcherService:
             changed_fields=changed_fields,
         )
         if prepared_decision is None:
-            return self._finish_without_queue(
+            return await self._finish_without_queue(
                 run_id,
                 source.url,
                 RunState.SKIPPED,
@@ -580,7 +584,7 @@ class ResearcherService:
                 "Update decision failed captured support, applicability, or conflict validation.",
             )
         if not self.persist_queue:
-            return self._finish_without_queue(
+            return await self._finish_without_queue(
                 run_id,
                 source.url,
                 RunState.SUCCEEDED,
@@ -591,7 +595,8 @@ class ResearcherService:
             status=RunState.SUCCEEDED,
             outcome=RunOutcome.PROPOSAL_CREATED,
         )
-        prepared = self.artifacts.prepare_decision(
+        prepared = await asyncio.to_thread(
+            self.artifacts.prepare_decision,
             run_id,
             source_url=source.url,
             decision=prepared_decision,
@@ -611,7 +616,8 @@ class ResearcherService:
             decision=prepared_decision,
         )
         try:
-            admission = admit_proposed_update(
+            admission = await asyncio.to_thread(
+                admit_proposed_update,
                 ProposedEventUpdateCreate(
                     event_id=frozen_event.id,
                     update_type="registration_window",
@@ -625,7 +631,7 @@ class ResearcherService:
                 database_url=self.database_url,
             )
         except Exception:
-            return self._finish_rejected_admission(
+            return await self._finish_rejected_admission(
                 prepared,
                 RunState.FAILED,
                 "Proposal admission failed before commit.",
@@ -635,7 +641,7 @@ class ResearcherService:
                 "conflicting_pending": "A conflicting pending proposal already exists.",
                 "queue_full": "The researcher proposal queue is full.",
             }[admission.outcome]
-            return self._finish_rejected_admission(
+            return await self._finish_rejected_admission(
                 prepared,
                 RunState.CAPPED if admission.outcome == "queue_full" else RunState.SKIPPED,
                 detail,
@@ -643,7 +649,8 @@ class ResearcherService:
             )
 
         queue_reference = f"proposed_event_update:{admission.update.id}"
-        terminal = self.artifacts.finalize_committed(
+        terminal = await asyncio.to_thread(
+            self.artifacts.finalize_committed,
             prepared,
             queue_reference=queue_reference,
         )
@@ -657,7 +664,8 @@ class ResearcherService:
     async def profile(self, url: str) -> ProfileJobResult:
         """Draft one cited event profile from one enriched capture; never touch queues."""
 
-        run_id = self.artifacts.create_run(
+        run_id = await asyncio.to_thread(
+            self.artifacts.create_run,
             job_type="profile",
             metadata={"source_url": url},
         )
@@ -666,7 +674,7 @@ class ResearcherService:
             async with asyncio.timeout(self.budget.max_wall_time_seconds_per_profile_job):
                 return await self._profile_started(run_id, url)
         except TimeoutError:
-            return self._finish_profile(
+            return await self._finish_profile(
                 run_id,
                 url,
                 RunState.CAPPED,
@@ -677,7 +685,7 @@ class ResearcherService:
             # Request construction failed (e.g. a URL longer than the frozen
             # context allows): fail closed with a terminal artifact instead of
             # leaking the error and leaving the run directory unterminated.
-            return self._finish_profile(
+            return await self._finish_profile(
                 run_id,
                 url,
                 RunState.FAILED,
@@ -696,7 +704,7 @@ class ResearcherService:
                 max_linked_pages=first_linked_pages,
             )
         except PageFetchError as error:
-            return self._finish_profile(
+            return await self._finish_profile(
                 run_id,
                 url,
                 RunState.FAILED,
@@ -704,7 +712,7 @@ class ResearcherService:
                 f"Profile page capture failed ({type(error).__name__}).",
             )
         if reason := blocked_page_reason(captured.snapshot):
-            return self._finish_profile(
+            return await self._finish_profile(
                 run_id,
                 url,
                 RunState.SKIPPED,
@@ -727,20 +735,20 @@ class ResearcherService:
         if decision.page_is_event is not False:
             assert decision.draft is not None
             if not _draft_matches_capture(decision.draft, captured.snapshot):
-                return self._finish_profile(
+                return await self._finish_profile(
                     run_id,
                     url,
                     RunState.SKIPPED,
                     RunOutcome.INCONCLUSIVE,
                     "Draft URLs did not match the captured evidence.",
                 )
-            return self._finish_profile_draft(run_id, url, decision)
+            return await self._finish_profile_draft(run_id, url, decision)
 
         # The captured page is not the event's own page: run exactly one
         # bounded locating search, capture the official page, assess once more.
         assert decision.draft is not None
         if self.budget.max_web_searches_per_job < 1:
-            return self._finish_profile(
+            return await self._finish_profile(
                 run_id,
                 url,
                 RunState.CAPPED,
@@ -755,11 +763,11 @@ class ResearcherService:
                 context=context,
             )
         )
-        self._record_scout(run_id, url, scout)
+        await asyncio.to_thread(self._record_scout, run_id, url, scout)
         if scout.state is not AgentRunState.SUCCEEDED:
-            return self._finish_profile_agent_outcome(run_id, url, scout)
+            return await self._finish_profile_agent_outcome(run_id, url, scout)
         if scout.metadata.web_search_calls > 1:
-            return self._finish_profile(
+            return await self._finish_profile(
                 run_id,
                 url,
                 RunState.CAPPED,
@@ -773,12 +781,28 @@ class ResearcherService:
             ),
         )
         if official_url is None:
-            return self._finish_profile(
+            return await self._finish_profile(
                 run_id,
                 url,
                 RunState.SKIPPED,
                 RunOutcome.INCONCLUSIVE,
                 "Locating search produced no new official-page candidate.",
+            )
+        if not _locate_candidate_corroborated(
+            official_url,
+            snapshot=captured.snapshot,
+            draft=decision.draft,
+        ):
+            # A located URL is only trusted when the captured evidence can
+            # deterministically vouch for it: the first capture links to or
+            # mentions its domain, or the domain carries a significant token
+            # of the event name. Anything else is never fetched.
+            return await self._finish_profile(
+                run_id,
+                url,
+                RunState.SKIPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Located page could not be corroborated by the captured evidence.",
             )
         try:
             # The locate capture may only enrich with whatever linked-page
@@ -792,7 +816,7 @@ class ResearcherService:
                 ),
             )
         except PageFetchError as error:
-            return self._finish_profile(
+            return await self._finish_profile(
                 run_id,
                 url,
                 RunState.FAILED,
@@ -800,7 +824,7 @@ class ResearcherService:
                 f"Official page capture failed ({type(error).__name__}).",
             )
         if reason := blocked_page_reason(official.snapshot):
-            return self._finish_profile(
+            return await self._finish_profile(
                 run_id,
                 url,
                 RunState.SKIPPED,
@@ -817,7 +841,7 @@ class ResearcherService:
             return failure
         assert located_decision is not None
         if located_decision.page_is_event is False:
-            return self._finish_profile(
+            return await self._finish_profile(
                 run_id,
                 url,
                 RunState.SKIPPED,
@@ -826,14 +850,14 @@ class ResearcherService:
             )
         assert located_decision.draft is not None
         if not _draft_matches_capture(located_decision.draft, official.snapshot):
-            return self._finish_profile(
+            return await self._finish_profile(
                 run_id,
                 url,
                 RunState.SKIPPED,
                 RunOutcome.INCONCLUSIVE,
                 "Draft URLs did not match the captured evidence.",
             )
-        return self._finish_profile_draft(run_id, url, located_decision, located=True)
+        return await self._finish_profile_draft(run_id, url, located_decision, located=True)
 
     async def _profile_assessment(
         self,
@@ -852,15 +876,15 @@ class ResearcherService:
                 reserve_continuation=reserve_continuation,
             )
         )
-        self._record_assessment(run_id, url, assessment)
+        await asyncio.to_thread(self._record_assessment, run_id, url, assessment)
         if assessment.state is not AgentRunState.SUCCEEDED or assessment.decision is None:
-            return None, self._finish_profile_agent_outcome(run_id, url, assessment)
+            return None, await self._finish_profile_agent_outcome(run_id, url, assessment)
         try:
             decision = ResearchDecision.model_validate(
                 assessment.decision.model_dump(mode="python")
             )
         except Exception:
-            return None, self._finish_profile(
+            return None, await self._finish_profile(
                 run_id,
                 url,
                 RunState.SKIPPED,
@@ -868,7 +892,7 @@ class ResearcherService:
                 "Terminal decision failed host schema validation.",
             )
         if decision.action is DecisionAction.INCONCLUSIVE:
-            return None, self._finish_profile(
+            return None, await self._finish_profile(
                 run_id,
                 url,
                 RunState.SKIPPED,
@@ -876,15 +900,17 @@ class ResearcherService:
                 decision.summary,
             )
         if decision.action is not DecisionAction.PROFILE_EVENT or decision.draft is None:
-            return None, self._finish_profile(
+            return None, await self._finish_profile(
                 run_id,
                 url,
                 RunState.SKIPPED,
                 RunOutcome.INCONCLUSIVE,
                 "Profile assessments can only profile the captured page.",
             )
-        if not self._valid_cited_references(decision, captures=(capture,)):
-            return None, self._finish_profile(
+        if not await asyncio.to_thread(
+            self._valid_cited_references, decision, captures=(capture,)
+        ):
+            return None, await self._finish_profile(
                 run_id,
                 url,
                 RunState.SKIPPED,
@@ -909,10 +935,10 @@ class ResearcherService:
             raise
         except Exception as error:
             raise PageFetchError("Page capture failed.") from error
-        reference = self.artifacts.write_page_snapshot(run_id, snapshot)
+        reference = await asyncio.to_thread(self.artifacts.write_page_snapshot, run_id, snapshot)
         return CapturedPage(snapshot=snapshot, reference=reference)
 
-    def _finish_profile(
+    async def _finish_profile(
         self,
         run_id: str,
         source_url: str,
@@ -921,14 +947,15 @@ class ResearcherService:
         detail: str,
     ) -> ProfileJobResult:
         status = ResearchRunStatus(status=state, outcome=outcome, detail=detail[:1_000])
-        terminal = self.artifacts.finalize_without_queue(
+        terminal = await asyncio.to_thread(
+            self.artifacts.finalize_without_queue,
             run_id,
             source_url=source_url,
             status=status,
         )
         return ProfileJobResult(run_id, status, terminal)
 
-    def _finish_profile_draft(
+    async def _finish_profile_draft(
         self,
         run_id: str,
         source_url: str,
@@ -941,7 +968,8 @@ class ResearcherService:
             outcome=RunOutcome.PROFILE_COMPLETED,
             detail=decision.summary[:1_000],
         )
-        terminal = self.artifacts.finalize_without_queue(
+        terminal = await asyncio.to_thread(
+            self.artifacts.finalize_without_queue,
             run_id,
             source_url=source_url,
             status=status,
@@ -954,13 +982,13 @@ class ResearcherService:
             located=located,
         )
 
-    def _finish_profile_agent_outcome(
+    async def _finish_profile_agent_outcome(
         self,
         run_id: str,
         source_url: str,
         result: ScoutRunResult | AssessmentRunResult,
     ) -> ProfileJobResult:
-        return self._finish_profile(
+        return await self._finish_profile(
             run_id,
             source_url,
             _AGENT_TERMINAL_STATES[result.state],
@@ -981,7 +1009,7 @@ class ResearcherService:
             raise
         except Exception as error:
             raise PageFetchError("Page capture failed.") from error
-        reference = self.artifacts.write_page_snapshot(run_id, snapshot)
+        reference = await asyncio.to_thread(self.artifacts.write_page_snapshot, run_id, snapshot)
         return CapturedPage(snapshot=snapshot, reference=reference)
 
     def _record_scout(
@@ -1110,13 +1138,13 @@ class ResearcherService:
             return False
         return True
 
-    def _finish_agent_outcome(
+    async def _finish_agent_outcome(
         self,
         run_id: str,
         source_url: str,
         result: ScoutRunResult | AssessmentRunResult,
     ) -> ResearchJobResult:
-        return self._finish_without_queue(
+        return await self._finish_without_queue(
             run_id,
             source_url,
             _AGENT_TERMINAL_STATES[result.state],
@@ -1124,7 +1152,7 @@ class ResearcherService:
             result.detail or result.error_code or "Agent returned no usable decision.",
         )
 
-    def _finish_without_queue(
+    async def _finish_without_queue(
         self,
         run_id: str,
         source_url: str,
@@ -1133,14 +1161,15 @@ class ResearcherService:
         detail: str,
     ) -> ResearchJobResult:
         status = ResearchRunStatus(status=state, outcome=outcome, detail=detail[:1_000])
-        terminal = self.artifacts.finalize_without_queue(
+        terminal = await asyncio.to_thread(
+            self.artifacts.finalize_without_queue,
             run_id,
             source_url=source_url,
             status=status,
         )
         return ResearchJobResult(run_id, status, terminal)
 
-    def _finish_rejected_admission(
+    async def _finish_rejected_admission(
         self,
         prepared: ArtifactReference,
         state: RunState,
@@ -1150,7 +1179,9 @@ class ResearcherService:
         conflicting_update_id: int | None = None,
     ) -> ResearchJobResult:
         status = ResearchRunStatus(status=state, outcome=outcome, detail=detail)
-        terminal = self.artifacts.finalize_uncommitted(prepared, status=status)
+        terminal = await asyncio.to_thread(
+            self.artifacts.finalize_uncommitted, prepared, status=status
+        )
         return ResearchJobResult(
             prepared.run_id,
             status,
@@ -1230,6 +1261,41 @@ def _locate_candidate_url(
             continue
         return candidate.source_url
     return None
+
+
+def _locate_candidate_corroborated(
+    candidate_url: str,
+    *,
+    snapshot: PageSnapshot,
+    draft: EventProfileDraft | None,
+) -> bool:
+    """The captured evidence must vouch for a located candidate URL.
+
+    Either the FIRST capture already points at the candidate's domain (via a
+    link or a mention in its normalized text), or the domain shares at least
+    one significant event-name token with the profile draft (generic terms
+    like marathon/run/race never corroborate).
+    """
+
+    domain = _safe_source_domain(candidate_url)
+    if domain is None:
+        return False
+    if any(_safe_source_domain(link.url) == domain for link in snapshot.links):
+        return True
+    if domain in snapshot.normalized_text.casefold():
+        return True
+    if draft is None:
+        return False
+    name_tokens = event_identity_tokens("", draft.name) - _GENERIC_EVENT_IDENTITY_TERMS
+    domain_labels = frozenset(re.findall(r"[^\W_]+", domain))
+    return bool(name_tokens & domain_labels)
+
+
+def _safe_source_domain(url: str) -> str | None:
+    try:
+        return source_domain(url)
+    except ValueError:
+        return None
 
 
 @dataclass(frozen=True)

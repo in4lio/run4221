@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import shutil
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -140,6 +141,9 @@ class ResearchArtifactStore:
         self.max_collection_items = max_collection_items
         self.max_depth = max_depth
         self.max_json_bytes = max_json_bytes
+        # Run ids this store instance already saw with a terminal.json:
+        # subsequent reconcile walks skip their directories entirely.
+        self._terminal_run_ids: set[str] = set()
 
     def create_run(
         self,
@@ -303,13 +307,18 @@ class ResearchArtifactStore:
             return ()
         results: list[ReconciliationResult] = []
         for run_dir in sorted(self.root.iterdir(), key=lambda path: path.name):
+            if run_dir.name in self._terminal_run_ids:
+                continue
             if not run_dir.is_dir() or run_dir.is_symlink():
                 continue
             try:
                 run_id = str(UUID(run_dir.name))
             except ValueError:
                 continue
-            if run_id != run_dir.name or (run_dir / "terminal.json").exists():
+            if run_id != run_dir.name:
+                continue
+            if (run_dir / "terminal.json").exists():
+                self._terminal_run_ids.add(run_id)
                 continue
             prepared_path = run_dir / "prepared.json"
             if not prepared_path.is_file() or prepared_path.is_symlink():
@@ -325,6 +334,7 @@ class ResearchArtifactStore:
                 # every other run: park it behind a truthful failed terminal
                 # and keep processing.
                 terminal = self._write_incompatible_prepared_terminal(prepared_reference)
+                self._terminal_run_ids.add(run_id)
                 results.append(
                     ReconciliationResult(
                         run_id,
@@ -345,6 +355,7 @@ class ResearchArtifactStore:
                     prepared.reference,
                     queue_reference=resolution.queue_reference or "",
                 )
+                self._terminal_run_ids.add(run_id)
                 results.append(
                     ReconciliationResult(run_id, resolution.state, terminal_reference=terminal)
                 )
@@ -359,6 +370,7 @@ class ResearchArtifactStore:
                         detail="Prepared decision was not found in a moderation queue.",
                     ),
                 )
+                self._terminal_run_ids.add(run_id)
                 results.append(
                     ReconciliationResult(run_id, resolution.state, terminal_reference=terminal)
                 )
@@ -375,6 +387,48 @@ class ResearchArtifactStore:
                 )
             )
         return tuple(results)
+
+    def prune_terminal_runs(self, *, older_than: datetime) -> int:
+        """Delete run directories that reached a terminal before ``older_than``.
+
+        Directories without terminal.json are never touched: they may still
+        be in flight or awaiting reconciliation. The creation time comes from
+        run.json, falling back to the directory mtime.
+        """
+
+        if not self.root.exists():
+            return 0
+        pruned = 0
+        for run_dir in sorted(self.root.iterdir(), key=lambda path: path.name):
+            if not run_dir.is_dir() or run_dir.is_symlink():
+                continue
+            try:
+                run_id = str(UUID(run_dir.name))
+            except ValueError:
+                continue
+            if run_id != run_dir.name:
+                continue
+            if not (run_dir / "terminal.json").is_file():
+                continue
+            if self._run_created_at(run_dir) >= older_than:
+                continue
+            try:
+                shutil.rmtree(run_dir)
+            except OSError:
+                continue
+            self._terminal_run_ids.discard(run_id)
+            pruned += 1
+        return pruned
+
+    def _run_created_at(self, run_dir: Path) -> datetime:
+        try:
+            payload = json.loads((run_dir / "run.json").read_bytes())
+            created_at = datetime.fromisoformat(str(payload["created_at"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            return datetime.fromtimestamp(run_dir.stat().st_mtime, tz=UTC)
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=UTC)
+        return created_at
 
     def read_artifact(self, reference: ArtifactReference) -> dict[str, Any]:
         path = self._path_for_reference(reference)

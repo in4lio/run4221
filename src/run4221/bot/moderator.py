@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import date, datetime
 from html import escape
@@ -1020,6 +1021,31 @@ async def run_background_registration_check(
 ) -> None:
     """One-shot refresh that reports into the same chat and never raises."""
 
+    async def answer(text: str) -> None:
+        with suppress(Exception):
+            await message.answer(text)
+
+    await run_registration_refresh(
+        engine,
+        event,
+        answer,
+        failure_prefix=(
+            "The background registration check failed. "
+            "The event was added and can be checked later with /update_event."
+        ),
+    )
+
+
+async def run_registration_refresh(
+    engine: ResearchEngine,
+    event: TrackedEvent,
+    answer: Callable[[str], Awaitable[object]],
+    *,
+    failure_prefix: str,
+) -> None:
+    """Guarded one-shot engine refresh shared by /update_event and the
+    post-create background scan; every outcome becomes one ``answer`` text."""
+
     _refreshing_events.add(event.id)
     try:
         result = await engine.refresh_source(event.id)
@@ -1030,15 +1056,10 @@ async def run_background_registration_check(
             f"<code>{escape(event.public_id)}</code>."
         )
     except Exception as error:
-        text = (
-            "The background registration check failed. "
-            "The event was added and can be checked later with /update_event.\n"
-            f"Error: {escape(str(error))}"
-        )
+        text = f"{failure_prefix}\nError: {escape(str(error))}"
     finally:
         _refreshing_events.discard(event.id)
-    with suppress(Exception):
-        await message.answer(text)
+    await answer(text)
 
 
 @router.message(Command("edit_event"))
@@ -1242,25 +1263,12 @@ async def update_event_registration_by_id(
         f"Running registration check for <b>{escape(event.name)}</b>...",
         reply_markup=remove_dialog_keyboard() if cleanup_keyboard else None,
     )
-    _refreshing_events.add(event.id)
-    try:
-        result = await engine.refresh_source(event.id)
-    except SourceNotFoundError:
-        await message.answer(
-            "I could not find an active source for event "
-            f"<code>{escape(event.public_id)}</code>."
-        )
-        return
-    except Exception as error:
-        await message.answer(
-            "Registration check failed. Try again later.\n"
-            f"Error: {escape(str(error))}"
-        )
-        return
-    finally:
-        _refreshing_events.discard(event.id)
-
-    await message.answer(format_refresh_outcome(result))
+    await run_registration_refresh(
+        engine,
+        event,
+        message.answer,
+        failure_prefix="Registration check failed. Try again later.",
+    )
 
 
 @router.message(Command("archive_event"))

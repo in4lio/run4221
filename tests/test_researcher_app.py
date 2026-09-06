@@ -6,6 +6,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
+
 from run4221.db.bootstrap import initialize_database
 from run4221.db.repository import EventCreate, ProposedEventUpdateCreate, add_event
 from run4221.db.research import (
@@ -21,6 +23,7 @@ from run4221.researcher.app import (
 )
 from run4221.researcher.artifacts import ResearchArtifactStore
 from run4221.researcher.config import ResearcherSettings
+from run4221.researcher.engine import SourceNotFoundError
 from run4221.researcher.health import HealthStore
 from run4221.researcher.schemas import (
     ArtifactReference,
@@ -63,7 +66,12 @@ def initialize(tmp_path: Path) -> str:
     return url
 
 
-def add_source(tmp_path: Path, *, public_id: str = "test.42") -> str:
+def add_source(
+    tmp_path: Path,
+    *,
+    public_id: str = "test.42",
+    registration_url: str | None = None,
+) -> str:
     event = add_event(
         EventCreate(
             public_id=public_id,
@@ -75,6 +83,7 @@ def add_source(tmp_path: Path, *, public_id: str = "test.42") -> str:
             distances=("marathon",),
             regions=("global", "eu", "de"),
             official_url=f"https://official.example/{public_id}",
+            registration_url=registration_url,
         ),
         database_url=database_url(tmp_path),
     )
@@ -172,6 +181,66 @@ def test_operator_one_shot_processes_exact_event_and_shadow_is_read_only(tmp_pat
     assert factory.calls == [("refresh", event_id)]
     assert factory.shadow_modes == [True]
     assert get_research_source(event_id, database_url=database_url(tmp_path)) is not None
+
+
+def test_run_event_without_active_source_raises_typed_error(tmp_path: Path) -> None:
+    initialize(tmp_path)
+    factory = Factory(tmp_path)
+    app = worker(tmp_path, factory)
+    app.initialize_health()
+
+    with pytest.raises(SourceNotFoundError, match="No active research source"):
+        asyncio.run(app.run_event("ghost.42"))
+
+    assert factory.calls == []
+
+
+def test_run_event_prefers_the_registration_page_source(tmp_path: Path) -> None:
+    initialize(tmp_path)
+    event_id = add_source(
+        tmp_path,
+        registration_url="https://register.example/test.42",
+    )
+    refreshed_urls: list[str] = []
+
+    class RecordingService:
+        def __init__(self) -> None:
+            self.artifacts = ResearchArtifactStore(tmp_path / "runs")
+
+        async def refresh(self, source):
+            refreshed_urls.append(source.url)
+            return result()
+
+    app = ResearcherWorker(
+        settings(tmp_path),
+        service_factory=lambda shadow, on_run_started: RecordingService(),
+        health=HealthStore(tmp_path / "researcher-health.json", now=lambda: NOW),
+        now=lambda: NOW,
+    )
+    app.initialize_health()
+
+    execution = asyncio.run(app.run_event(event_id))
+
+    assert execution.failed is False
+    # One-shot runs resolve with the engine's preference: registration first.
+    assert refreshed_urls == ["https://register.example/test.42"]
+
+
+def test_once_cli_reports_missing_source_with_typed_exit_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    url = initialize(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.setenv("RESEARCHER_PROMPT_DIR", str(tmp_path / "prompts"))
+
+    exit_code = asyncio.run(async_main(["--once", "--event-id", "ghost.42"]))
+
+    assert exit_code == 2
+    assert "No active research source for event: ghost.42" in capsys.readouterr().err
 
 
 def test_lock_contention_skips_without_constructing_service(tmp_path: Path) -> None:
@@ -418,3 +487,73 @@ def test_worker_reconciles_prepared_runs_at_every_cycle_start(tmp_path: Path) ->
     asyncio.run(app.run_cycle())
 
     assert terminal_payload(config, second_run)["content"]["queue_state"] == "absent"
+
+
+def test_worker_second_cycle_skips_previously_terminal_run(tmp_path: Path) -> None:
+    initialize(tmp_path)
+    event_id = add_source(tmp_path)
+    config = settings(tmp_path)
+    _store, run_id = prepare_absent_decision(config, event_id)
+    app = worker(tmp_path, Factory(tmp_path))
+    app.initialize_health()
+
+    asyncio.run(app.run_cycle())
+    terminal_path = Path(config.artifact_dir) / run_id / "terminal.json"
+    assert terminal_path.exists()
+
+    # A run cached as terminal is never re-read: even with the terminal file
+    # gone, the next cycle must not reconcile that directory again.
+    terminal_path.unlink()
+    asyncio.run(app.run_cycle())
+
+    assert not terminal_path.exists()
+
+
+def old_terminal_run(
+    config: ResearcherSettings,
+    *,
+    age_days: int,
+    finalize: bool = True,
+) -> str:
+    store = ResearchArtifactStore(
+        config.artifact_dir,
+        now=lambda: NOW - timedelta(days=age_days),
+    )
+    run_id = store.create_run(job_type="refresh")
+    if finalize:
+        store.finalize_without_queue(
+            run_id,
+            source_url="https://official.example/expired",
+            status=ResearchRunStatus(status="skipped", outcome="inconclusive"),
+        )
+    return run_id
+
+
+def test_cycle_prunes_only_expired_terminal_runs(tmp_path: Path) -> None:
+    initialize(tmp_path)
+    config = settings(tmp_path, schedule_enabled=False)
+    expired_terminal = old_terminal_run(config, age_days=120)
+    expired_open = old_terminal_run(config, age_days=120, finalize=False)
+    young_terminal = old_terminal_run(config, age_days=1)
+    app = worker(tmp_path, Factory(tmp_path), schedule_enabled=False)
+    app.initialize_health()
+
+    asyncio.run(app.run_cycle())
+
+    runs_root = Path(config.artifact_dir)
+    assert not (runs_root / expired_terminal).exists()
+    # Runs without terminal.json are never touched, however old they are.
+    assert (runs_root / expired_open).exists()
+    assert (runs_root / young_terminal).exists()
+
+
+def test_zero_run_retention_days_disables_pruning(tmp_path: Path) -> None:
+    initialize(tmp_path)
+    config = settings(tmp_path, run_retention_days=0)
+    expired_terminal = old_terminal_run(config, age_days=365)
+    app = worker(tmp_path, Factory(tmp_path), run_retention_days=0)
+    app.initialize_health()
+
+    asyncio.run(app.run_cycle())
+
+    assert (Path(config.artifact_dir) / expired_terminal).exists()
