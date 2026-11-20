@@ -570,7 +570,7 @@ class ResearcherService:
                 RunOutcome.INCONCLUSIVE,
                 "Proposed event date is older than the stored event date.",
             )
-        prepared_decision = self._validated_refresh_update(
+        prepared_decision, validation_reason = self._validated_refresh_update(
             decision,
             captures=tuple(captures),
             event=frozen_event,
@@ -584,6 +584,7 @@ class ResearcherService:
                 RunState.SKIPPED,
                 RunOutcome.INCONCLUSIVE,
                 "Update decision failed captured support, applicability, or conflict validation.",
+                validation_reason=validation_reason,
             )
         if not self.persist_queue:
             return await self._finish_without_queue(
@@ -757,6 +758,15 @@ class ResearcherService:
                 RunOutcome.INCONCLUSIVE,
                 "Profile locate-search budget was exhausted.",
             )
+        pages_left = self.budget.max_static_pages_per_job - captured.snapshot.pages_attempted
+        if pages_left < 1:
+            return await self._finish_profile(
+                run_id,
+                url,
+                RunState.CAPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Profile page budget was exhausted before locating the official page.",
+            )
         context = _profile_locate_context(url, decision.draft)
         scout = await self.agent.scout(
             ScoutRequest(
@@ -812,10 +822,7 @@ class ResearcherService:
             official = await self._capture_enriched(
                 run_id,
                 official_url,
-                max_linked_pages=max(
-                    0,
-                    self.budget.max_static_pages_per_job - 1 - first_linked_pages,
-                ),
+                max_linked_pages=pages_left - 1,
             )
         except PageFetchError as error:
             return await self._finish_profile(
@@ -1095,20 +1102,20 @@ class ResearcherService:
         event: TrackedEvent,
         changed_fields: dict[str, object],
         anchor_url: str | None = None,
-    ) -> ResearchDecision | None:
+    ) -> tuple[ResearchDecision | None, str | None]:
         retained_support = tuple(
             item for item in decision.field_support if item.field.value in changed_fields
         )
         if set(item.field.value for item in retained_support) != set(changed_fields):
-            return None
+            return None, "missing_field_support"
         cited = set(decision.evidence)
         if not cited or any(
             not set(item.evidence).issubset(cited) for item in retained_support
         ):
-            return None
+            return None, "uncited_support"
         qualified = _qualified_capture_references(captures, event, anchor_url=anchor_url)
         if any(not set(item.evidence).issubset(qualified) for item in retained_support):
-            return None
+            return None, "unqualified_support_capture"
         try:
             return ResearchDecision.model_validate(
                 {
@@ -1116,9 +1123,9 @@ class ResearcherService:
                     "proposed_fields": _normalized_proposed_changes(changed_fields),
                     "field_support": retained_support,
                 }
-            )
+            ), None
         except Exception:
-            return None
+            return None, "normalized_decision_invalid"
 
     def _valid_cited_references(
         self,
@@ -1163,8 +1170,15 @@ class ResearcherService:
         state: RunState,
         outcome: RunOutcome,
         detail: str,
+        *,
+        validation_reason: str | None = None,
     ) -> ResearchJobResult:
-        status = ResearchRunStatus(status=state, outcome=outcome, detail=detail[:1_000])
+        status = ResearchRunStatus(
+            status=state,
+            outcome=outcome,
+            detail=detail[:1_000],
+            validation_reason=validation_reason,
+        )
         terminal = await asyncio.to_thread(
             self.artifacts.finalize_without_queue,
             run_id,

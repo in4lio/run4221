@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 ShortText = Annotated[str, Field(min_length=1, max_length=240)]
 SummaryText = Annotated[str, Field(min_length=1, max_length=1_000)]
@@ -154,9 +155,7 @@ class ProposedEventChanges(ResearchSchema):
 
     @property
     def changed_fields(self) -> frozenset[EventUpdateField]:
-        fields = {
-            field for field in EventUpdateField if getattr(self, field.value) is not None
-        }
+        fields = {field for field in EventUpdateField if getattr(self, field.value) is not None}
         fields.update(EventUpdateField(name) for name in self.clear_fields)
         return frozenset(fields)
 
@@ -271,6 +270,10 @@ class AssessorNoPayloadDecision(AssessorTerminalDecision):
     action: Literal[DecisionAction.NO_CHANGE, DecisionAction.INCONCLUSIVE]
 
 
+class AssessorInconclusiveDecision(AssessorNoPayloadDecision):
+    action: Literal[DecisionAction.INCONCLUSIVE]
+
+
 class AssessorUpdateDecision(AssessorTerminalDecision):
     action: Literal[DecisionAction.PROPOSE_UPDATE]
     proposed_fields: ProposedEventChanges
@@ -303,9 +306,10 @@ class AssessorUpdateDecision(AssessorTerminalDecision):
                     or item.distance_category is not AssessmentVerdict.CONFIRMED
                     or support.field not in item.applicable_fields
                 ):
-                    raise ValueError(
+                    raise PydanticCustomError(
+                        "fact_validation_failed",
                         "Field support requires confirmed identity, edition, "
-                        "distance/category, and field applicability."
+                        "distance/category, and field applicability.",
                     )
 
         changed_fields = self.proposed_fields.changed_fields
@@ -313,7 +317,10 @@ class AssessorUpdateDecision(AssessorTerminalDecision):
             conflict.field is None or conflict.field in changed_fields
             for conflict in self.conflicts
         ):
-            raise ValueError("A proposed update cannot source-order conflicting evidence.")
+            raise PydanticCustomError(
+                "fact_validation_failed",
+                "A proposed update cannot source-order conflicting evidence.",
+            )
         return self
 
 
@@ -337,6 +344,15 @@ AssessorDecision = Annotated[
 
 AssessorOutcome = Annotated[
     AssessorNoPayloadDecision | AssessorUpdateDecision | AssessorProfileDecision | EvidenceRequest,
+    Field(discriminator="action"),
+]
+
+ProfileAssessmentOutcome = Annotated[
+    AssessorProfileDecision | AssessorInconclusiveDecision, Field(discriminator="action")
+]
+
+RefreshAssessmentOutcome = Annotated[
+    AssessorUpdateDecision | AssessorNoPayloadDecision | EvidenceRequest,
     Field(discriminator="action"),
 ]
 
@@ -503,3 +519,12 @@ class ResearchRunStatus(ResearchSchema):
     status: RunState
     outcome: RunOutcome
     detail: Annotated[str, Field(min_length=1, max_length=1_000)] | None = None
+    validation_reason: (
+        Literal[
+            "missing_field_support",
+            "uncited_support",
+            "unqualified_support_capture",
+            "normalized_decision_invalid",
+        ]
+        | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)

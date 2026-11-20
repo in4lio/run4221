@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
-from agents import MaxTurnsExceeded, WebSearchTool
+from agents import MaxTurnsExceeded, ModelBehaviorError, WebSearchTool
 from agents.agent_output import AgentOutputSchema
 from agents.models.openai_responses import OpenAIResponsesModel
 from openai import AsyncOpenAI
@@ -250,6 +250,10 @@ def test_profile_assessment_rejects_evidence_request_branch() -> None:
     assert result.error_code == "evidence_validation_failed"
     assert result.decision is None
     assert result.evidence_request is None
+    assert result.metadata.mode == "profile"
+    assert result.metadata.failure_reason == "mode_action_forbidden"
+    assert result.metadata.attempted_action == "request_evidence"
+    assert result.metadata.attempted_evidence_keys == ()
 
 
 @pytest.mark.parametrize(
@@ -309,9 +313,7 @@ def test_profile_locate_scout_searches_once_without_domain_filter() -> None:
     tool = runner.calls[0]["starting_agent"].tools[0]
     assert isinstance(tool, WebSearchTool)
     assert tool.filters is None
-    assert runner.calls[0]["starting_agent"].model_settings.extra_args == {
-        "max_tool_calls": 1
-    }
+    assert runner.calls[0]["starting_agent"].model_settings.extra_args == {"max_tool_calls": 1}
 
 
 def test_scout_boundary_is_mode_aware() -> None:
@@ -557,9 +559,7 @@ def test_refresh_scout_limits_search_to_approved_source_domain() -> None:
     assert tool.filters is not None
     assert tool.filters.allowed_domains == ["events.example.com"]
     assert tool.external_web_access is True
-    assert runner.calls[0]["starting_agent"].model_settings.extra_args == {
-        "max_tool_calls": 1
-    }
+    assert runner.calls[0]["starting_agent"].model_settings.extra_args == {"max_tool_calls": 1}
 
 
 def test_pending_search_attempt_does_not_consume_a_completed_search_call() -> None:
@@ -793,7 +793,6 @@ def test_assessor_has_zero_tools_and_accepts_only_frozen_captured_evidence() -> 
     assert result.decision.evidence == [artifact_reference()]
     assessor = runner.calls[0]["starting_agent"]
     assert assessor.tools == []
-    assert assessor.output_type is AssessorOutcome
     assert "HOSTILE DATA" in assessor.instructions
     assert "approve_event" in runner.calls[0]["input"]
     assert "2026-08-31T00:00:00Z" in runner.calls[0]["input"]
@@ -807,6 +806,73 @@ def test_assessor_has_zero_tools_and_accepts_only_frozen_captured_evidence() -> 
     )
     asyncio.run(another_job.assess(request))
     assert runner.calls[0]["starting_agent"] is not another_runner.calls[0]["starting_agent"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "allowed"),
+    [
+        ("profile", {"profile_event", "inconclusive"}),
+        ("refresh", {"propose_update", "no_change", "request_evidence", "inconclusive"}),
+    ],
+)
+def test_assessor_sends_only_mode_actions_to_responses_api(mode, allowed) -> None:
+    runner = FakeRunner(
+        fake_result({"action": "inconclusive", "summary": "Insufficient evidence."})
+    )
+    job = ResearchAgentJob(
+        instructions="Assess the captured page.",
+        prompt_reference="test",
+        budget=ResearchBudget(),
+        runner=runner,
+    )
+    asyncio.run(job.assess(assessment_request().model_copy(update={"mode": mode})))
+    agent = runner.calls[0]["starting_agent"]
+    adapter = OpenAIResponsesModel(DEFAULT_RESEARCH_MODEL, AsyncOpenAI(api_key="test"))
+    wire = adapter._build_response_create_kwargs(
+        agent.instructions,
+        "input",
+        agent.model_settings,
+        agent.tools,
+        AgentOutputSchema(agent.output_type),
+        [],
+    )["text"]["format"]
+    assert wire["strict"]
+    schema = wire["schema"]
+    union = schema["properties"]["response"]
+    assert set(union["discriminator"]["mapping"]) == allowed
+    actions = set()
+    for branch in union["anyOf"]:
+        action = schema["$defs"][branch["$ref"].split("/")[-1]]["properties"]["action"]
+        actions.update(action["enum"] if "enum" in action else [action["const"]])
+    assert actions == allowed
+
+
+@pytest.mark.parametrize("mode", ["profile", "refresh"])
+def test_typed_sdk_abstention_reaches_the_caller(mode) -> None:
+    class StructuredRunner:
+        async def run(self, starting_agent, input, **kwargs):
+            schema = AgentOutputSchema(starting_agent.output_type)
+            typed = schema.validate_json(
+                json.dumps(
+                    {
+                        "response": {
+                            "action": "inconclusive",
+                            "summary": "The stated facts conflict.",
+                        }
+                    }
+                )
+            )
+            return fake_result(typed)
+
+    job = ResearchAgentJob(
+        instructions="Assess captured facts.",
+        prompt_reference="test",
+        budget=ResearchBudget(),
+        runner=StructuredRunner(),
+    )
+    result = asyncio.run(job.assess(assessment_request().model_copy(update={"mode": mode})))
+    assert result.state is AgentRunState.SUCCEEDED
+    assert result.decision is not None and result.decision.action is DecisionAction.INCONCLUSIVE
 
 
 def test_assessor_attaches_exact_captured_references_with_discriminated_output() -> None:
@@ -993,6 +1059,12 @@ def test_update_rejects_invalid_per_field_support(mutate) -> None:
 
     assert result.state is AgentRunState.INCONCLUSIVE
     assert result.decision is None
+    assert result.metadata.attempted_action == "propose_update"
+    if decision["applicability"][0]["evidence_key"] == "E8":
+        assert result.metadata.failure_reason == "unknown_evidence_key"
+        assert result.metadata.attempted_evidence_keys == ("E8",)
+    else:
+        assert result.metadata.failure_reason == "invalid_structure"
 
 
 def test_update_preserves_explicit_conflicts_without_source_order_resolution() -> None:
@@ -1058,6 +1130,8 @@ def test_confidence_cannot_rescue_rejected_update_applicability() -> None:
 
     assert result.state is AgentRunState.INCONCLUSIVE
     assert result.decision is None
+    assert result.metadata.failure_reason == "fact_validation_failed"
+    assert result.metadata.attempted_fields == ("registration_status",)
 
 
 def test_assessment_input_uses_local_keys_and_hides_immutable_reference_boundaries() -> None:
@@ -1285,6 +1359,9 @@ def test_output_token_exhaustion_stops_before_another_sdk_call() -> None:
     assert first.state is AgentRunState.SUCCEEDED
     assert second.state is AgentRunState.CAPPED
     assert second.error_code == "output_token_budget"
+    assert second.metadata.failure_reason == "job_budget_exhausted"
+    assert second.metadata.runner_calls == 0
+    assert first.metadata.runner_calls == 1
     assert len(runner.calls) == 1
 
 
@@ -1363,3 +1440,91 @@ def test_turn_budget_stops_before_another_sdk_call() -> None:
     assert second.state is AgentRunState.CAPPED
     assert second.error_code == "agent_turn_budget"
     assert len(runner.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("finish", "reason"),
+    [
+        ("max_output_tokens", "provider_output_truncated"),
+        ("completed", "invalid_structure"),
+        ("incomplete", "unknown"),
+    ],
+)
+def test_sdk_parse_failure_retains_usage_and_safe_identifiers(finish, reason) -> None:
+    # Invoke the SDK lifecycle callback as the real runner does, before it
+    # validates final output and discards payload-bearing error details.
+    from openai.types.responses import ResponseOutputMessage, ResponseOutputText
+
+    payload = {
+        "action": "propose_update",
+        "proposed_fields": {"event_date": "2027-10-01", "not-a-field": "sensitive text"},
+        "applicability": [{"evidence_key": "E1"}, {"evidence_key": "sensitive text"}],
+    }
+    response = fake_result(None, output_tokens=128).raw_responses[0]
+    response.raw_usage["output_tokens_details"] = {"reasoning_tokens": 81}
+    response.output = [
+        ResponseOutputMessage(
+            id="msg_test",
+            type="message",
+            role="assistant",
+            status="completed" if finish == "completed" else "incomplete",
+            content=[
+                ResponseOutputText(
+                    type="output_text", annotations=[], text=json.dumps({"response": payload})
+                )
+            ],
+        )
+    ]
+    if finish == "max_output_tokens":
+        response.incomplete_details = SimpleNamespace(reason=finish)
+
+    class ParseFailureRunner:
+        async def run(self, starting_agent, input, **kwargs):
+            await kwargs["hooks"].on_llm_end(None, starting_agent, response)
+            raise ModelBehaviorError("sensitive text")
+
+    job = ResearchAgentJob(
+        instructions="Assess captured pages.",
+        prompt_reference="test",
+        budget=ResearchBudget(max_output_tokens_per_job=128),
+        runner=ParseFailureRunner(),
+    )
+    result = asyncio.run(job.assess(assessment_request()))
+    assert result.decision is None
+    assert result.metadata.failure_reason == reason
+    assert result.metadata.attempted_fields == ("event_date",)
+    assert result.metadata.attempted_evidence_keys == ("E1",)
+    assert result.metadata.output_tokens == 128
+    assert result.metadata.reasoning_tokens == 81
+    assert result.metadata.model_responses == result.metadata.runner_calls == 1
+    assert "sensitive text" not in repr(result)
+
+
+def test_partial_provider_response_cannot_admit_a_valid_looking_decision() -> None:
+    response = fake_result(valid_update_decision())
+    response.raw_responses[0].stop_reason = "length"
+    job = ResearchAgentJob(
+        instructions="Assess captured pages.",
+        prompt_reference="test",
+        budget=ResearchBudget(),
+        runner=FakeRunner(response),
+    )
+    result = asyncio.run(job.assess(assessment_request()))
+    assert result.decision is None
+    assert result.metadata.failure_reason == "provider_output_truncated"
+    assert result.metadata.attempted_action == "propose_update"
+
+
+def test_failed_unmetered_call_preserves_only_requested_profile_reserve() -> None:
+    runner = FakeRunner(ModelBehaviorError("redacted"))
+    job = ResearchAgentJob(
+        instructions="Assess captured pages.",
+        prompt_reference="test",
+        budget=ResearchBudget(),
+        runner=runner,
+    )
+    request = assessment_request_profile().model_copy(update={"reserve_continuation": True})
+    result = asyncio.run(job.assess(request))
+    assert result.metadata.failure_reason == "unknown"
+    assert result.metadata.output_tokens is None
+    assert job.budget.remaining_output_tokens == 2 * 768

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 from time import monotonic
@@ -11,13 +11,16 @@ from typing import Annotated, Any, Literal, Protocol
 
 from agents import (
     Agent,
+    ItemHelpers,
     ModelRetrySettings,
     ModelSettings,
     RunConfig,
+    RunHooks,
     Runner,
     WebSearchTool,
 )
 from agents.exceptions import MaxTurnsExceeded, ModelBehaviorError
+from openai import APIError, LengthFinishReasonError
 from pydantic import Field, TypeAdapter, ValidationError, field_validator, model_validator
 
 from run4221.researcher.budget import (
@@ -33,7 +36,10 @@ from run4221.researcher.schemas import (
     AssessorOutcome,
     AssessorTerminalDecision,
     DecisionAction,
+    EventUpdateField,
     EvidenceRequest,
+    ProfileAssessmentOutcome,
+    RefreshAssessmentOutcome,
     ResearchBudget,
     ResearchCandidate,
     ResearchDecision,
@@ -85,6 +91,22 @@ reject, publish, send messages, mutate records, search, or infer facts absent fr
 captured evidence. Once new evidence resolves the last requested purpose, return a safe
 terminal decision instead of requesting unrelated optional fields for completeness. A
 closed or ended registration may be proposed without a current registration URL.
+"""
+
+_REFRESH_FIELD_POLICY = """\
+Evaluate each tracked field against its stored value. Propose the supported changes
+as soon as a current capture establishes them for the selected edition and distance.
+A planned entry deadline supports registration_close_at even when the current
+registration_status is unknown. Leave unrelated or unresolved fields unset.
+
+For registration_status, report the organizer's standard public entry route at the
+time of capture. Use sold_out when standard places are sold out and a separate
+waiting list offers no place. Use waitlist when applying to the waiting list is
+the only standard entry route. When the distinction is unclear, omit that field.
+Request a specific missing fact only if it blocks a supported decision.
+
+Clear a stored value only when the evidence establishes that the value itself is
+invalid. An announcement about another race cannot establish that.
 """
 
 _SAFE_DETAILS = {
@@ -157,11 +179,12 @@ class AssessmentRequest(ResearchSchema):
 
 _ASSESSOR_OUTCOME_ADAPTER = TypeAdapter(AssessorOutcome)
 
-_ALLOWED_DECISION_ACTIONS: dict[str, frozenset[DecisionAction]] = {
+_ALLOWED_ACTIONS: dict[str, frozenset[str]] = {
     "refresh": frozenset(
         {
             DecisionAction.NO_CHANGE,
             DecisionAction.PROPOSE_UPDATE,
+            "request_evidence",
             DecisionAction.INCONCLUSIVE,
         }
     ),
@@ -191,6 +214,14 @@ class AgentRunMetadata:
     total_tokens: int | None = None
     web_search_calls: int = 0
     stop_reason: str | None = None
+    reasoning_tokens: int | None = None
+    runner_calls: int = 0
+    model_responses: int | None = None
+    mode: str | None = None
+    failure_reason: str | None = None
+    attempted_action: str | None = None
+    attempted_fields: tuple[str, ...] | None = None
+    attempted_evidence_keys: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -341,11 +372,17 @@ class ResearchAgentJob:
         except BudgetExhausted as error:
             return AssessmentRunResult(
                 state=AgentRunState.CAPPED,
-                metadata=self._empty_metadata(),
+                metadata=replace(
+                    self._empty_metadata(),
+                    mode=request.mode,
+                    failure_reason="job_budget_exhausted",
+                    model_responses=0,
+                ),
                 error_code=error.cap.value,
             )
 
-        agent = self._assessor_agent(limits)
+        agent = self._assessor_agent(limits, request.mode)
+        observations = _AssessmentResponses()
         try:
             result = await asyncio.wait_for(
                 self.runner.run(
@@ -353,12 +390,15 @@ class ResearchAgentJob:
                     _assessment_model_input(request),
                     max_turns=limits.max_turns,
                     run_config=_run_config(),
+                    hooks=observations,
                 ),
                 timeout=limits.wall_time_seconds,
             )
         except Exception as error:
             return self._assessment_error(
                 error,
+                request=request,
+                observations=observations,
                 preserve_followups=reserved_followups,
             )
 
@@ -367,33 +407,39 @@ class ResearchAgentJob:
             preserve_assessment_reserve=request.reserve_continuation,
             preserved_followups=max(1, reserved_followups),
         )
+        raw_outcome = getattr(result, "final_output", None)
+        metadata = _attempt_metadata(metadata, request.mode, raw_outcome)
         if cap is not None:
             return AssessmentRunResult(
                 state=AgentRunState.CAPPED,
-                metadata=metadata,
+                metadata=replace(metadata, failure_reason="job_budget_exhausted"),
                 error_code=cap.value,
             )
-        try:
-            assessed = _ASSESSOR_OUTCOME_ADAPTER.validate_python(result.final_output)
-        except (AttributeError, TypeError, ValidationError):
+        if metadata.stop_reason in {"length", "max_output_tokens", "incomplete", "content_filter"}:
+            reason = (
+                "provider_output_truncated"
+                if metadata.stop_reason in {"length", "max_output_tokens"}
+                else "unknown"
+            )
             return AssessmentRunResult(
                 state=AgentRunState.INCONCLUSIVE,
-                metadata=metadata,
+                metadata=replace(metadata, failure_reason=reason),
+                error_code="malformed_output",
+                detail=_SAFE_DETAILS["malformed_output"],
+            )
+        try:
+            assessed = _ASSESSOR_OUTCOME_ADAPTER.validate_python(raw_outcome)
+        except (TypeError, ValidationError) as error:
+            return AssessmentRunResult(
+                state=AgentRunState.INCONCLUSIVE,
+                metadata=replace(metadata, failure_reason=_validation_failure(error, metadata)),
                 error_code="malformed_output",
                 detail=_SAFE_DETAILS["malformed_output"],
             )
 
+        if assessed.action not in _ALLOWED_ACTIONS[request.mode]:
+            return self._rejected_assessment(metadata, "mode_action_forbidden")
         if isinstance(assessed, EvidenceRequest):
-            if request.mode != "refresh":
-                # A profile assessment is a single pass and never opens an
-                # evidence loop; treat the wrong branch exactly like other
-                # host-validation failures.
-                return AssessmentRunResult(
-                    state=AgentRunState.INCONCLUSIVE,
-                    metadata=metadata,
-                    error_code="evidence_validation_failed",
-                    detail=_SAFE_DETAILS["evidence_validation_failed"],
-                )
             return AssessmentRunResult(
                 state=AgentRunState.SUCCEEDED,
                 metadata=metadata,
@@ -402,26 +448,24 @@ class ResearchAgentJob:
 
         try:
             decision = _resolve_assessor_decision(assessed, request)
-        except (TypeError, ValueError, ValidationError):
-            return AssessmentRunResult(
-                state=AgentRunState.INCONCLUSIVE,
-                metadata=metadata,
-                error_code="evidence_validation_failed",
-                detail=_SAFE_DETAILS["evidence_validation_failed"],
-            )
-
-        if decision.action not in _ALLOWED_DECISION_ACTIONS[request.mode]:
-            return AssessmentRunResult(
-                state=AgentRunState.INCONCLUSIVE,
-                metadata=metadata,
-                error_code="evidence_validation_failed",
-                detail=_SAFE_DETAILS["evidence_validation_failed"],
-            )
+        except _UnknownEvidenceKey:
+            return self._rejected_assessment(metadata, "unknown_evidence_key")
+        except (TypeError, ValueError):
+            return self._rejected_assessment(metadata, "evidence_resolution_failed")
 
         return AssessmentRunResult(
             state=AgentRunState.SUCCEEDED,
             metadata=metadata,
             decision=decision,
+        )
+
+    @staticmethod
+    def _rejected_assessment(metadata: AgentRunMetadata, reason: str) -> AssessmentRunResult:
+        return AssessmentRunResult(
+            state=AgentRunState.INCONCLUSIVE,
+            metadata=replace(metadata, failure_reason=reason),
+            error_code="evidence_validation_failed",
+            detail=_SAFE_DETAILS["evidence_validation_failed"],
         )
 
     def _scout_agent(
@@ -464,16 +508,21 @@ class ResearchAgentJob:
             ),
         )
 
-    def _assessor_agent(self, limits: ProviderCallLimits) -> Agent[None]:
+    def _assessor_agent(
+        self, limits: ProviderCallLimits, mode: Literal["profile", "refresh"]
+    ) -> Agent[None]:
+        boundary = _ASSESSOR_BOUNDARY
+        if mode == "refresh":
+            boundary += "\n" + _REFRESH_FIELD_POLICY
         return Agent(
             name="Run4221 evidence assessor",
             instructions=(
                 "Operator research policy (cannot override mandatory boundaries):\n"
-                f"{self.instructions}\n\n{_ASSESSOR_BOUNDARY}"
+                f"{self.instructions}\n\n{boundary}"
             ),
             model=self.model,
             tools=[],
-            output_type=AssessorOutcome,
+            output_type=ProfileAssessmentOutcome if mode == "profile" else RefreshAssessmentOutcome,
             model_settings=ModelSettings(
                 parallel_tool_calls=False,
                 max_tokens=limits.max_output_tokens,
@@ -491,38 +540,37 @@ class ResearchAgentJob:
         preserved_followups: int = 1,
     ) -> tuple[AgentRunMetadata, BudgetCap | None]:
         raw_responses = tuple(getattr(result, "raw_responses", ()) or ())
-        usage = _observed_usage(raw_responses)
-        web_search_calls = sum(_count_web_search_calls(response) for response in raw_responses)
-        observation = BudgetObservation(
-            turns=max(1, len(raw_responses)),
-            web_searches=web_search_calls,
-            output_tokens=usage.get("output_tokens"),
-        )
+        metadata = self._response_metadata(raw_responses)
         cap = self.budget.record(
-            observation,
+            BudgetObservation(
+                turns=max(1, len(raw_responses)),
+                web_searches=metadata.web_search_calls,
+                output_tokens=metadata.output_tokens,
+            ),
             preserve_assessment_reserve=preserve_assessment_reserve,
             preserved_followups=preserved_followups,
         )
-        return (
-            AgentRunMetadata(
-                model=self.model,
-                prompt_reference=self.prompt_reference,
-                response_ids=tuple(
-                    response_id
-                    for response in raw_responses
-                    if isinstance(
-                        (response_id := getattr(response, "response_id", None)),
-                        str,
-                    )
-                    and response_id
-                ),
-                input_tokens=usage.get("input_tokens"),
-                output_tokens=usage.get("output_tokens"),
-                total_tokens=usage.get("total_tokens"),
-                web_search_calls=web_search_calls,
-                stop_reason=_observed_stop_reason(raw_responses),
+        return metadata, cap
+
+    def _response_metadata(self, responses: tuple[object, ...]) -> AgentRunMetadata:
+        usage = _observed_usage(responses)
+        return AgentRunMetadata(
+            model=self.model,
+            prompt_reference=self.prompt_reference,
+            runner_calls=1,
+            model_responses=len(responses) if responses else None,
+            response_ids=tuple(
+                response_id
+                for response in responses
+                if isinstance((response_id := getattr(response, "response_id", None)), str)
+                and response_id
             ),
-            cap,
+            input_tokens=usage.get("input_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            total_tokens=usage.get("total_tokens"),
+            reasoning_tokens=_observed_reasoning_tokens(responses),
+            web_search_calls=sum(_count_web_search_calls(item) for item in responses),
+            stop_reason=_observed_stop_reason(responses),
         )
 
     def _empty_metadata(self, *, stop_reason: str | None = None) -> AgentRunMetadata:
@@ -540,11 +588,12 @@ class ResearchAgentJob:
     ) -> ScoutRunResult:
         state, error_code = self._classify_error(
             error,
+            observation=BudgetObservation(turns=1, web_searches=0, output_tokens=None),
             preserve_assessment_reserve=preserve_assessment_reserve,
         )
         return ScoutRunResult(
             state=state,
-            metadata=self._empty_metadata(),
+            metadata=replace(self._empty_metadata(), runner_calls=1),
             error_code=error_code,
             detail=_SAFE_DETAILS.get(error_code, _SAFE_DETAILS["provider_error"]),
         )
@@ -553,16 +602,48 @@ class ResearchAgentJob:
         self,
         error: BaseException,
         *,
+        request: AssessmentRequest,
+        observations: _AssessmentResponses,
         preserve_followups: int = 0,
     ) -> AssessmentRunResult:
+        metadata = self._response_metadata(tuple(observations.responses))
         state, error_code = self._classify_error(
             error,
+            observation=BudgetObservation(
+                turns=metadata.model_responses or 1,
+                web_searches=metadata.web_search_calls,
+                output_tokens=metadata.output_tokens,
+            ),
             preserve_assessment_reserve=preserve_followups > 0,
             preserved_followups=max(1, preserve_followups),
         )
+        payload = observations.final_outcome()
+        metadata = _attempt_metadata(metadata, request.mode, payload)
+        if isinstance(error, LengthFinishReasonError):
+            metadata = replace(metadata, stop_reason="length")
+        if metadata.stop_reason in {"length", "max_output_tokens"}:
+            reason = "provider_output_truncated"
+        elif state is AgentRunState.CAPPED:
+            reason = "job_budget_exhausted"
+        elif isinstance(error, ModelBehaviorError):
+            reason = "unknown"
+            if payload is not None:
+                try:
+                    _ASSESSOR_OUTCOME_ADAPTER.validate_python(payload)
+                except ValidationError as validation_error:
+                    reason = _validation_failure(validation_error, metadata)
+                else:
+                    if metadata.attempted_action not in _ALLOWED_ACTIONS[request.mode]:
+                        reason = "mode_action_forbidden"
+            elif metadata.stop_reason == "completed":
+                reason = "invalid_structure"
+        elif isinstance(error, APIError) or getattr(error, "status_code", None) is not None:
+            reason = "provider_error"
+        else:
+            reason = "unknown"
         return AssessmentRunResult(
             state=state,
-            metadata=self._empty_metadata(),
+            metadata=replace(metadata, failure_reason=reason),
             error_code=error_code,
             detail=_SAFE_DETAILS.get(error_code, _SAFE_DETAILS["provider_error"]),
         )
@@ -571,23 +652,22 @@ class ResearchAgentJob:
         self,
         error: BaseException,
         *,
+        observation: BudgetObservation,
         preserve_assessment_reserve: bool = False,
         preserved_followups: int = 1,
     ) -> tuple[AgentRunState, str]:
-        if isinstance(error, MaxTurnsExceeded):
-            self.budget.record_failed_call(
-                exhaust_turns=True,
-                preserve_assessment_reserve=preserve_assessment_reserve,
-                preserved_followups=preserved_followups,
-            )
-            return AgentRunState.CAPPED, "max_turns"
+        turn_limit = isinstance(error, MaxTurnsExceeded)
         self.budget.record_failed_call(
+            observation,
+            exhaust_turns=turn_limit,
             preserve_assessment_reserve=preserve_assessment_reserve,
             preserved_followups=preserved_followups,
         )
+        if turn_limit:
+            return AgentRunState.CAPPED, "max_turns"
         if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
             return AgentRunState.CAPPED, "timeout"
-        if isinstance(error, ModelBehaviorError):
+        if isinstance(error, (LengthFinishReasonError, ModelBehaviorError)):
             return AgentRunState.INCONCLUSIVE, "malformed_output"
 
         status_code = getattr(error, "status_code", None)
@@ -662,6 +742,10 @@ def _resolve_assessor_decision(
     )
 
 
+class _UnknownEvidenceKey(ValueError):
+    pass
+
+
 def _resolve_evidence_key(
     evidence_key: str,
     evidence_by_key: Mapping[str, ArtifactReference],
@@ -669,7 +753,7 @@ def _resolve_evidence_key(
     try:
         return evidence_by_key[evidence_key]
     except KeyError as error:
-        raise ValueError("The assessor cited an unknown evidence key.") from error
+        raise _UnknownEvidenceKey("The assessor cited an unknown evidence key.") from error
 
 
 def _run_config() -> RunConfig:
@@ -750,9 +834,115 @@ def _observed_usage(raw_responses: tuple[object, ...]) -> dict[str, int | None]:
     return {field: sum(entries) for field, entries in values.items()}
 
 
-def _observed_stop_reason(raw_responses: tuple[object, ...]) -> str | None:
-    for response in reversed(raw_responses):
-        stop_reason = getattr(response, "stop_reason", None)
-        if isinstance(stop_reason, str) and stop_reason:
-            return stop_reason[:120]
+def _observed_reasoning_tokens(responses: tuple[object, ...]) -> int | None:
+    total = 0
+    for response in responses:
+        raw = getattr(response, "raw_usage", None)
+        details = raw.get("output_tokens_details") if isinstance(raw, Mapping) else None
+        tokens = details.get("reasoning_tokens") if isinstance(details, Mapping) else None
+        if type(tokens) is not int or tokens < 0:
+            return None
+        total += tokens
+    return total if responses else None
+
+
+def _observed_stop_reason(responses: tuple[object, ...]) -> str | None:
+    if not responses:
+        return None
+    response = responses[-1]
+    details = getattr(response, "incomplete_details", None)
+    incomplete_reason = (
+        details.get("reason") if isinstance(details, Mapping) else getattr(details, "reason", None)
+    )
+    for reason in (incomplete_reason, getattr(response, "stop_reason", None)):
+        if reason in ("length", "max_output_tokens", "content_filter", "stop", "completed"):
+            return reason
+    for item in reversed(getattr(response, "output", ()) or ()):
+        if _item_type(item) == "message":
+            status = _item_status(item)
+            if status in ("completed", "incomplete"):
+                return status
     return None
+
+
+class _AssessmentResponses(RunHooks):
+    """Hold returned responses for this call if the SDK rejects its final output."""
+
+    def __init__(self) -> None:
+        self.responses: list[Any] = []
+
+    async def on_llm_end(self, context, agent, response) -> None:
+        self.responses.append(response)
+
+    def final_outcome(self) -> object:
+        if not self.responses:
+            return None
+        for item in reversed(self.responses[-1].output):
+            if _item_type(item) != "message":
+                continue
+            content = ItemHelpers.extract_last_text(item)
+            if not content:
+                break
+            try:
+                wrapper = json.loads(content)
+            except (ValueError, RecursionError):
+                return None
+            return wrapper.get("response") if isinstance(wrapper, dict) else None
+        return None
+
+
+def _validation_failure(error: Exception, metadata: AgentRunMetadata) -> str:
+    if metadata.stop_reason in {"max_output_tokens", "length"}:
+        return "provider_output_truncated"
+    if metadata.stop_reason in {"incomplete", "content_filter"}:
+        return "unknown"
+    if isinstance(error, ValidationError) and any(
+        issue["type"] == "fact_validation_failed"
+        for issue in error.errors(include_input=False, include_context=False)
+    ):
+        return "fact_validation_failed"
+    return "invalid_structure"
+
+
+def _attempt_metadata(metadata: AgentRunMetadata, mode: str, outcome: object) -> AgentRunMetadata:
+    if isinstance(outcome, ResearchSchema):
+        outcome = outcome.model_dump()
+    if not isinstance(outcome, Mapping):
+        return replace(metadata, mode=mode)
+
+    # Keep only bounded identifiers from the model boundary. Unknown keys,
+    # proposed values, explanations and captured page text never enter diagnostics.
+    action = outcome.get("action")
+    known_actions = _ALLOWED_ACTIONS["refresh"] | _ALLOWED_ACTIONS["profile"]
+    fields: set[str] = set()
+    proposed = outcome.get("proposed_fields")
+    if isinstance(proposed, Mapping):
+        cleared = proposed.get("clear_fields")
+        for field in EventUpdateField:
+            if proposed.get(field.value) is not None or (
+                isinstance(cleared, (list, tuple)) and field.value in cleared
+            ):
+                fields.add(field.value)
+    keys: set[str] = set()
+    allowed_keys = {f"E{index}" for index in range(1, 9)}
+    for name in ("applicability", "field_support", "conflicts"):
+        items = outcome.get(name)
+        if not isinstance(items, (tuple, list)):
+            continue
+        for item in items:
+            if not isinstance(item, Mapping):
+                continue
+            cited = (
+                (item.get("evidence_key"),)
+                if name == "applicability"
+                else item.get("evidence_keys")
+            )
+            if isinstance(cited, (list, tuple)):
+                keys.update(key for key in cited if isinstance(key, str) and key in allowed_keys)
+    return replace(
+        metadata,
+        mode=mode,
+        attempted_action=action if isinstance(action, str) and action in known_actions else None,
+        attempted_fields=tuple(sorted(fields)),
+        attempted_evidence_keys=tuple(sorted(keys)),
+    )

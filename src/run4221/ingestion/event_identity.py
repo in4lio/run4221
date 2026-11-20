@@ -7,7 +7,7 @@ moderator flows, and the legacy extraction pipeline.
 from __future__ import annotations
 
 import re
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, unquote_plus, urlparse
 
 NON_PRIMARY_EVENT_TERMS = (
     "mini",
@@ -26,16 +26,21 @@ HALF_MARATHON_TERMS = (
     "halfmarathon",
     "halb",
     "halbmarathon",
-    "21",
-    "21k",
-    "21km",
 )
 
 FULL_MARATHON_TERMS = (
     "full",
-    "42",
-    "42k",
-    "42km",
+    "fullmarathon",
+)
+
+# Rounded labels and official distances can use a decimal point or comma.
+_RACE_KM = r"(?:21(?:[.,](?:1|09|097|0975))?|42(?:[.,](?:2|19|195))?)"
+_DISTANCE_WITH_UNIT = re.compile(
+    rf"(?<![^\W_])(?<!\d[.,])({_RACE_KM})[\s_-]*(?:km?|kilomet(?:er|re)s?)(?![^\W_])",
+    re.IGNORECASE,
+)
+_DISTANCE_URL_FIELD = re.compile(
+    rf"(?:^|[/&])distances?[/=]({_RACE_KM})(?=$|[/&])", re.IGNORECASE
 )
 
 REGISTRATION_LINK_TERMS = (
@@ -152,11 +157,11 @@ def is_homepage_url(value: str) -> bool:
 
 
 def matches_distance_url(url: str, text: str, distances: tuple[str, ...]) -> bool:
-    tokens = event_identity_tokens(url, text)
+    tokens = _event_category_tokens(url, text)
     if "half_marathon" in distances:
         return any(term in tokens for term in HALF_MARATHON_TERMS)
     if "marathon" in distances:
-        return "marathon" in tokens and not any(
+        return bool(tokens & {"marathon", "fullmarathon"}) and not any(
             term in tokens for term in HALF_MARATHON_TERMS
         )
 
@@ -170,7 +175,7 @@ def conflicts_with_event_identity(
 ) -> bool:
     if not distances:
         return False
-    tokens = event_identity_tokens(url, text)
+    tokens = _event_category_tokens(url, text)
     if any(term in tokens for term in NON_PRIMARY_EVENT_TERMS):
         return True
     if "marathon" in distances and "half_marathon" not in distances:
@@ -178,6 +183,19 @@ def conflicts_with_event_identity(
     if "half_marathon" in distances and "marathon" not in distances:
         return any(term in tokens for term in FULL_MARATHON_TERMS)
     return False
+
+
+def _event_category_tokens(url: str, text: str) -> set[str]:
+    parsed = urlparse(url)
+    path, query = unquote(parsed.path), unquote_plus(parsed.query)
+    tokens = set(event_identity_tokens(url, text))
+    numbers = _DISTANCE_WITH_UNIT.findall(text)
+    for component in (path, query):
+        numbers.extend(_DISTANCE_WITH_UNIT.findall(component))
+        numbers.extend(_DISTANCE_URL_FIELD.findall(component))
+    for number in numbers:
+        tokens.add("halfmarathon" if number.startswith("21") else "fullmarathon")
+    return tokens
 
 
 def event_identity_tokens(url: str, text: str) -> frozenset[str]:
