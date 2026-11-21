@@ -10,7 +10,6 @@ from agents import MaxTurnsExceeded, ModelBehaviorError, WebSearchTool
 from agents.agent_output import AgentOutputSchema
 from agents.models.openai_responses import OpenAIResponsesModel
 from openai import AsyncOpenAI
-from pydantic import TypeAdapter
 
 from run4221.researcher.agent import (
     DEFAULT_RESEARCH_MODEL,
@@ -24,12 +23,11 @@ from run4221.researcher.agent import (
 )
 from run4221.researcher.schemas import (
     ArtifactReference,
-    AssessorOutcome,
     DecisionAction,
-    EvidenceRequest,
+    EvidenceGap,
+    RefreshAssessment,
     ResearchBudget,
     ResearchCandidate,
-    RunOutcome,
 )
 
 
@@ -167,9 +165,13 @@ def update_applicability(
     }
 
 
+def empty_report() -> dict[str, object]:
+    return {"observed_fields": None, "field_support": [], "gap": None, "summary": "No cited facts."}
+
+
 def valid_update_decision() -> dict[str, object]:
     return {
-        "action": "observe_fields",
+        "gap": None,
         "summary": "Captured official page says registration is open.",
         "confidence": 0.94,
         "uncertainty": "No material uncertainty in the captured statement.",
@@ -255,11 +257,11 @@ def test_profile_assessment_rejects_evidence_request_branch() -> None:
     result = assess_decision(outcome, mode="profile")
 
     assert result.state is AgentRunState.INCONCLUSIVE
-    assert result.error_code == "evidence_validation_failed"
+    assert result.error_code == "malformed_output"
     assert result.decision is None
-    assert result.evidence_request is None
+    assert result.gap is None
     assert result.metadata.mode == "profile"
-    assert result.metadata.failure_reason == "mode_action_forbidden"
+    assert result.metadata.failure_reason == "invalid_structure"
     assert result.metadata.attempted_action == "request_evidence"
     assert result.metadata.attempted_evidence_keys == ()
 
@@ -279,7 +281,7 @@ def test_mode_mismatched_decision_branches_are_rejected(
     result = assess_decision(outcome, mode=mode)
 
     assert result.state is AgentRunState.INCONCLUSIVE
-    assert result.error_code == "evidence_validation_failed"
+    assert result.error_code == "malformed_output"
     assert result.decision is None
 
 
@@ -513,7 +515,7 @@ def test_assessor_boundary_stops_after_requested_purpose_is_resolved() -> None:
     runner = FakeRunner(
         fake_result(
             {
-                "action": "inconclusive",
+                **empty_report(),
                 "summary": "Captured evidence supports no change.",
             }
         )
@@ -529,7 +531,7 @@ def test_assessor_boundary_stops_after_requested_purpose_is_resolved() -> None:
 
     assert result.state is AgentRunState.SUCCEEDED
     instructions = runner.calls[0]["starting_agent"].instructions
-    assert "resolves the last requested purpose" in instructions
+    assert "host compares values and decides" in instructions
     assert "without a current registration URL" in instructions
 
 
@@ -638,7 +640,7 @@ def test_refresh_search_cap_is_a_top_level_responses_parameter() -> None:
 
 def test_refresh_scout_reserves_budget_for_assessor() -> None:
     decision = {
-        "action": "inconclusive",
+        **empty_report(),
         "summary": "Captured evidence does not support a change.",
     }
     runner = FakeRunner(
@@ -687,7 +689,7 @@ def test_refresh_scout_reserves_budget_for_assessor() -> None:
 
 def test_unmetered_refresh_scout_preserves_assessor_reserve() -> None:
     decision = {
-        "action": "inconclusive",
+        **empty_report(),
         "summary": "Captured evidence does not support a change.",
     }
     runner = FakeRunner(
@@ -723,7 +725,7 @@ def test_unmetered_refresh_scout_preserves_assessor_reserve() -> None:
 
 def test_refresh_scout_turn_exhaustion_preserves_assessor_turn() -> None:
     decision = {
-        "action": "inconclusive",
+        **empty_report(),
         "summary": "Captured evidence does not support a change.",
     }
     runner = FakeRunner(
@@ -855,25 +857,12 @@ def test_assessor_has_zero_tools_and_accepts_only_frozen_captured_evidence() -> 
     assert runner.calls[0]["starting_agent"] is not another_runner.calls[0]["starting_agent"]
 
 
-@pytest.mark.parametrize(
-    ("mode", "allowed"),
-    [
-        ("profile", {"profile_event", "inconclusive"}),
-        ("refresh", {"observe_fields", "request_evidence", "inconclusive"}),
-    ],
-)
-def test_assessor_sends_only_mode_actions_to_responses_api(mode, allowed) -> None:
-    runner = FakeRunner(
-        fake_result({"action": "inconclusive", "summary": "Insufficient evidence."})
-    )
+@pytest.mark.parametrize("mode", ["profile", "refresh"])
+def test_assessor_sends_mode_contract_to_responses_api(mode):
     job = ResearchAgentJob(
-        instructions="Assess the captured page.",
-        prompt_reference="test",
-        budget=ResearchBudget(),
-        runner=runner,
+        instructions="Assess the captured page.", prompt_reference="test", budget=ResearchBudget()
     )
-    asyncio.run(job.assess(assessment_request().model_copy(update={"mode": mode})))
-    agent = runner.calls[0]["starting_agent"]
+    agent = job._assessor_agent(job.budget.limits_for_call(needs_web_search=False), mode)
     adapter = OpenAIResponsesModel(DEFAULT_RESEARCH_MODEL, AsyncOpenAI(api_key="test"))
     wire = adapter._build_response_create_kwargs(
         agent.instructions,
@@ -885,44 +874,41 @@ def test_assessor_sends_only_mode_actions_to_responses_api(mode, allowed) -> Non
     )["text"]["format"]
     assert wire["strict"]
     schema = wire["schema"]
-    union = schema["properties"]["response"]
-    assert set(union["discriminator"]["mapping"]) == allowed
-    actions = set()
-    for branch in union["anyOf"]:
-        action = schema["$defs"][branch["$ref"].split("/")[-1]]["properties"]["action"]
-        actions.update(action["enum"] if "enum" in action else [action["const"]])
-    assert actions == allowed
+    if mode == "refresh":
+        assert {"observed_fields", "field_support", "gap"}.issubset(schema["required"])
+        assert "action" not in schema["properties"] and "response" not in schema["properties"]
+        assert "query" not in schema["$defs"]["EvidenceGap"]["properties"]
+    else:
+        assert set(schema["properties"]["response"]["discriminator"]["mapping"]) == {
+            "profile_event",
+            "inconclusive",
+        }
 
 
 @pytest.mark.parametrize("mode", ["profile", "refresh"])
-def test_typed_sdk_abstention_reaches_the_caller(mode) -> None:
+def test_typed_sdk_abstention_reaches_the_caller(mode):
     class StructuredRunner:
         async def run(self, starting_agent, input, **kwargs):
-            schema = AgentOutputSchema(starting_agent.output_type)
-            typed = schema.validate_json(
-                json.dumps(
-                    {
-                        "response": {
-                            "action": "inconclusive",
-                            "summary": "The stated facts conflict.",
-                        }
-                    }
-                )
+            payload = (
+                {"response": {"action": "inconclusive", "summary": "Conflicting dates."}}
+                if mode == "profile"
+                else empty_report()
             )
+            typed = AgentOutputSchema(starting_agent.output_type).validate_json(json.dumps(payload))
             return fake_result(typed)
 
     job = ResearchAgentJob(
-        instructions="Assess captured facts.",
+        instructions="Assess facts.",
         prompt_reference="test",
         budget=ResearchBudget(),
         runner=StructuredRunner(),
     )
     result = asyncio.run(job.assess(assessment_request().model_copy(update={"mode": mode})))
     assert result.state is AgentRunState.SUCCEEDED
-    assert result.decision is not None and result.decision.action is DecisionAction.INCONCLUSIVE
+    assert result.decision.action == DecisionAction.INCONCLUSIVE
 
 
-def test_assessor_attaches_exact_captured_references_with_discriminated_output() -> None:
+def test_assessor_attaches_exact_captured_references_to_empty_report() -> None:
     first_reference = artifact_reference()
     second_reference = first_reference.model_copy(
         update={
@@ -933,7 +919,7 @@ def test_assessor_attaches_exact_captured_references_with_discriminated_output()
     runner = FakeRunner(
         fake_result(
             {
-                "action": "inconclusive",
+                **empty_report(),
                 "summary": "Captured official event page is unchanged.",
                 "confidence": 0.91,
             }
@@ -971,66 +957,15 @@ def test_assessor_attaches_exact_captured_references_with_discriminated_output()
     assert result.state is AgentRunState.SUCCEEDED
     assert result.decision is not None
     assert result.decision.evidence == [first_reference, second_reference]
-    output_type = runner.calls[0]["starting_agent"].output_type
-    output_schema = TypeAdapter(output_type).json_schema()
-    assert "oneOf" in output_schema
-    assert output_schema["discriminator"]["propertyName"] == "action"
 
 
-def test_refresh_assessor_returns_one_bounded_registration_status_evidence_request() -> None:
-    outcome = {
-        "action": "request_evidence",
-        "purpose": "registration_status",
-        "query": "Example Marathon 2027 standard registration status official",
-        "gap": "The captured page names the event but does not state registration status.",
-    }
-
-    result = assess_decision(outcome, mode="refresh")
-
-    assert result.state is AgentRunState.SUCCEEDED
-    assert result.decision is None
-    assert result.evidence_request == EvidenceRequest.model_validate(outcome)
-    assert not hasattr(result.evidence_request, "candidate")
-    assert not hasattr(result.evidence_request, "proposed_fields")
-    assert "request_evidence" not in {action.value for action in DecisionAction}
-    assert "request_evidence" not in {outcome.value for outcome in RunOutcome}
-
-
-@pytest.mark.parametrize(
-    "outcome",
-    [
-        {
-            "action": "request_evidence",
-            "purpose": "unknown",
-            "query": "official registration status",
-            "gap": "Registration state is absent.",
-        },
-        {
-            "action": "request_evidence",
-            "purpose": "registration_status",
-            "query": " ",
-            "gap": "Registration state is absent.",
-        },
-        {
-            "action": "request_evidence",
-            "purpose": "registration_status",
-            "query": "x" * 501,
-            "gap": "Registration state is absent.",
-        },
-        {
-            "action": "request_evidence",
-            "purpose": "registration_status",
-            "query": "official registration status",
-            "gap": "Registration state is absent.",
-            "observed_fields": {"registration_status": "open"},
-        },
-    ],
-)
-def test_evidence_request_is_a_strict_separate_union_branch(
-    outcome: dict[str, object],
-) -> None:
-    with pytest.raises(ValueError):
-        TypeAdapter(AssessorOutcome).validate_python(outcome)
+def test_sdk_report_keeps_confirmed_fact_and_independent_gap():
+    report = valid_update_decision()
+    report["gap"] = {"purpose": "registration_url", "description": "The entry URL is missing."}
+    typed = AgentOutputSchema(RefreshAssessment).validate_json(json.dumps(report))
+    result = assess_decision(typed)
+    assert result.decision.proposed_fields.registration_status == "open"
+    assert result.gap == EvidenceGap.model_validate(report["gap"])
 
 
 def test_valid_update_maps_only_known_evidence_keys_to_exact_references() -> None:
@@ -1126,7 +1061,7 @@ def test_update_rejects_invalid_per_field_support(mutate) -> None:
 
     assert result.state is AgentRunState.INCONCLUSIVE
     assert result.decision is None
-    assert result.metadata.attempted_action == "observe_fields"
+    assert result.metadata.attempted_action is None
     if decision["applicability"][0]["evidence_key"] == "E8":
         assert result.metadata.failure_reason == "unknown_evidence_key"
         assert result.metadata.attempted_evidence_keys == ("E8",)
@@ -1160,7 +1095,7 @@ def test_update_preserves_explicit_conflicts_without_source_order_resolution() -
         ),
     )
     decision = {
-        "action": "inconclusive",
+        **empty_report(),
         "summary": "Current captured sources conflict.",
         "confidence": 0.9,
         "uncertainty": "Registration status cannot be resolved from current evidence.",
@@ -1203,7 +1138,7 @@ def test_confidence_cannot_rescue_rejected_update_applicability() -> None:
 
 def test_assessment_input_uses_local_keys_and_hides_immutable_reference_boundaries() -> None:
     decision = {
-        "action": "inconclusive",
+        **empty_report(),
         "summary": "No captured fields changed.",
     }
     runner = FakeRunner(fake_result(decision))
@@ -1230,7 +1165,7 @@ def test_assessment_input_uses_local_keys_and_hides_immutable_reference_boundari
     "decision",
     [
         {
-            "action": "inconclusive",
+            **empty_report(),
             "summary": "The captured page does not confirm a date.",
             "confidence": 0.31,
         },
@@ -1241,13 +1176,13 @@ def test_assessment_input_uses_local_keys_and_hides_immutable_reference_boundari
         },
     ],
 )
-def test_assessor_accepts_each_action_payload(decision: dict[str, object]) -> None:
+def test_refresh_report_resolves_to_host_decision(decision: dict[str, object]) -> None:
     result = assess_decision(decision)
 
     assert result.state is AgentRunState.SUCCEEDED
     assert result.decision is not None
     assert result.decision.action == (
-        "propose_update" if decision["action"] == "observe_fields" else decision["action"]
+        "propose_update" if decision["observed_fields"] else "inconclusive"
     )
     assert result.decision.evidence == [artifact_reference()]
 
@@ -1292,28 +1227,23 @@ def test_assessor_accepts_explicit_clear_fields() -> None:
 @pytest.mark.parametrize(
     "decision",
     [
-        {"action": "unknown", "summary": "Unsupported action."},
-        {"action": "suggest_event", "summary": "Removed discovery action."},
-        {"action": "observe_fields", "summary": "Missing proposed fields."},
+        {**empty_report(), "action": "request_evidence"},
+        {"gap": None, "summary": "Missing facts and support."},
+        {**empty_report(), "candidate": candidate().model_dump(mode="json")},
+        {**empty_report(), "evidence": [artifact_reference().model_dump(mode="json")]},
+        {**empty_report(), "gap": {"purpose": "unsupported", "description": "Unclear."}},
+        {**empty_report(), "gap": {"purpose": "registration_status", "description": " "}},
         {
-            "action": "inconclusive",
-            "summary": "Unexpected candidate.",
-            "candidate": candidate().model_dump(mode="json"),
+            **empty_report(),
+            "gap": {
+                "purpose": "event_date",
+                "description": "Unknown.",
+                "query": "model-selected search",
+            },
         },
+        {**valid_update_decision(), "observed_fields": None},
         {
-            "action": "observe_fields",
-            "summary": "Mixed payload.",
-            "candidate": candidate().model_dump(mode="json"),
-            "observed_fields": {"registration_status": "open"},
-        },
-        {
-            "action": "inconclusive",
-            "summary": "Invented evidence.",
-            "evidence": [artifact_reference().model_dump(mode="json")],
-        },
-        {
-            "action": "observe_fields",
-            "summary": "Conflicting clear and replacement.",
+            **valid_update_decision(),
             "observed_fields": {
                 "registration_url": "https://example.com/register",
                 "clear_fields": ["registration_url"],
@@ -1321,48 +1251,12 @@ def test_assessor_accepts_explicit_clear_fields() -> None:
         },
     ],
 )
-def test_assessor_rejects_invalid_action_payloads(decision: dict[str, object]) -> None:
+def test_refresh_rejects_invalid_report(decision: dict[str, object]) -> None:
     result = assess_decision(decision)
 
     assert result.state is AgentRunState.INCONCLUSIVE
     assert result.error_code == "malformed_output"
     assert result.decision is None
-
-
-def test_assessor_uses_agents_sdk_strict_wrapped_schema() -> None:
-    output = AgentOutputSchema(AssessorOutcome)
-
-    assert output.is_strict_json_schema() is True
-    schema = output.json_schema()
-    response_schema = schema["properties"]["response"]
-    assert response_schema["discriminator"]["propertyName"] == "action"
-    parsed = output.validate_json(
-        json.dumps(
-            {
-                "response": {
-                    "action": "inconclusive",
-                    "summary": "No captured fields changed.",
-                    "confidence": 0.88,
-                }
-            }
-        )
-    )
-    assert parsed.action == "inconclusive"
-    requested = output.validate_json(
-        json.dumps(
-            {
-                "response": {
-                    "action": "request_evidence",
-                    "purpose": "registration_status",
-                    "query": "official registration status",
-                    "gap": "The captured page does not state registration status.",
-                }
-            }
-        )
-    )
-    assert requested.action == "request_evidence"
-    updated = output.validate_json(json.dumps({"response": valid_update_decision()}))
-    assert updated.action == "observe_fields"
 
 
 def test_search_budget_stops_before_a_third_provider_call() -> None:
@@ -1411,7 +1305,7 @@ def test_output_token_exhaustion_stops_before_another_sdk_call() -> None:
     # A refresh scout always holds back the assessment reserve, so only an
     # assessor call can consume the final output tokens of a job.
     decision = {
-        "action": "inconclusive",
+        **empty_report(),
         "summary": "Captured evidence does not support a change.",
     }
     runner = FakeRunner(
@@ -1531,7 +1425,6 @@ def test_sdk_parse_failure_retains_usage_and_safe_identifiers(finish, reason) ->
     from openai.types.responses import ResponseOutputMessage, ResponseOutputText
 
     payload = {
-        "action": "observe_fields",
         "observed_fields": {"event_date": "2027-10-01", "not-a-field": "sensitive text"},
         "applicability": [{"evidence_key": "E1"}, {"evidence_key": "sensitive text"}],
     }
@@ -1545,7 +1438,7 @@ def test_sdk_parse_failure_retains_usage_and_safe_identifiers(finish, reason) ->
             status="completed" if finish == "completed" else "incomplete",
             content=[
                 ResponseOutputText(
-                    type="output_text", annotations=[], text=json.dumps({"response": payload})
+                    type="output_text", annotations=[], text=json.dumps(payload)
                 )
             ],
         )
@@ -1587,7 +1480,7 @@ def test_partial_provider_response_cannot_admit_a_valid_looking_decision() -> No
     result = asyncio.run(job.assess(assessment_request()))
     assert result.decision is None
     assert result.metadata.failure_reason == "provider_output_truncated"
-    assert result.metadata.attempted_action == "observe_fields"
+    assert result.metadata.attempted_action is None
 
 
 def test_failed_unmetered_call_preserves_only_requested_profile_reserve() -> None:

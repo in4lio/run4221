@@ -46,7 +46,7 @@ from run4221.researcher.schemas import (
     DecisionAction,
     EventProfileDraft,
     EventUpdateField,
-    EvidenceRequest,
+    EvidenceGap,
     EvidenceRequestPurpose,
     ProposedEventChanges,
     ResearchBudget,
@@ -320,7 +320,7 @@ class ResearcherService:
         context = _event_context(frozen_event, source.url)
         captured_final_urls = {normalize_url(captured.snapshot.final_url)}
         completed_purposes: set[EvidenceRequestPurpose] = set()
-        normalized_queries: set[str] = set()
+        seen_gaps: set[str] = set()
         successful_captures = 1
         completed_web_searches = 0
 
@@ -335,6 +335,7 @@ class ResearcherService:
             await asyncio.to_thread(self._record_assessment, run_id, source.url, assessment)
             if assessment.state is not AgentRunState.SUCCEEDED:
                 return await self._finish_agent_outcome(run_id, source.url, assessment)
+            evidence_gap = assessment.gap
             if assessment.decision is not None:
                 try:
                     decision = ResearchDecision.model_validate(
@@ -348,20 +349,20 @@ class ResearcherService:
                         RunOutcome.INCONCLUSIVE,
                         "Terminal decision failed host schema validation.",
                     )
-                evidence_request = None
                 observed = decision.proposed_fields
+                if evidence_gap and not _needs_followup(evidence_gap, decision, frozen_fields):
+                    evidence_gap = None
                 if (
-                    len(captures) == 1
+                    evidence_gap is None
+                    and len(captures) == 1
                     and observed is not None
                     and observed.changed_fields == {EventUpdateField.EVENT_DATE}
                     and observed.event_date == frozen_event.event_date
                     and observed.event_date is not None
                 ):
-                    registration = EvidenceRequest(
-                        action="request_evidence",
+                    registration = EvidenceGap(
                         purpose=EvidenceRequestPurpose.REGISTRATION_STATUS,
-                        query="standard marathon registration",
-                        gap="The overview confirms the race date. Check its registration page.",
+                        description="The overview confirms the date. Check the registration page.",
                     )
                     if _refresh_link_candidate_urls(
                         tuple(captures),
@@ -370,21 +371,19 @@ class ResearcherService:
                         approved_source_url=source.url,
                         captured_final_urls=frozenset(captured_final_urls),
                     ):
-                        evidence_request = registration
-                if evidence_request is None:
+                        evidence_gap = registration
+                if evidence_gap is None:
                     break
-            else:
-                evidence_request = assessment.evidence_request
-            if not isinstance(evidence_request, EvidenceRequest):
+            if not isinstance(evidence_gap, EvidenceGap):
                 return await self._finish_without_queue(
                     run_id,
                     source.url,
                     RunState.SKIPPED,
                     RunOutcome.INCONCLUSIVE,
-                    "Assessment returned neither a terminal decision nor a valid evidence request.",
+                    "Assessment returned neither verified facts nor a specific evidence gap.",
                 )
-            normalized_query = _normalize_refresh_query(evidence_request.query)
-            purpose = evidence_request.purpose
+            normalized_gap = " ".join(evidence_gap.description.casefold().split())
+            purpose = evidence_gap.purpose
             if len(completed_purposes) >= MAX_REFRESH_CONTINUATIONS:
                 return await self._finish_without_queue(
                     run_id,
@@ -393,13 +392,13 @@ class ResearcherService:
                     RunOutcome.INCONCLUSIVE,
                     "Refresh continuation budget was exhausted.",
                 )
-            if normalized_query in normalized_queries or purpose in completed_purposes:
+            if normalized_gap in seen_gaps or purpose in completed_purposes:
                 return await self._finish_without_queue(
                     run_id,
                     source.url,
                     RunState.SKIPPED,
                     RunOutcome.INCONCLUSIVE,
-                    "Assessment repeated an already completed evidence query or purpose.",
+                    "Assessment repeated an previous evidence gap or purpose.",
                 )
             capture_limit = min(
                 MAX_REFRESH_CAPTURES,
@@ -414,10 +413,10 @@ class ResearcherService:
                     "Refresh page-capture budget was exhausted.",
             )
 
-            normalized_queries.add(normalized_query)
+            seen_gaps.add(normalized_gap)
             linked_candidate_urls = _refresh_link_candidate_urls(
                 tuple(captures),
-                request=evidence_request,
+                request=evidence_gap,
                 event=frozen_event,
                 approved_source_url=source.url,
                 captured_final_urls=frozenset(captured_final_urls),
@@ -441,7 +440,7 @@ class ResearcherService:
                         query=_targeted_refresh_query(
                             frozen_event,
                             source.url,
-                            evidence_request,
+                            evidence_gap,
                         ),
                         approved_source_url=source.url,
                         context=context,
@@ -1133,11 +1132,7 @@ class ResearcherService:
                 "decision": (
                     result.decision.model_dump(mode="json") if result.decision is not None else None
                 ),
-                "evidence_request": (
-                    result.evidence_request.model_dump(mode="json")
-                    if result.evidence_request is not None
-                    else None
-                ),
+                "gap": result.gap.model_dump(mode="json") if result.gap is not None else None,
                 "error_code": result.error_code,
                 "detail": result.detail,
             },
@@ -1486,24 +1481,48 @@ def _event_context(event: TrackedEvent, approved_source_url: str) -> tuple[Froze
     return tuple(FrozenContextField(name=name, value=str(value)) for name, value in values.items())
 
 
+def _needs_followup(
+    gap: EvidenceGap, decision: ResearchDecision, current_fields: dict[str, object]
+) -> bool:
+    observed = decision.proposed_fields
+    if observed is None or gap.purpose in {
+        EvidenceRequestPurpose.EVENT_IDENTITY,
+        EvidenceRequestPurpose.EVENT_EDITION,
+        EvidenceRequestPurpose.DISTANCE_CATEGORY,
+    }:
+        return True
+
+    changed = _changed_supported_fields(decision, current_fields)
+    if gap.purpose is EvidenceRequestPurpose.CONFLICT_RESOLUTION:
+        # A scoped conflict already passed the schema's disjoint-field check.
+        return not changed or not decision.conflicts
+    if (
+        gap.purpose is EvidenceRequestPurpose.REGISTRATION_URL
+        and observed.registration_status in {"closed", "sold_out"}
+        and "registration_url" not in changed
+    ):
+        return False
+    if gap.purpose is EvidenceRequestPurpose.REGISTRATION_TIMING:
+        return not changed or bool(
+            changed.keys()
+            & {"registration_open_at", "registration_open_precision", "registration_close_at"}
+        )
+    return not changed or gap.purpose.value in changed
+
+
 def _targeted_refresh_query(
     event: TrackedEvent,
     approved_source_url: str,
-    request: EvidenceRequest,
+    request: EvidenceGap,
 ) -> str:
     year = event.event_date[:4] if event.event_date else "current"
     distances = " ".join(event.distances).replace("_", " ")
-    requested_query = " ".join(request.query.split())[:180]
-    gap = " ".join(request.gap.split())[:160]
+    gap = " ".join(request.description.split())[:300]
     query = (
         f'site:{source_domain(approved_source_url)} "{event.name}" {year} {distances} '
-        f"{request.purpose.value} {requested_query} {gap}"
+        f"{request.purpose.value} {gap}"
     )
     return query[:500]
-
-
-def _normalize_refresh_query(query: str) -> str:
-    return " ".join(query.casefold().split())
 
 
 def _refresh_candidate_urls(
@@ -1543,7 +1562,7 @@ def _refresh_candidate_urls(
 def _refresh_link_candidate_urls(
     captures: tuple[CapturedPage, ...],
     *,
-    request: EvidenceRequest,
+    request: EvidenceGap,
     event: TrackedEvent,
     approved_source_url: str,
     captured_final_urls: frozenset[str],

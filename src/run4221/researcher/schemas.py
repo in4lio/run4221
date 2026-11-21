@@ -272,25 +272,29 @@ class AssessorInconclusiveDecision(AssessorTerminalDecision):
     action: Literal[DecisionAction.INCONCLUSIVE]
 
 
-class AssessorObservedFields(AssessorTerminalDecision):
-    action: Literal["observe_fields"]
-    observed_fields: ProposedEventChanges
-    applicability: Annotated[
-        tuple[EvidenceApplicability, ...],
-        Field(min_length=1, max_length=8),
-    ]
+class EvidenceGap(ResearchSchema):
+    purpose: EvidenceRequestPurpose
+    description: EvidenceText
+
+
+class RefreshAssessment(AssessorTerminalDecision):
+    observed_fields: ProposedEventChanges | None
     field_support: Annotated[
-        tuple[FieldEvidenceSupport, ...],
-        Field(min_length=1, max_length=len(EventUpdateField)),
+        tuple[FieldEvidenceSupport, ...], Field(max_length=len(EventUpdateField))
     ]
+    gap: EvidenceGap | None
 
     @model_validator(mode="after")
     def validate_update_support(self) -> Self:
         support_fields = [item.field for item in self.field_support]
         if len(set(support_fields)) != len(support_fields):
-            raise ValueError("Each proposed field must have exactly one support item.")
+            raise ValueError("Each observed field must have exactly one support item.")
+        if self.observed_fields is None:
+            if support_fields:
+                raise ValueError("Field support requires observed values.")
+            return self
         if set(support_fields) != set(self.observed_fields.changed_fields):
-            raise ValueError("field_support must exactly match the proposed fields.")
+            raise ValueError("field_support must exactly match the observed fields.")
 
         applicability = {item.evidence_key: item for item in self.applicability}
         for support in self.field_support:
@@ -338,35 +342,9 @@ class AssessorProfileDecision(AssessorTerminalDecision):
     page_is_event: bool = True
 
 
-class EvidenceRequest(ResearchSchema):
-    action: Literal["request_evidence"]
-    purpose: EvidenceRequestPurpose
-    query: Annotated[str, Field(min_length=1, max_length=500)]
-    gap: EvidenceText
-
-
-AssessorDecision = Annotated[
-    AssessorInconclusiveDecision | AssessorObservedFields | AssessorProfileDecision,
-    Field(discriminator="action"),
-]
-
-AssessorOutcome = Annotated[
-    AssessorInconclusiveDecision
-    | AssessorObservedFields
-    | AssessorProfileDecision
-    | EvidenceRequest,
-    Field(discriminator="action"),
-]
-
 ProfileAssessmentOutcome = Annotated[
     AssessorProfileDecision | AssessorInconclusiveDecision, Field(discriminator="action")
 ]
-
-RefreshAssessmentOutcome = Annotated[
-    AssessorObservedFields | AssessorInconclusiveDecision | EvidenceRequest,
-    Field(discriminator="action"),
-]
-
 
 class ResolvedEvidenceApplicability(ResearchSchema):
     evidence: ArtifactReference

@@ -40,7 +40,7 @@ from run4221.researcher.artifacts import ResearchArtifactStore
 from run4221.researcher.schemas import (
     ArtifactReference,
     EventProfileDraft,
-    EvidenceRequest,
+    EvidenceGap,
     ResearchBudget,
     ResearchCandidate,
     ResearchDecision,
@@ -156,11 +156,11 @@ class FakeAgent:
             outcome = outcome(request)
         if isinstance(outcome, AssessmentRunResult):
             return outcome
-        if isinstance(outcome, EvidenceRequest):
+        if isinstance(outcome, EvidenceGap):
             return AssessmentRunResult(
                 state=AgentRunState.SUCCEEDED,
                 metadata=metadata(),
-                evidence_request=outcome,
+                gap=outcome,
             )
         return AssessmentRunResult(
             state=AgentRunState.SUCCEEDED,
@@ -172,10 +172,9 @@ class FakeAgent:
 def refresh_request(
     *,
     purpose: str = "registration_status",
-    query: str = "official standard registration status",
     gap: str = "The captured page does not confirm the current registration status.",
-) -> EvidenceRequest:
-    return EvidenceRequest(action="request_evidence", purpose=purpose, query=query, gap=gap)
+) -> EvidenceGap:
+    return EvidenceGap(purpose=purpose, description=gap)
 
 
 def supported_update(
@@ -562,7 +561,7 @@ def test_typed_refresh_request_captures_snippet_mismatch_then_proposes_supported
         snippet="Kids & Youth appears only in this untrusted ranking hint.",
     )
     update = {
-        "action": "observe_fields",
+        "gap": None,
         "summary": "The standard marathon entry deadline is 2 September 2027.",
         "applicability": [update_applicability("E2", applicable_fields=["registration_close_at"])],
         "field_support": [
@@ -579,11 +578,15 @@ def test_typed_refresh_request_captures_snippet_mismatch_then_proposes_supported
     def replay() -> ResearchJobResult:
         runner = FakeRunner(
             fake_result(
-                refresh_request(
-                    purpose="registration_timing",
-                    query="standard marathon closing date",
-                    gap="The approved event overview omits the standard entry deadline.",
-                )
+                {
+                    "observed_fields": None,
+                    "field_support": [],
+                    "summary": "No deadline in the overview.",
+                    "gap": {
+                        "purpose": "registration_timing",
+                        "description": "The overview omits the standard entry deadline.",
+                    },
+                }
             ),
             fake_result({"candidates": [candidate]}, web_search_calls=1),
             fake_result(update),
@@ -772,12 +775,10 @@ def test_refresh_allows_two_distinct_successful_continuations_then_stops_third(
             refresh_request(),
             refresh_request(
                 purpose="event_date",
-                query="official 2027 event date",
                 gap="The current event date is not confirmed.",
             ),
             refresh_request(
                 purpose="registration_url",
-                query="official standard registration URL",
                 gap="The registration destination is not confirmed.",
             ),
         ),
@@ -799,23 +800,21 @@ def test_refresh_allows_two_distinct_successful_continuations_then_stops_third(
     assert count_proposed_event_updates(database_url=url) == 0
 
 
-def test_refresh_repeated_query_or_completed_purpose_stops_without_another_scout(
+def test_refresh_repeated_gap_or_completed_purpose_stops_without_another_scout(
     tmp_path: Path,
 ) -> None:
     for suffix, second_request in (
         (
-            "query",
+            "gap",
             refresh_request(
                 purpose="event_date",
-                query="  OFFICIAL standard registration STATUS  ",
-                gap="A different gap repeats the same query.",
+                gap="  THE captured page does not confirm the current registration status.  ",
             ),
         ),
         (
             "purpose",
             refresh_request(
                 purpose="registration_status",
-                query="a different registration status query",
                 gap="The same purpose was already completed.",
             ),
         ),
@@ -868,7 +867,6 @@ def test_refresh_duplicate_final_url_stops_without_fresh_assessment(tmp_path: Pa
             refresh_request(),
             refresh_request(
                 purpose="event_date",
-                query="official 2027 event date",
                 gap="The event date is not confirmed.",
             ),
         ),
@@ -1646,7 +1644,8 @@ def test_date_clear_needs_a_retraction_of_the_stored_date(tmp_path, notice, admi
     assert find_event(source.event.id, db) == source.event
 
 
-def test_unchanged_race_date_leads_to_linked_registration_notice(tmp_path):
+@pytest.mark.parametrize("reported_gap", [False, True])
+def test_unchanged_race_date_leads_to_linked_registration_notice(tmp_path, reported_gap):
     db = database_url(tmp_path)
     source = tracked_source(db)
     registration = "https://baden.example/registration"
@@ -1658,9 +1657,18 @@ def test_unchanged_race_date_leads_to_linked_registration_notice(tmp_path):
             return snapshot(url, links=(PageLink(url=registration, text="Marathon registration"),))
         return snapshot(url, text="Standard entries are sold out.")
 
+    def unchanged(request):
+        fact = supported_update(request, proposed_fields={"event_date": "2027-09-19"})
+        return AssessmentRunResult(
+            state=AgentRunState.SUCCEEDED,
+            metadata=metadata(),
+            decision=fact,
+            gap=refresh_request() if reported_gap else None,
+        )
+
     agent = FakeAgent(
         assessments=(
-            lambda request: supported_update(request, proposed_fields={"event_date": "2027-09-19"}),
+            unchanged,
             lambda request: supported_update(
                 request, proposed_fields={"registration_status": "sold_out"}, evidence_indexes=(1,)
             ),
@@ -1672,6 +1680,50 @@ def test_unchanged_race_date_leads_to_linked_registration_notice(tmp_path):
     assert list_proposed_event_updates(database_url=db)[0].proposed_fields == {
         "registration_status": "sold_out"
     }
+
+
+@pytest.mark.parametrize(
+    ("purpose", "expected"),
+    [
+        ("registration_url", "proposal_created"),
+        ("registration_status", "inconclusive"),
+        ("event_identity", "inconclusive"),
+        ("event_edition", "inconclusive"),
+        ("distance_category", "inconclusive"),
+        ("conflict_resolution", "inconclusive"),
+    ],
+)
+def test_host_routes_observation_and_gap_with_one_capture(tmp_path, purpose, expected):
+    db = database_url(tmp_path)
+    source = tracked_source(db)
+
+    def assess(request):
+        return AssessmentRunResult(
+            state=AgentRunState.SUCCEEDED,
+            metadata=metadata(),
+            decision=supported_update(request, proposed_fields={"registration_status": "sold_out"}),
+            gap=EvidenceGap(purpose=purpose, description="An independently reported gap."),
+        )
+
+    async def fetch(url):
+        return snapshot(url, text="Standard entries are sold out.")
+
+    agent = FakeAgent(decide=assess)
+    result = asyncio.run(
+        service(
+            tmp_path,
+            url=db,
+            agent=agent,
+            fetch=fetch,
+            budget=ResearchBudget(max_static_pages_per_job=1),
+        ).refresh(source)
+    )
+    assert result.status.outcome == expected
+    assert not agent.scout_calls
+    assert [row.proposed_fields for row in list_proposed_event_updates(database_url=db)] == (
+        [{"registration_status": "sold_out"}] if expected == "proposal_created" else []
+    )
+    assert find_event(source.event.id, db) == source.event
 
 
 def test_mismatched_withdrawal_keeps_independent_supported_status(tmp_path):
