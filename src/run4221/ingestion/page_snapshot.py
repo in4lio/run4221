@@ -6,7 +6,7 @@ import json
 import re
 import socket
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from html import unescape
@@ -69,6 +69,8 @@ class PageSnapshot:
     links: tuple[PageLink, ...]
     primary_text: str = ""
     chrome_text: str = ""
+    # Host-side page budget includes the root and failed enrichment fetches.
+    pages_attempted: int = 1
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -391,7 +393,8 @@ async def fetch_enriched_page_snapshot(
         max_response_bytes=max_response_bytes,
     )
     linked_snapshots = []
-    for candidate_url in same_domain_candidate_urls(root_snapshot, max_linked_pages):
+    candidates = same_domain_candidate_urls(root_snapshot, max_linked_pages)
+    for candidate_url in candidates:
         try:
             linked_snapshots.append(
                 await fetch_page_snapshot(
@@ -406,7 +409,8 @@ async def fetch_enriched_page_snapshot(
         except PageFetchError:
             continue
 
-    return merge_page_snapshots(root_snapshot, tuple(linked_snapshots))
+    merged = merge_page_snapshots(root_snapshot, tuple(linked_snapshots))
+    return replace(merged, pages_attempted=1 + len(candidates))
 
 
 def extract_response_content(
@@ -437,6 +441,8 @@ def extract_response_content(
 
 
 def same_domain_candidate_urls(snapshot: PageSnapshot, limit: int) -> tuple[str, ...]:
+    if limit <= 0:
+        return ()
     root_domain = urlparse(snapshot.final_url).netloc.casefold()
     root_url = normalize_fetch_url(snapshot.final_url)
     candidates: list[str] = []

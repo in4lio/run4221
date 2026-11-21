@@ -2532,7 +2532,7 @@ def test_researcher_update_detail_shows_validated_field_support_and_conflicts() 
         evidence=update.evidence
         + (
             "Researcher field support: registration_status <- "
-            "page_snapshot-status.json#bbbbbbbbbbbb",
+            "page_snapshot-status.json#bbbbbbbbbbbb | Entries <sold out> & waitlist separate.",
             "Researcher conflict: event_date <- "
             "page_snapshot-overview.json#cccccccccccc, "
             "page_snapshot-status.json#bbbbbbbbbbbb | "
@@ -2543,6 +2543,7 @@ def test_researcher_update_detail_shows_validated_field_support_and_conflicts() 
     detail = format_proposed_update_detail(update)
 
     assert "<b>Supported fields</b>: registration_status" in detail
+    assert "Entries &lt;sold out&gt; &amp; waitlist separate." in detail
     assert "<b>Field support</b>" not in detail
     assert (
         "<b>Conflict</b>: event_date &lt;- "

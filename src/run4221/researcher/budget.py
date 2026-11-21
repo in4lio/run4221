@@ -150,16 +150,20 @@ class JobBudgetTracker:
 
     def record_failed_call(
         self,
+        observation: BudgetObservation,
         *,
         exhaust_turns: bool = False,
         preserve_assessment_reserve: bool = False,
         preserved_followups: int = 1,
     ) -> None:
-        floor = preserved_followups if preserve_assessment_reserve else 0
+        self.record(
+            observation,
+            preserve_assessment_reserve=preserve_assessment_reserve,
+            preserved_followups=preserved_followups,
+        )
         if exhaust_turns:
-            self.remaining_turns = floor
-        else:
-            self.remaining_turns = max(floor, self.remaining_turns - 1)
+            floor = preserved_followups if preserve_assessment_reserve else 0
+            self.remaining_turns = min(self.remaining_turns, floor)
 
     def candidate_cap_exceeded(self, count: int) -> bool:
         return count > self.policy.max_candidates_per_cycle

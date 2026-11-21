@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 ShortText = Annotated[str, Field(min_length=1, max_length=240)]
 SummaryText = Annotated[str, Field(min_length=1, max_length=1_000)]
@@ -154,9 +155,7 @@ class ProposedEventChanges(ResearchSchema):
 
     @property
     def changed_fields(self) -> frozenset[EventUpdateField]:
-        fields = {
-            field for field in EventUpdateField if getattr(self, field.value) is not None
-        }
+        fields = {field for field in EventUpdateField if getattr(self, field.value) is not None}
         fields.update(EventUpdateField(name) for name in self.clear_fields)
         return frozenset(fields)
 
@@ -219,6 +218,8 @@ class EvidenceApplicability(ResearchSchema):
 
 
 class FieldEvidenceSupport(ResearchSchema):
+    quote: EvidenceText
+    withdrawn_value: EvidenceText | None = None
     field: EventUpdateField
     evidence_keys: Annotated[
         tuple[EvidenceKey, ...],
@@ -267,32 +268,46 @@ class AssessorTerminalDecision(ResearchSchema):
         return self
 
 
-class AssessorNoPayloadDecision(AssessorTerminalDecision):
-    action: Literal[DecisionAction.NO_CHANGE, DecisionAction.INCONCLUSIVE]
+class AssessorInconclusiveDecision(AssessorTerminalDecision):
+    action: Literal[DecisionAction.INCONCLUSIVE]
 
 
-class AssessorUpdateDecision(AssessorTerminalDecision):
-    action: Literal[DecisionAction.PROPOSE_UPDATE]
-    proposed_fields: ProposedEventChanges
-    applicability: Annotated[
-        tuple[EvidenceApplicability, ...],
-        Field(min_length=1, max_length=8),
-    ]
+class EvidenceGap(ResearchSchema):
+    purpose: EvidenceRequestPurpose
+    description: EvidenceText
+
+
+class RefreshAssessment(AssessorTerminalDecision):
+    observed_fields: ProposedEventChanges | None
     field_support: Annotated[
-        tuple[FieldEvidenceSupport, ...],
-        Field(min_length=1, max_length=len(EventUpdateField)),
+        tuple[FieldEvidenceSupport, ...], Field(max_length=len(EventUpdateField))
     ]
+    gap: EvidenceGap | None
 
     @model_validator(mode="after")
     def validate_update_support(self) -> Self:
         support_fields = [item.field for item in self.field_support]
         if len(set(support_fields)) != len(support_fields):
-            raise ValueError("Each proposed field must have exactly one support item.")
-        if set(support_fields) != set(self.proposed_fields.changed_fields):
-            raise ValueError("field_support must exactly match the proposed fields.")
+            raise ValueError("Each observed field must have exactly one support item.")
+        if self.observed_fields is None:
+            if support_fields:
+                raise ValueError("Field support requires observed values.")
+            return self
+        if set(support_fields) != set(self.observed_fields.changed_fields):
+            raise ValueError("field_support must exactly match the observed fields.")
 
         applicability = {item.evidence_key: item for item in self.applicability}
         for support in self.field_support:
+            if (support.field.value in self.observed_fields.clear_fields) != (
+                support.withdrawn_value is not None
+            ):
+                raise ValueError("Supply the withdrawn value exactly for cleared fields.")
+            if (
+                support.field is EventUpdateField.REGISTRATION_URL
+                and support.withdrawn_value is not None
+                and support.withdrawn_value not in support.quote
+            ):
+                raise ValueError("Quote the withdrawn registration URL.")
             for evidence_key in support.evidence_keys:
                 item = applicability.get(evidence_key)
                 if item is None:
@@ -303,17 +318,21 @@ class AssessorUpdateDecision(AssessorTerminalDecision):
                     or item.distance_category is not AssessmentVerdict.CONFIRMED
                     or support.field not in item.applicable_fields
                 ):
-                    raise ValueError(
+                    raise PydanticCustomError(
+                        "fact_validation_failed",
                         "Field support requires confirmed identity, edition, "
-                        "distance/category, and field applicability."
+                        "distance/category, and field applicability.",
                     )
 
-        changed_fields = self.proposed_fields.changed_fields
+        changed_fields = self.observed_fields.changed_fields
         if any(
             conflict.field is None or conflict.field in changed_fields
             for conflict in self.conflicts
         ):
-            raise ValueError("A proposed update cannot source-order conflicting evidence.")
+            raise PydanticCustomError(
+                "fact_validation_failed",
+                "A proposed update cannot source-order conflicting evidence.",
+            )
         return self
 
 
@@ -323,23 +342,9 @@ class AssessorProfileDecision(AssessorTerminalDecision):
     page_is_event: bool = True
 
 
-class EvidenceRequest(ResearchSchema):
-    action: Literal["request_evidence"]
-    purpose: EvidenceRequestPurpose
-    query: Annotated[str, Field(min_length=1, max_length=500)]
-    gap: EvidenceText
-
-
-AssessorDecision = Annotated[
-    AssessorNoPayloadDecision | AssessorUpdateDecision | AssessorProfileDecision,
-    Field(discriminator="action"),
+ProfileAssessmentOutcome = Annotated[
+    AssessorProfileDecision | AssessorInconclusiveDecision, Field(discriminator="action")
 ]
-
-AssessorOutcome = Annotated[
-    AssessorNoPayloadDecision | AssessorUpdateDecision | AssessorProfileDecision | EvidenceRequest,
-    Field(discriminator="action"),
-]
-
 
 class ResolvedEvidenceApplicability(ResearchSchema):
     evidence: ArtifactReference
@@ -359,6 +364,10 @@ class ResolvedEvidenceApplicability(ResearchSchema):
 
 
 class ResolvedFieldEvidenceSupport(ResearchSchema):
+    withdrawn_value: EvidenceText | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    quote: EvidenceText | None = Field(default=None, exclude_if=lambda value: value is None)
     field: EventUpdateField
     evidence: Annotated[
         tuple[ArtifactReference, ...],
@@ -503,3 +512,14 @@ class ResearchRunStatus(ResearchSchema):
     status: RunState
     outcome: RunOutcome
     detail: Annotated[str, Field(min_length=1, max_length=1_000)] | None = None
+    validation_reason: (
+        Literal[
+            "missing_field_support",
+            "uncited_support",
+            "unqualified_support_capture",
+            "unconfirmed_date_withdrawal",
+            "withdrawn_value_mismatch",
+            "normalized_decision_invalid",
+        ]
+        | None
+    ) = Field(default=None, exclude_if=lambda value: value is None)

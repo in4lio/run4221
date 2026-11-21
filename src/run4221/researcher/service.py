@@ -4,6 +4,7 @@ import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
+from datetime import date
 from typing import Protocol
 from urllib.parse import urlparse
 
@@ -45,13 +46,14 @@ from run4221.researcher.schemas import (
     DecisionAction,
     EventProfileDraft,
     EventUpdateField,
-    EvidenceRequest,
+    EvidenceGap,
     EvidenceRequestPurpose,
     ProposedEventChanges,
     ResearchBudget,
     ResearchCandidate,
     ResearchDecision,
     ResearchRunStatus,
+    ResolvedFieldEvidenceSupport,
     RunOutcome,
     RunState,
 )
@@ -318,7 +320,7 @@ class ResearcherService:
         context = _event_context(frozen_event, source.url)
         captured_final_urls = {normalize_url(captured.snapshot.final_url)}
         completed_purposes: set[EvidenceRequestPurpose] = set()
-        normalized_queries: set[str] = set()
+        seen_gaps: set[str] = set()
         successful_captures = 1
         completed_web_searches = 0
 
@@ -333,6 +335,7 @@ class ResearcherService:
             await asyncio.to_thread(self._record_assessment, run_id, source.url, assessment)
             if assessment.state is not AgentRunState.SUCCEEDED:
                 return await self._finish_agent_outcome(run_id, source.url, assessment)
+            evidence_gap = assessment.gap
             if assessment.decision is not None:
                 try:
                     decision = ResearchDecision.model_validate(
@@ -346,19 +349,41 @@ class ResearcherService:
                         RunOutcome.INCONCLUSIVE,
                         "Terminal decision failed host schema validation.",
                     )
-                break
-
-            evidence_request = assessment.evidence_request
-            if not isinstance(evidence_request, EvidenceRequest):
+                observed = decision.proposed_fields
+                if evidence_gap and not _needs_followup(evidence_gap, decision, frozen_fields):
+                    evidence_gap = None
+                if (
+                    evidence_gap is None
+                    and len(captures) == 1
+                    and observed is not None
+                    and observed.changed_fields == {EventUpdateField.EVENT_DATE}
+                    and observed.event_date == frozen_event.event_date
+                    and observed.event_date is not None
+                ):
+                    registration = EvidenceGap(
+                        purpose=EvidenceRequestPurpose.REGISTRATION_STATUS,
+                        description="The overview confirms the date. Check the registration page.",
+                    )
+                    if _refresh_link_candidate_urls(
+                        tuple(captures),
+                        request=registration,
+                        event=frozen_event,
+                        approved_source_url=source.url,
+                        captured_final_urls=frozenset(captured_final_urls),
+                    ):
+                        evidence_gap = registration
+                if evidence_gap is None:
+                    break
+            if not isinstance(evidence_gap, EvidenceGap):
                 return await self._finish_without_queue(
                     run_id,
                     source.url,
                     RunState.SKIPPED,
                     RunOutcome.INCONCLUSIVE,
-                    "Assessment returned neither a terminal decision nor a valid evidence request.",
+                    "Assessment returned neither verified facts nor a specific evidence gap.",
                 )
-            normalized_query = _normalize_refresh_query(evidence_request.query)
-            purpose = evidence_request.purpose
+            normalized_gap = " ".join(evidence_gap.description.casefold().split())
+            purpose = evidence_gap.purpose
             if len(completed_purposes) >= MAX_REFRESH_CONTINUATIONS:
                 return await self._finish_without_queue(
                     run_id,
@@ -367,13 +392,13 @@ class ResearcherService:
                     RunOutcome.INCONCLUSIVE,
                     "Refresh continuation budget was exhausted.",
                 )
-            if normalized_query in normalized_queries or purpose in completed_purposes:
+            if normalized_gap in seen_gaps or purpose in completed_purposes:
                 return await self._finish_without_queue(
                     run_id,
                     source.url,
                     RunState.SKIPPED,
                     RunOutcome.INCONCLUSIVE,
-                    "Assessment repeated an already completed evidence query or purpose.",
+                    "Assessment repeated an previous evidence gap or purpose.",
                 )
             capture_limit = min(
                 MAX_REFRESH_CAPTURES,
@@ -388,10 +413,10 @@ class ResearcherService:
                     "Refresh page-capture budget was exhausted.",
             )
 
-            normalized_queries.add(normalized_query)
+            seen_gaps.add(normalized_gap)
             linked_candidate_urls = _refresh_link_candidate_urls(
                 tuple(captures),
-                request=evidence_request,
+                request=evidence_gap,
                 event=frozen_event,
                 approved_source_url=source.url,
                 captured_final_urls=frozenset(captured_final_urls),
@@ -415,7 +440,7 @@ class ResearcherService:
                         query=_targeted_refresh_query(
                             frozen_event,
                             source.url,
-                            evidence_request,
+                            evidence_gap,
                         ),
                         approved_source_url=source.url,
                         context=context,
@@ -551,12 +576,57 @@ class ResearcherService:
             )
 
         changed_fields = _changed_supported_fields(decision, frozen_fields)
+        withheld = None
+        for item in decision.field_support:
+            field = item.field.value
+            if field not in changed_fields or changed_fields[field] is not None:
+                continue
+            reason = None
+            if item.withdrawn_value is not None and item.withdrawn_value != frozen_fields[field]:
+                reason = "withdrawn_value_mismatch"
+            elif item.field is EventUpdateField.EVENT_DATE and not _supports_date_withdrawal(
+                frozen_event, item, tuple(captures)
+            ):
+                reason = "unconfirmed_date_withdrawal"
+            if reason:
+                del changed_fields[field]
+                withheld = reason
+        if withheld:
+            if not changed_fields:
+                return await self._finish_without_queue(
+                    run_id,
+                    source.url,
+                    RunState.SKIPPED,
+                    RunOutcome.INCONCLUSIVE,
+                    "The source did not confirm withdrawal of the stored value.",
+                    validation_reason=withheld,
+                )
+            decision = decision.model_copy(
+                update={
+                    "summary": "The quoted source supports the listed changes. "
+                    "A separate withdrawal could not be confirmed."
+                }
+            )
         if not changed_fields:
+            qualified = _qualified_capture_references(
+                tuple(captures), frozen_event, anchor_url=source.url
+            )
+            observed = decision.proposed_fields
+            confirmed = (
+                not decision.conflicts
+                and observed is not None
+                and any(
+                    set(item.evidence).issubset(qualified)
+                    and getattr(observed, item.field.value) not in {None, "", "unknown"}
+                    and getattr(observed, item.field.value) == frozen_fields[item.field.value]
+                    for item in decision.field_support
+                )
+            )
             return await self._finish_without_queue(
                 run_id,
                 source.url,
-                RunState.SKIPPED,
-                RunOutcome.NO_CHANGE,
+                RunState.SUCCEEDED if confirmed else RunState.SKIPPED,
+                RunOutcome.NO_CHANGE if confirmed else RunOutcome.INCONCLUSIVE,
                 "No supported tracked-event field changed.",
             )
         if _proposes_stale_event_date(changed_fields, frozen_event):
@@ -570,7 +640,7 @@ class ResearcherService:
                 RunOutcome.INCONCLUSIVE,
                 "Proposed event date is older than the stored event date.",
             )
-        prepared_decision = self._validated_refresh_update(
+        prepared_decision, validation_reason = self._validated_refresh_update(
             decision,
             captures=tuple(captures),
             event=frozen_event,
@@ -584,6 +654,7 @@ class ResearcherService:
                 RunState.SKIPPED,
                 RunOutcome.INCONCLUSIVE,
                 "Update decision failed captured support, applicability, or conflict validation.",
+                validation_reason=validation_reason,
             )
         if not self.persist_queue:
             return await self._finish_without_queue(
@@ -757,6 +828,15 @@ class ResearcherService:
                 RunOutcome.INCONCLUSIVE,
                 "Profile locate-search budget was exhausted.",
             )
+        pages_left = self.budget.max_static_pages_per_job - captured.snapshot.pages_attempted
+        if pages_left < 1:
+            return await self._finish_profile(
+                run_id,
+                url,
+                RunState.CAPPED,
+                RunOutcome.INCONCLUSIVE,
+                "Profile page budget was exhausted before locating the official page.",
+            )
         context = _profile_locate_context(url, decision.draft)
         scout = await self.agent.scout(
             ScoutRequest(
@@ -812,10 +892,7 @@ class ResearcherService:
             official = await self._capture_enriched(
                 run_id,
                 official_url,
-                max_linked_pages=max(
-                    0,
-                    self.budget.max_static_pages_per_job - 1 - first_linked_pages,
-                ),
+                max_linked_pages=pages_left - 1,
             )
         except PageFetchError as error:
             return await self._finish_profile(
@@ -1055,11 +1132,7 @@ class ResearcherService:
                 "decision": (
                     result.decision.model_dump(mode="json") if result.decision is not None else None
                 ),
-                "evidence_request": (
-                    result.evidence_request.model_dump(mode="json")
-                    if result.evidence_request is not None
-                    else None
-                ),
+                "gap": result.gap.model_dump(mode="json") if result.gap is not None else None,
                 "error_code": result.error_code,
                 "detail": result.detail,
             },
@@ -1095,20 +1168,20 @@ class ResearcherService:
         event: TrackedEvent,
         changed_fields: dict[str, object],
         anchor_url: str | None = None,
-    ) -> ResearchDecision | None:
+    ) -> tuple[ResearchDecision | None, str | None]:
         retained_support = tuple(
             item for item in decision.field_support if item.field.value in changed_fields
         )
         if set(item.field.value for item in retained_support) != set(changed_fields):
-            return None
+            return None, "missing_field_support"
         cited = set(decision.evidence)
         if not cited or any(
             not set(item.evidence).issubset(cited) for item in retained_support
         ):
-            return None
+            return None, "uncited_support"
         qualified = _qualified_capture_references(captures, event, anchor_url=anchor_url)
         if any(not set(item.evidence).issubset(qualified) for item in retained_support):
-            return None
+            return None, "unqualified_support_capture"
         try:
             return ResearchDecision.model_validate(
                 {
@@ -1116,9 +1189,9 @@ class ResearcherService:
                     "proposed_fields": _normalized_proposed_changes(changed_fields),
                     "field_support": retained_support,
                 }
-            )
+            ), None
         except Exception:
-            return None
+            return None, "normalized_decision_invalid"
 
     def _valid_cited_references(
         self,
@@ -1163,8 +1236,15 @@ class ResearcherService:
         state: RunState,
         outcome: RunOutcome,
         detail: str,
+        *,
+        validation_reason: str | None = None,
     ) -> ResearchJobResult:
-        status = ResearchRunStatus(status=state, outcome=outcome, detail=detail[:1_000])
+        status = ResearchRunStatus(
+            status=state,
+            outcome=outcome,
+            detail=detail[:1_000],
+            validation_reason=validation_reason,
+        )
         terminal = await asyncio.to_thread(
             self.artifacts.finalize_without_queue,
             run_id,
@@ -1241,6 +1321,56 @@ def _draft_matches_capture(draft: EventProfileDraft, snapshot: PageSnapshot) -> 
         draft.official_url,
         snapshot.final_url,
     )
+
+
+def _supports_date_withdrawal(
+    event: TrackedEvent, support: ResolvedFieldEvidenceSupport, captures: tuple[CapturedPage, ...]
+) -> bool:
+    """Only admit an explicit retraction of this exact scheduled race date."""
+    if not event.event_date:
+        return False
+    try:
+        previous = date.fromisoformat(event.event_date)
+    except ValueError:
+        return False
+    month = previous.strftime("%B")
+    day, year = previous.day, previous.year
+    named_date = rf"(?:{previous.isoformat()}|{day} {month} {year}|{month} {day},? {year})"
+    # Conservative admission for destructive edits. Other wording needs manual review.
+    race_date = r"(?:the |our )?(?:previously (?:confirmed |announced )?)?(?:race|event) date"
+    retraction = re.compile(
+        rf"(?:we (?:have )?|the organi[sz]er (?:has )?)"
+        rf"(?:withdrawn|withdrew|retracted) {race_date} (?:of |on )?{named_date}"
+        rf"|{race_date} (?:of |on )?{named_date} (?:has been|is) (?:withdrawn|retracted)",
+        re.IGNORECASE,
+    )
+    # A retraction can also announce a new date. Require an undated current schedule.
+    unscheduled = re.compile(
+        r"no (?:new|replacement) (?:race |event )?date (?:is confirmed|has been (?:set|announced))"
+        r"|(?:the |a )?(?:new|replacement) (?:race |event )?date (?:is|has) yet to be announced",
+        re.IGNORECASE,
+    )
+    for capture in captures:
+        if capture.reference not in support.evidence:
+            continue
+        primary = capture.snapshot.primary_text
+        for heading in (capture.snapshot.title, f"{event.name} {year}", event.name):
+            if heading and primary.startswith(heading + " "):
+                primary = primary[len(heading) :].lstrip()
+                break
+        statements = [
+            sentence.rstrip(".").strip() for sentence in re.split(r"(?<=[.!?])\s+", primary)
+        ]
+        if not unscheduled.fullmatch(statements[-1]):
+            continue
+        if support.quote and statements[-1] not in support.quote:
+            continue
+        for statement in statements[:-1]:
+            if retraction.fullmatch(statement) and (
+                support.quote is None or statement in support.quote
+            ):
+                return True
+    return False
 
 
 def _proposes_stale_event_date(
@@ -1351,24 +1481,48 @@ def _event_context(event: TrackedEvent, approved_source_url: str) -> tuple[Froze
     return tuple(FrozenContextField(name=name, value=str(value)) for name, value in values.items())
 
 
+def _needs_followup(
+    gap: EvidenceGap, decision: ResearchDecision, current_fields: dict[str, object]
+) -> bool:
+    observed = decision.proposed_fields
+    if observed is None or gap.purpose in {
+        EvidenceRequestPurpose.EVENT_IDENTITY,
+        EvidenceRequestPurpose.EVENT_EDITION,
+        EvidenceRequestPurpose.DISTANCE_CATEGORY,
+    }:
+        return True
+
+    changed = _changed_supported_fields(decision, current_fields)
+    if gap.purpose is EvidenceRequestPurpose.CONFLICT_RESOLUTION:
+        # A scoped conflict already passed the schema's disjoint-field check.
+        return not changed or not decision.conflicts
+    if (
+        gap.purpose is EvidenceRequestPurpose.REGISTRATION_URL
+        and observed.registration_status in {"closed", "sold_out"}
+        and "registration_url" not in changed
+    ):
+        return False
+    if gap.purpose is EvidenceRequestPurpose.REGISTRATION_TIMING:
+        return not changed or bool(
+            changed.keys()
+            & {"registration_open_at", "registration_open_precision", "registration_close_at"}
+        )
+    return not changed or gap.purpose.value in changed
+
+
 def _targeted_refresh_query(
     event: TrackedEvent,
     approved_source_url: str,
-    request: EvidenceRequest,
+    request: EvidenceGap,
 ) -> str:
     year = event.event_date[:4] if event.event_date else "current"
     distances = " ".join(event.distances).replace("_", " ")
-    requested_query = " ".join(request.query.split())[:180]
-    gap = " ".join(request.gap.split())[:160]
+    gap = " ".join(request.description.split())[:300]
     query = (
         f'site:{source_domain(approved_source_url)} "{event.name}" {year} {distances} '
-        f"{request.purpose.value} {requested_query} {gap}"
+        f"{request.purpose.value} {gap}"
     )
     return query[:500]
-
-
-def _normalize_refresh_query(query: str) -> str:
-    return " ".join(query.casefold().split())
 
 
 def _refresh_candidate_urls(
@@ -1408,7 +1562,7 @@ def _refresh_candidate_urls(
 def _refresh_link_candidate_urls(
     captures: tuple[CapturedPage, ...],
     *,
-    request: EvidenceRequest,
+    request: EvidenceGap,
     event: TrackedEvent,
     approved_source_url: str,
     captured_final_urls: frozenset[str],
@@ -1628,6 +1782,7 @@ def _field_support_evidence_lines(decision: ResearchDecision) -> tuple[str, ...]
             f"{reference.artifact_name}#{reference.content_hash[:12]}"
             for reference in support.evidence
         )
+        + (f" | {_single_line(support.quote, 500)}" if support.quote else "")
         for support in decision.field_support
     )
 

@@ -1,5 +1,8 @@
+import pytest
+
 from run4221.ingestion.event_identity import (
     conflicts_with_event_identity,
+    matches_distance_url,
     select_registration_url_for_distances,
 )
 
@@ -82,3 +85,40 @@ def test_single_distance_event_still_rejects_other_distance_pages() -> None:
     assert conflicts_with_event_identity(
         "https://race.example/42km", "", ("half_marathon",)
     )
+
+
+@pytest.mark.parametrize(
+    ("url", "text"),
+    (
+        ("https://race.example/marathon/", "Race check-in starts on 21 April 2028."),
+        ("https://race.example/2027/03/21/", "Registration office: rooms 21 and 42."),
+        ("https://race.example/entry?id=42", "Entry opens at 21:00. There are 42 places."),
+        ("https://race.example/entry?ref=21", "The club is 4.21km away."),
+    ),
+)
+def test_numbers_without_a_race_distance_do_not_change_category(url: str, text: str) -> None:
+    for distance in ("marathon", "half_marathon"):
+        assert not conflicts_with_event_identity(url, text, (distance,))
+    assert not matches_distance_url(url, text, ("half_marathon",))
+
+
+@pytest.mark.parametrize(
+    ("url", "text", "distance"),
+    (
+        ("https://race.example/21k/entries", "Registration", "half_marathon"),
+        ("https://race.example/enter", "21,0975 km", "half_marathon"),
+        ("https://race.example/entry?distance=21", "Registration", "half_marathon"),
+        ("https://race.example/distance/21/registration", "Entries", "half_marathon"),
+        ("https://race.example/enter", "42.195 km", "marathon"),
+        ("https://race.example/events/42-km", "Registration", "marathon"),
+        ("https://race.example/enter", "42 km", "marathon"),
+    ),
+)
+def test_numeric_distance_qualifies_only_its_own_category(
+    url: str, text: str, distance: str
+) -> None:
+    other = "marathon" if distance == "half_marathon" else "half_marathon"
+    assert matches_distance_url(url, text, (distance,))
+    assert not matches_distance_url(url, text, (other,))
+    assert conflicts_with_event_identity(url, text, (other,))
+    assert not conflicts_with_event_identity(url, text, (distance,))

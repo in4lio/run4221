@@ -7,7 +7,11 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
+
+import httpx
+import pytest
 
 from run4221.db.repository import (
     EventCreate,
@@ -29,12 +33,14 @@ from run4221.researcher.agent import (
     AgentRunMetadata,
     AgentRunState,
     AssessmentRunResult,
+    ResearchAgentJob,
     ScoutRunResult,
 )
 from run4221.researcher.artifacts import ResearchArtifactStore
 from run4221.researcher.schemas import (
+    ArtifactReference,
     EventProfileDraft,
-    EvidenceRequest,
+    EvidenceGap,
     ResearchBudget,
     ResearchCandidate,
     ResearchDecision,
@@ -44,6 +50,9 @@ from run4221.researcher.service import (
     ResearcherService,
     ResearchJobResult,
 )
+from tests.test_page_snapshot import public_resolver
+from tests.test_researcher_agent import FakeRunner, fake_result, update_applicability
+from tests.test_researcher_evidence_loop import FixtureFetcher
 
 
 def database_url(tmp_path: Path, *, query: str = "") -> str:
@@ -147,11 +156,11 @@ class FakeAgent:
             outcome = outcome(request)
         if isinstance(outcome, AssessmentRunResult):
             return outcome
-        if isinstance(outcome, EvidenceRequest):
+        if isinstance(outcome, EvidenceGap):
             return AssessmentRunResult(
                 state=AgentRunState.SUCCEEDED,
                 metadata=metadata(),
-                evidence_request=outcome,
+                gap=outcome,
             )
         return AssessmentRunResult(
             state=AgentRunState.SUCCEEDED,
@@ -163,10 +172,9 @@ class FakeAgent:
 def refresh_request(
     *,
     purpose: str = "registration_status",
-    query: str = "official standard registration status",
     gap: str = "The captured page does not confirm the current registration status.",
-) -> EvidenceRequest:
-    return EvidenceRequest(action="request_evidence", purpose=purpose, query=query, gap=gap)
+) -> EvidenceGap:
+    return EvidenceGap(purpose=purpose, description=gap)
 
 
 def supported_update(
@@ -279,18 +287,32 @@ def test_default_researcher_fetcher_is_single_page_fetcher() -> None:
     assert default_fetcher is fetch_page_snapshot
 
 
-def test_ae1_refresh_creates_proposal_without_mutating_event(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("status", "announcement"),
+    (
+        ("open", "Standard 42K entries are open."),
+        ("sold_out", "Standard 42K entries are sold out. A separate reserve list is available."),
+        ("waitlist", "The waiting list is the only route for standard 42K entry."),
+    ),
+)
+def test_ae1_refresh_creates_proposal_without_mutating_event(
+    tmp_path: Path, status: str, announcement: str
+) -> None:
     url = database_url(tmp_path)
     source = tracked_source(url)
 
     async def fetch(source_url: str) -> PageSnapshot:
-        return snapshot(source_url)
+        return snapshot(source_url, text=announcement)
 
     result = asyncio.run(
         service(
             tmp_path,
             url=url,
-            agent=FakeAgent(decide=refresh_decision),
+            agent=FakeAgent(
+                decide=lambda request: supported_update(
+                    request, proposed_fields={"registration_status": status}, summary=announcement
+                )
+            ),
             fetch=fetch,
         ).refresh(source)
     )
@@ -301,7 +323,7 @@ def test_ae1_refresh_creates_proposal_without_mutating_event(tmp_path: Path) -> 
     assert find_event(source.event.id, url).registration_status == "unknown"
     updates = list_proposed_event_updates(event_id=source.event.id, database_url=url)
     assert len(updates) == 1
-    assert updates[0].proposed_fields == {"registration_status": "open"}
+    assert updates[0].proposed_fields == {"registration_status": status}
     assert any("researcher-evidence:v1" in line for line in updates[0].evidence)
     assert any("researcher-decision:v1" in line for line in updates[0].evidence)
     assert any("stored approved event source" in line for line in updates[0].evidence)
@@ -420,6 +442,7 @@ def test_refresh_rejects_initial_child_event_as_update_support(tmp_path: Path) -
     result = asyncio.run(service(tmp_path, url=url, agent=agent, fetch=fetch).refresh(source))
 
     assert result.status.outcome == "inconclusive"
+    assert result.status.validation_reason == "unqualified_support_capture"
     assert count_proposed_event_updates(database_url=url) == 0
 
 
@@ -521,47 +544,87 @@ def test_typed_refresh_request_captures_snippet_mismatch_then_proposes_supported
     url = database_url(tmp_path)
     source = tracked_source(url)
     followup_url = "https://baden.example/registration/status"
-    agent = FakeAgent(
-        candidate_batches=(
-            (
-                ResearchCandidate(
-                    source_url=followup_url,
-                    title="Baden Marathon registration",
-                    snippet="Kids & Youth appears only in this untrusted ranking hint.",
-                ),
+    budget = ResearchBudget(max_wall_time_seconds_per_job=10)
+    fetcher = FixtureFetcher(
+        {
+            source.url: "<main><h1>Baden Marathon 2027</h1><p>42.195 km event overview.</p></main>",
+            followup_url: (
+                "<main><h1>Baden Marathon 2027 registration</h1><p>Standard marathon "
+                "registration closes on 2 September 2027. A current entry status has "
+                "not been announced.</p></main>"
             ),
-        ),
-        assessments=(
-            refresh_request(
-                query="current official registration status",
-                gap="The approved source names the event but omits registration status.",
-            ),
-            lambda request: supported_update(
-                request,
-                proposed_fields={"registration_status": "closed"},
-                summary="The captured standard-marathon page confirms registration is closed.",
-                evidence_indexes=(1,),
-            ),
-        ),
+        }
     )
-    fetched_urls: list[str] = []
+    candidate = ResearchCandidate(
+        source_url=followup_url,
+        title="Baden Marathon registration",
+        snippet="Kids & Youth appears only in this untrusted ranking hint.",
+    )
+    update = {
+        "gap": None,
+        "summary": "The standard marathon entry deadline is 2 September 2027.",
+        "applicability": [update_applicability("E2", applicable_fields=["registration_close_at"])],
+        "field_support": [
+            {
+                "field": "registration_close_at",
+                "evidence_keys": ["E2"],
+                "quote": "Standard marathon registration closes on 2 September 2027.",
+            }
+        ],
+        "observed_fields": {"registration_close_at": "2027-09-02"},
+    }
+    store = ResearchArtifactStore(tmp_path / "runs")
 
-    async def fetch(source_url: str) -> PageSnapshot:
-        fetched_urls.append(source_url)
-        return snapshot(
-            source_url,
-            title="Baden Marathon 2027 registration",
-            primary_text="Baden Marathon standard marathon registration is closed.",
+    def replay() -> ResearchJobResult:
+        runner = FakeRunner(
+            fake_result(
+                {
+                    "observed_fields": None,
+                    "field_support": [],
+                    "summary": "No deadline in the overview.",
+                    "gap": {
+                        "purpose": "registration_timing",
+                        "description": "The overview omits the standard entry deadline.",
+                    },
+                }
+            ),
+            fake_result({"candidates": [candidate]}, web_search_calls=1),
+            fake_result(update),
         )
+        worker = ResearcherService(
+            database_url=url,
+            artifacts=store,
+            budget=budget,
+            fetch_snapshot=fetcher,
+            agent=ResearchAgentJob(
+                instructions="Assess the captured pages.",
+                prompt_reference="offline-replay",
+                budget=budget,
+                runner=runner,
+            ),
+        )
+        return asyncio.run(worker.refresh(source))
 
-    result = asyncio.run(service(tmp_path, url=url, agent=agent, fetch=fetch).refresh(source))
-
+    result = replay()
     assert result.status.outcome == "proposal_created"
-    assert fetched_urls == [source.url, followup_url]
-    assert agent.call_order == ["assess", "scout", "assess"]
-    assert len(agent.assessment_calls[1].evidence) == 2
-    update = list_proposed_event_updates(event_id=source.event.id, database_url=url)[0]
-    assert update.proposed_fields == {"registration_status": "closed"}
+    assert [call[0] for call in fetcher.calls] == [source.url, followup_url]
+    terminal = store.read_artifact(result.terminal_reference)["content"]
+    assert terminal["queue_reference"] == result.queue_reference == "proposed_event_update:1"
+    prepared = store.read_artifact(ArtifactReference.model_validate(terminal["prepared_artifact"]))
+    (evidence,) = prepared["content"]["decision"]["evidence"]
+    captured = store.read_artifact(ArtifactReference.model_validate(evidence))["content"]
+    assert captured["final_url"] == followup_url
+    assert "2 September 2027" in captured["primary_text"]
+    assert "Kids & Youth" not in captured["primary_text"]
+
+    duplicate = replay()
+    assert duplicate.status.status == "skipped"
+    updates = list_proposed_event_updates(event_id=source.event.id, database_url=url)
+    assert len(updates) == 1
+    assert duplicate.conflicting_update_id == updates[0].id
+    assert store.read_artifact(duplicate.terminal_reference)["content"]["queue_state"] == "absent"
+    assert updates[0].proposed_fields == {"registration_close_at": "2027-09-02"}
+    assert find_event(source.event.id, url) == source.event
 
 
 def test_refresh_falls_back_to_ranked_captured_links_when_scout_repeats_homepage(
@@ -712,12 +775,10 @@ def test_refresh_allows_two_distinct_successful_continuations_then_stops_third(
             refresh_request(),
             refresh_request(
                 purpose="event_date",
-                query="official 2027 event date",
                 gap="The current event date is not confirmed.",
             ),
             refresh_request(
                 purpose="registration_url",
-                query="official standard registration URL",
                 gap="The registration destination is not confirmed.",
             ),
         ),
@@ -739,23 +800,21 @@ def test_refresh_allows_two_distinct_successful_continuations_then_stops_third(
     assert count_proposed_event_updates(database_url=url) == 0
 
 
-def test_refresh_repeated_query_or_completed_purpose_stops_without_another_scout(
+def test_refresh_repeated_gap_or_completed_purpose_stops_without_another_scout(
     tmp_path: Path,
 ) -> None:
     for suffix, second_request in (
         (
-            "query",
+            "gap",
             refresh_request(
                 purpose="event_date",
-                query="  OFFICIAL standard registration STATUS  ",
-                gap="A different gap repeats the same query.",
+                gap="  THE captured page does not confirm the current registration status.  ",
             ),
         ),
         (
             "purpose",
             refresh_request(
                 purpose="registration_status",
-                query="a different registration status query",
                 gap="The same purpose was already completed.",
             ),
         ),
@@ -808,7 +867,6 @@ def test_refresh_duplicate_final_url_stops_without_fresh_assessment(tmp_path: Pa
             refresh_request(),
             refresh_request(
                 purpose="event_date",
-                query="official 2027 event date",
                 gap="The event date is not confirmed.",
             ),
         ),
@@ -1535,6 +1593,167 @@ def test_refresh_request_respects_search_and_page_caps_without_queue(tmp_path: P
         assert count_proposed_event_updates(database_url=url) == 0
 
 
+@pytest.mark.parametrize(
+    ("notice", "admitted"),
+    [
+        ("The usual race is paused. A separate replacement takes place next spring.", False),
+        ("We have withdrawn the race date of 19 September 2027. No new date has been set.", True),
+        (
+            "Baden Marathon 2027 We have withdrawn the race date of 19 September 2027. "
+            "No new race date has been set.",
+            True,
+        ),
+        (
+            "We have withdrawn the race date of 19 September 2027. "
+            "The race is now on 26 September.",
+            False,
+        ),
+        (
+            "We have withdrawn the race date of 19 September 2027. No new date has been set. "
+            "Update: the date is now reinstated.",
+            False,
+        ),
+        ("We have withdrawn the race date of 18 September 2027. No new date has been set.", False),
+        (
+            "We have not withdrawn the race date of 19 September 2027. No new date has been set.",
+            False,
+        ),
+        (
+            "If necessary, we have withdrawn the race date of 19 September 2027. "
+            "No new date has been set.",
+            False,
+        ),
+    ],
+)
+def test_date_clear_needs_a_retraction_of_the_stored_date(tmp_path, notice, admitted):
+    db = database_url(tmp_path)
+    source = tracked_source(db)
+
+    async def fetch(url):
+        return snapshot(url, text=notice, primary_text=notice, title="Official race information")
+
+    agent = FakeAgent(
+        decide=lambda request: supported_update(
+            request, proposed_fields={"clear_fields": ["event_date"]}
+        )
+    )
+    result = asyncio.run(service(tmp_path, url=db, agent=agent, fetch=fetch).refresh(source))
+    queue = list_proposed_event_updates(database_url=db)
+    assert [row.proposed_fields for row in queue] == ([{"event_date": None}] if admitted else [])
+    assert result.status.validation_reason == (None if admitted else "unconfirmed_date_withdrawal")
+    assert find_event(source.event.id, db) == source.event
+
+
+@pytest.mark.parametrize("reported_gap", [False, True])
+def test_unchanged_race_date_leads_to_linked_registration_notice(tmp_path, reported_gap):
+    db = database_url(tmp_path)
+    source = tracked_source(db)
+    registration = "https://baden.example/registration"
+    seen = []
+
+    async def fetch(url):
+        seen.append(url)
+        if url == source.url:
+            return snapshot(url, links=(PageLink(url=registration, text="Marathon registration"),))
+        return snapshot(url, text="Standard entries are sold out.")
+
+    def unchanged(request):
+        fact = supported_update(request, proposed_fields={"event_date": "2027-09-19"})
+        return AssessmentRunResult(
+            state=AgentRunState.SUCCEEDED,
+            metadata=metadata(),
+            decision=fact,
+            gap=refresh_request() if reported_gap else None,
+        )
+
+    agent = FakeAgent(
+        assessments=(
+            unchanged,
+            lambda request: supported_update(
+                request, proposed_fields={"registration_status": "sold_out"}, evidence_indexes=(1,)
+            ),
+        )
+    )
+    result = asyncio.run(service(tmp_path, url=db, agent=agent, fetch=fetch).refresh(source))
+    assert seen == [source.url, registration] and not agent.scout_calls
+    assert result.status.outcome == "proposal_created"
+    assert list_proposed_event_updates(database_url=db)[0].proposed_fields == {
+        "registration_status": "sold_out"
+    }
+
+
+@pytest.mark.parametrize(
+    ("purpose", "expected"),
+    [
+        ("registration_url", "proposal_created"),
+        ("registration_status", "inconclusive"),
+        ("event_identity", "inconclusive"),
+        ("event_edition", "inconclusive"),
+        ("distance_category", "inconclusive"),
+        ("conflict_resolution", "inconclusive"),
+    ],
+)
+def test_host_routes_observation_and_gap_with_one_capture(tmp_path, purpose, expected):
+    db = database_url(tmp_path)
+    source = tracked_source(db)
+
+    def assess(request):
+        return AssessmentRunResult(
+            state=AgentRunState.SUCCEEDED,
+            metadata=metadata(),
+            decision=supported_update(request, proposed_fields={"registration_status": "sold_out"}),
+            gap=EvidenceGap(purpose=purpose, description="An independently reported gap."),
+        )
+
+    async def fetch(url):
+        return snapshot(url, text="Standard entries are sold out.")
+
+    agent = FakeAgent(decide=assess)
+    result = asyncio.run(
+        service(
+            tmp_path,
+            url=db,
+            agent=agent,
+            fetch=fetch,
+            budget=ResearchBudget(max_static_pages_per_job=1),
+        ).refresh(source)
+    )
+    assert result.status.outcome == expected
+    assert not agent.scout_calls
+    assert [row.proposed_fields for row in list_proposed_event_updates(database_url=db)] == (
+        [{"registration_status": "sold_out"}] if expected == "proposal_created" else []
+    )
+    assert find_event(source.event.id, db) == source.event
+
+
+def test_mismatched_withdrawal_keeps_independent_supported_status(tmp_path):
+    db = database_url(tmp_path)
+    source = tracked_source(db)
+
+    def decide(request):
+        observed = supported_update(
+            request, proposed_fields={"clear_fields": ["event_date"], "registration_status": "open"}
+        )
+        support = tuple(
+            item.model_copy(update={"withdrawn_value": "2027-09-01"})
+            if item.field.value == "event_date"
+            else item
+            for item in observed.field_support
+        )
+        return observed.model_copy(update={"field_support": support})
+
+    async def fetch(url):
+        return snapshot(url)
+
+    result = asyncio.run(
+        service(tmp_path, url=db, agent=FakeAgent(decide=decide), fetch=fetch).refresh(source)
+    )
+    assert result.status.outcome == "proposal_created"
+    assert list_proposed_event_updates(database_url=db)[0].proposed_fields == {
+        "registration_status": "open"
+    }
+
+
 def test_thin_high_confidence_no_change_is_inconclusive(tmp_path: Path) -> None:
     url = database_url(tmp_path)
     source = tracked_source(url)
@@ -2105,52 +2324,112 @@ def test_profile_enrichment_sub_fetches_stay_inside_static_page_budget(
     assert enriched_calls == [(OFFICIAL_URL, 1)]
 
 
+@pytest.mark.parametrize("exhaust_first_capture", (False, True))
 def test_profile_non_event_page_locates_official_page_with_one_search(
     tmp_path: Path,
+    exhaust_first_capture: bool,
 ) -> None:
     url = database_url(tmp_path)
-    agent = FakeAgent(
-        candidates=(
-            ResearchCandidate(
-                source_url=OFFICIAL_URL,
-                title="Baden Marathon",
-                snippet="Official event page.",
-            ),
-        ),
-        assessments=(
-            lambda request: profile_decision(request, page_is_event=False),
-            lambda request: profile_decision(request),
-        ),
+    approved = add_event(event_payload(), database_url=url)
+    budget = ResearchBudget(max_static_pages_per_job=2)
+    # Replay a third-party article, the official race page and a failing optional capture.
+    article = (
+        "<main><p>Baden Marathon 2027 in Karlsruhe, Germany. Standard marathon, "
+        f"19 September 2027. Official site: <a href='{OFFICIAL_URL}'>Official site</a>.</p>"
     )
-    enriched_calls: list[tuple[str, int]] = []
+    if exhaust_first_capture:
+        article += "<a href='/entry'>Entry information</a>"
+    pages = {
+        PROFILE_URL: article + "</main>",
+        OFFICIAL_URL: (
+            "<main><h1>Baden Marathon 2027</h1><p>Marathon in Karlsruhe, Germany on "
+            "19 September 2027.</p><a href='/registration'>Registration</a></main>"
+        ),
+    }
+    requested = []
 
-    async def fetch(source_url: str) -> PageSnapshot:
-        return snapshot(source_url, title="Baden Marathon 2027")
+    def handle(request: httpx.Request) -> httpx.Response:
+        origin_url = f"https://{request.headers['host']}{request.url.path}"
+        requested.append(origin_url)
+        if origin_url == "https://news.example/entry":
+            raise httpx.ReadTimeout("Replay: optional page timed out.", request=request)
+        return httpx.Response(200, text=pages[origin_url], request=request)
 
-    result = asyncio.run(
-        profile_service(
-            tmp_path,
-            url=url,
-            agent=agent,
-            fetch=fetch,
-            enriched_calls=enriched_calls,
-        ).profile(PROFILE_URL)
+    def profile_output(source_url: str, *, official: bool):
+        draft = profile_draft_payload(source_url)
+        if not official:
+            draft.update(registration_url=None, registration_url_candidates=())
+        return fake_result(
+            {
+                "action": "profile_event",
+                "summary": "Baden Marathon in Karlsruhe, Germany.",
+                "draft": draft,
+                "page_is_event": official,
+            }
+        )
+
+    runner = FakeRunner(
+        profile_output(PROFILE_URL, official=False),
+        fake_result(
+            {
+                "candidates": [
+                    {
+                        "source_url": OFFICIAL_URL,
+                        "title": "Baden Marathon",
+                        "snippet": "Official event page.",
+                    }
+                ]
+            },
+            web_search_calls=1,
+        ),
+        profile_output(OFFICIAL_URL, official=True),
     )
+    store = ResearchArtifactStore(tmp_path / "runs")
 
-    assert result.status.outcome == "profile_completed"
-    # The locate hop is typed provenance for the caller to surface.
-    assert result.located is True
-    assert isinstance(result.draft, EventProfileDraft)
-    assert [call_url for call_url, _ in enriched_calls] == [PROFILE_URL, OFFICIAL_URL]
-    assert len(agent.scout_calls) == 1
-    assert agent.scout_calls[0].mode == "profile"
-    assert agent.scout_calls[0].approved_source_url is None
-    assert "Baden Marathon" in agent.scout_calls[0].query
-    assert len(agent.assessment_calls) == 2
-    # Only the first assessment reserves budget for the potential locate hop.
-    assert agent.assessment_calls[0].reserve_continuation is True
-    assert agent.assessment_calls[1].reserve_continuation is False
-    assert agent.assessment_calls[1].evidence[0].final_url == OFFICIAL_URL
+    async def replay():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+            worker = ResearcherService(
+                database_url=url,
+                artifacts=store,
+                budget=budget,
+                agent=ResearchAgentJob(
+                    instructions="Assess the captured pages.",
+                    prompt_reference="offline-replay",
+                    budget=budget,
+                    runner=runner,
+                ),
+                fetch_enriched_snapshot=partial(
+                    fetch_enriched_page_snapshot, client=client, resolve_host=public_resolver
+                ),
+            )
+            return await worker.profile(PROFILE_URL)
+
+    result = asyncio.run(replay())
+    assert store.read_artifact(result.terminal_reference)["content"]["queue_reference"] is None
+    assert count_event_suggestions(database_url=url) == 0
+    assert count_proposed_event_updates(database_url=url) == 0
+    assert find_event(approved.id, url) == approved
+    if exhaust_first_capture:
+        assert result.status.status == "capped"
+        assert result.status.outcome == "inconclusive"
+        assert result.draft is None
+        assert requested == [PROFILE_URL, "https://news.example/entry"]
+        assert len(runner.calls) == 1
+        return
+    assert requested == [PROFILE_URL, OFFICIAL_URL]
+    assert result.status.outcome == "profile_completed" and result.located
+    assert result.draft.source_url == OFFICIAL_URL
+    first, scout, second = runner.calls
+    scout_input = json.loads(scout["input"].split("\n", 1)[1])
+    assert scout_input["mode"] == "profile" and scout_input["approved_source_url"] is None
+    assert "Baden Marathon" in scout_input["query"]
+    first_token_limit = first["starting_agent"].model_settings.max_tokens
+    assert first_token_limit < second["starting_agent"].model_settings.max_tokens
+    captures = [
+        json.loads(path.read_text())["content"]
+        for path in (tmp_path / "runs" / result.run_id).glob("page_snapshot-*.json")
+    ]
+    assert {p["final_url"] for p in captures} == {PROFILE_URL, OFFICIAL_URL}
 
 
 def test_profile_locate_runs_at_most_once_then_terminates_inconclusive(
@@ -2352,7 +2631,7 @@ def test_profile_locate_capture_shares_the_static_page_budget(tmp_path: Path) ->
     assert result.status.outcome == "profile_completed"
     # The locate capture only gets the linked-page allowance the first
     # enriched capture left unspent.
-    assert enriched_calls == [(PROFILE_URL, 2), (OFFICIAL_URL, 0)]
+    assert enriched_calls == [(PROFILE_URL, 2), (OFFICIAL_URL, 1)]
 
 
 def test_profile_locate_accepts_candidate_linked_from_first_capture(tmp_path: Path) -> None:
