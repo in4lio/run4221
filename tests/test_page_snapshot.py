@@ -422,7 +422,10 @@ def test_store_page_snapshot_writes_json(tmp_path) -> None:
     assert payload["chrome_text"] == ""
 
 
-def test_fetch_enriched_page_snapshot_fetches_same_domain_registration_page() -> None:
+@pytest.mark.parametrize("max_linked_pages", [0, 1])
+def test_fetch_enriched_page_snapshot_fetches_same_domain_registration_page(
+    max_linked_pages: int,
+) -> None:
     seen_urls: list[str] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -462,11 +465,17 @@ def test_fetch_enriched_page_snapshot_fetches_same_domain_registration_page() ->
                 "https://example.com/",
                 client=client,
                 resolve_host=public_resolver,
+                max_linked_pages=max_linked_pages,
             )
 
     snapshot = run(fetch())
 
+    if max_linked_pages == 0:
+        assert seen_urls == ["https://example.com/"]
+        assert snapshot.pages_attempted == 1
+        return
     assert seen_urls == ["https://example.com/", "https://example.com/anmeldung"]
+    assert snapshot.pages_attempted == 2
     assert "Linked page: https://example.com/anmeldung." in snapshot.normalized_text
     assert "Registration opens on 2026-05-31." in snapshot.normalized_text
     assert any(link.url == "https://example.com/payment" for link in snapshot.links)
@@ -746,5 +755,6 @@ def test_fetch_enriched_page_snapshot_drops_linked_page_redirecting_off_origin()
     snapshot = run(fetch())
 
     assert "evil.example" not in seen_hosts
+    assert snapshot.pages_attempted == 2
     assert "Third-party capture" not in snapshot.normalized_text
     assert "Badenmarathon" in snapshot.normalized_text

@@ -29,7 +29,7 @@ from run4221.researcher.agent import (
 )
 from run4221.researcher.artifacts import ResearchArtifactStore
 from run4221.researcher.schemas import (
-    EvidenceRequest,
+    EvidenceGap,
     ResearchBudget,
     ResearchCandidate,
     ResearchDecision,
@@ -81,7 +81,7 @@ class FixtureFetcher:
 class CorpusAgent:
     def __init__(
         self,
-        assess: Callable[[AssessmentRequest], ResearchDecision | EvidenceRequest],
+        assess: Callable[[AssessmentRequest], ResearchDecision | EvidenceGap],
         *,
         scout_batches: tuple[tuple[ResearchCandidate, ...], ...] = (),
     ) -> None:
@@ -94,11 +94,11 @@ class CorpusAgent:
     async def assess(self, request: AssessmentRequest) -> AssessmentRunResult:
         self.assessment_requests.append(request)
         outcome = self.assess_fn(request)
-        if isinstance(outcome, EvidenceRequest):
+        if isinstance(outcome, EvidenceGap):
             return AssessmentRunResult(
                 AgentRunState.SUCCEEDED,
                 _metadata(),
-                evidence_request=outcome,
+                gap=outcome,
             )
         self.decisions.append(outcome)
         return AssessmentRunResult(
@@ -442,12 +442,10 @@ def test_baden_overview_requests_distance_specific_evidence(tmp_path: Path) -> N
     source_url = "https://baden.example/2027/overview"
     candidate_url = "https://baden.example/2027/registration"
 
-    def request_evidence(_request: AssessmentRequest) -> EvidenceRequest:
-        return EvidenceRequest(
-            action="request_evidence",
+    def request_evidence(_request: AssessmentRequest) -> EvidenceGap:
+        return EvidenceGap(
             purpose="registration_status",
-            query="full marathon standard registration status",
-            gap="The multi-distance overview has no current standard marathon status.",
+            description="The multi-distance overview has no current standard marathon status.",
         )
 
     candidate = ResearchCandidate(
@@ -486,13 +484,11 @@ def test_istanbul_conflict_is_explicit_and_order_independent(
     source_url = f"https://istanbul.example/{first}/2026/marathon"
     candidate_url = f"https://istanbul.example/{second}/2026/marathon"
 
-    def assess(request: AssessmentRequest) -> ResearchDecision | EvidenceRequest:
+    def assess(request: AssessmentRequest) -> ResearchDecision | EvidenceGap:
         if len(request.evidence) == 1:
-            return EvidenceRequest(
-                action="request_evidence",
+            return EvidenceGap(
                 purpose="conflict_resolution",
-                query="official 42K status other language",
-                gap="A second official-language page is needed.",
+                description="A second official-language page is needed.",
             )
         references = tuple(item.reference for item in request.evidence)
         return ResearchDecision.model_validate(
