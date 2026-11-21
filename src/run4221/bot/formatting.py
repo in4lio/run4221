@@ -205,13 +205,18 @@ def format_researcher_source_check(
         optional_fields.append(("Trust", provenance.trust_reason, 200, "text"))
     support_fields: list[tuple[str, object, int, str]] = []
     if provenance.field_support:
-        # The stored evidence keeps the full "field <- artifact#hash" refs;
-        # the moderator card shows only the field names.
         supported = ", ".join(
             entry.split(" <- ", 1)[0].strip() or entry.strip()
             for entry in provenance.field_support
         )
         support_fields.append(("Supported fields", supported, 300, "text"))
+        quotes = []
+        for entry in provenance.field_support:
+            field, _, references = entry.partition(" <- ")
+            _, _, quote = references.partition(" | ")
+            if quote:
+                quotes.append((f"{field} quote", quote, 300, "text"))
+        optional_fields = [*quotes, *optional_fields]
     critical_fields = [
         ("Run ID", provenance.run_id, 160, "id"),
         *support_fields,

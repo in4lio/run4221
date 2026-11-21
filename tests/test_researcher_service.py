@@ -562,11 +562,17 @@ def test_typed_refresh_request_captures_snippet_mismatch_then_proposes_supported
         snippet="Kids & Youth appears only in this untrusted ranking hint.",
     )
     update = {
-        "action": "propose_update",
+        "action": "observe_fields",
         "summary": "The standard marathon entry deadline is 2 September 2027.",
         "applicability": [update_applicability("E2", applicable_fields=["registration_close_at"])],
-        "field_support": [{"field": "registration_close_at", "evidence_keys": ["E2"]}],
-        "proposed_fields": {"registration_close_at": "2027-09-02"},
+        "field_support": [
+            {
+                "field": "registration_close_at",
+                "evidence_keys": ["E2"],
+                "quote": "Standard marathon registration closes on 2 September 2027.",
+            }
+        ],
+        "observed_fields": {"registration_close_at": "2027-09-02"},
     }
     store = ResearchArtifactStore(tmp_path / "runs")
 
@@ -1593,10 +1599,32 @@ def test_refresh_request_respects_search_and_page_caps_without_queue(tmp_path: P
     ("notice", "admitted"),
     [
         ("The usual race is paused. A separate replacement takes place next spring.", False),
-        ("We have withdrawn the race date of 19 September 2027.", True),
-        ("We have withdrawn the race date of 18 September 2027.", False),
-        ("We have not withdrawn the race date of 19 September 2027.", False),
-        ("If necessary, we have withdrawn the race date of 19 September 2027.", False),
+        ("We have withdrawn the race date of 19 September 2027. No new date has been set.", True),
+        (
+            "Baden Marathon 2027 We have withdrawn the race date of 19 September 2027. "
+            "No new race date has been set.",
+            True,
+        ),
+        (
+            "We have withdrawn the race date of 19 September 2027. "
+            "The race is now on 26 September.",
+            False,
+        ),
+        (
+            "We have withdrawn the race date of 19 September 2027. No new date has been set. "
+            "Update: the date is now reinstated.",
+            False,
+        ),
+        ("We have withdrawn the race date of 18 September 2027. No new date has been set.", False),
+        (
+            "We have not withdrawn the race date of 19 September 2027. No new date has been set.",
+            False,
+        ),
+        (
+            "If necessary, we have withdrawn the race date of 19 September 2027. "
+            "No new date has been set.",
+            False,
+        ),
     ],
 )
 def test_date_clear_needs_a_retraction_of_the_stored_date(tmp_path, notice, admitted):
@@ -1604,16 +1632,74 @@ def test_date_clear_needs_a_retraction_of_the_stored_date(tmp_path, notice, admi
     source = tracked_source(db)
 
     async def fetch(url):
-        return snapshot(url, text=notice, primary_text=notice)
+        return snapshot(url, text=notice, primary_text=notice, title="Official race information")
 
-    agent = FakeAgent(decide=lambda request: supported_update(
-        request, proposed_fields={"clear_fields": ["event_date"]}
-    ))
+    agent = FakeAgent(
+        decide=lambda request: supported_update(
+            request, proposed_fields={"clear_fields": ["event_date"]}
+        )
+    )
     result = asyncio.run(service(tmp_path, url=db, agent=agent, fetch=fetch).refresh(source))
     queue = list_proposed_event_updates(database_url=db)
     assert [row.proposed_fields for row in queue] == ([{"event_date": None}] if admitted else [])
     assert result.status.validation_reason == (None if admitted else "unconfirmed_date_withdrawal")
     assert find_event(source.event.id, db) == source.event
+
+
+def test_unchanged_race_date_leads_to_linked_registration_notice(tmp_path):
+    db = database_url(tmp_path)
+    source = tracked_source(db)
+    registration = "https://baden.example/registration"
+    seen = []
+
+    async def fetch(url):
+        seen.append(url)
+        if url == source.url:
+            return snapshot(url, links=(PageLink(url=registration, text="Marathon registration"),))
+        return snapshot(url, text="Standard entries are sold out.")
+
+    agent = FakeAgent(
+        assessments=(
+            lambda request: supported_update(request, proposed_fields={"event_date": "2027-09-19"}),
+            lambda request: supported_update(
+                request, proposed_fields={"registration_status": "sold_out"}, evidence_indexes=(1,)
+            ),
+        )
+    )
+    result = asyncio.run(service(tmp_path, url=db, agent=agent, fetch=fetch).refresh(source))
+    assert seen == [source.url, registration] and not agent.scout_calls
+    assert result.status.outcome == "proposal_created"
+    assert list_proposed_event_updates(database_url=db)[0].proposed_fields == {
+        "registration_status": "sold_out"
+    }
+
+
+def test_mismatched_withdrawal_keeps_independent_supported_status(tmp_path):
+    db = database_url(tmp_path)
+    source = tracked_source(db)
+
+    def decide(request):
+        observed = supported_update(
+            request, proposed_fields={"clear_fields": ["event_date"], "registration_status": "open"}
+        )
+        support = tuple(
+            item.model_copy(update={"withdrawn_value": "2027-09-01"})
+            if item.field.value == "event_date"
+            else item
+            for item in observed.field_support
+        )
+        return observed.model_copy(update={"field_support": support})
+
+    async def fetch(url):
+        return snapshot(url)
+
+    result = asyncio.run(
+        service(tmp_path, url=db, agent=FakeAgent(decide=decide), fetch=fetch).refresh(source)
+    )
+    assert result.status.outcome == "proposal_created"
+    assert list_proposed_event_updates(database_url=db)[0].proposed_fields == {
+        "registration_status": "open"
+    }
 
 
 def test_thin_high_confidence_no_change_is_inconclusive(tmp_path: Path) -> None:

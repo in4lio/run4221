@@ -348,9 +348,33 @@ class ResearcherService:
                         RunOutcome.INCONCLUSIVE,
                         "Terminal decision failed host schema validation.",
                     )
-                break
-
-            evidence_request = assessment.evidence_request
+                evidence_request = None
+                observed = decision.proposed_fields
+                if (
+                    len(captures) == 1
+                    and observed is not None
+                    and observed.changed_fields == {EventUpdateField.EVENT_DATE}
+                    and observed.event_date == frozen_event.event_date
+                    and observed.event_date is not None
+                ):
+                    registration = EvidenceRequest(
+                        action="request_evidence",
+                        purpose=EvidenceRequestPurpose.REGISTRATION_STATUS,
+                        query="standard marathon registration",
+                        gap="The overview confirms the race date. Check its registration page.",
+                    )
+                    if _refresh_link_candidate_urls(
+                        tuple(captures),
+                        request=registration,
+                        event=frozen_event,
+                        approved_source_url=source.url,
+                        captured_final_urls=frozenset(captured_final_urls),
+                    ):
+                        evidence_request = registration
+                if evidence_request is None:
+                    break
+            else:
+                evidence_request = assessment.evidence_request
             if not isinstance(evidence_request, EvidenceRequest):
                 return await self._finish_without_queue(
                     run_id,
@@ -553,12 +577,57 @@ class ResearcherService:
             )
 
         changed_fields = _changed_supported_fields(decision, frozen_fields)
+        withheld = None
+        for item in decision.field_support:
+            field = item.field.value
+            if field not in changed_fields or changed_fields[field] is not None:
+                continue
+            reason = None
+            if item.withdrawn_value is not None and item.withdrawn_value != frozen_fields[field]:
+                reason = "withdrawn_value_mismatch"
+            elif item.field is EventUpdateField.EVENT_DATE and not _supports_date_withdrawal(
+                frozen_event, item, tuple(captures)
+            ):
+                reason = "unconfirmed_date_withdrawal"
+            if reason:
+                del changed_fields[field]
+                withheld = reason
+        if withheld:
+            if not changed_fields:
+                return await self._finish_without_queue(
+                    run_id,
+                    source.url,
+                    RunState.SKIPPED,
+                    RunOutcome.INCONCLUSIVE,
+                    "The source did not confirm withdrawal of the stored value.",
+                    validation_reason=withheld,
+                )
+            decision = decision.model_copy(
+                update={
+                    "summary": "The quoted source supports the listed changes. "
+                    "A separate withdrawal could not be confirmed."
+                }
+            )
         if not changed_fields:
+            qualified = _qualified_capture_references(
+                tuple(captures), frozen_event, anchor_url=source.url
+            )
+            observed = decision.proposed_fields
+            confirmed = (
+                not decision.conflicts
+                and observed is not None
+                and any(
+                    set(item.evidence).issubset(qualified)
+                    and getattr(observed, item.field.value) not in {None, "", "unknown"}
+                    and getattr(observed, item.field.value) == frozen_fields[item.field.value]
+                    for item in decision.field_support
+                )
+            )
             return await self._finish_without_queue(
                 run_id,
                 source.url,
-                RunState.SKIPPED,
-                RunOutcome.NO_CHANGE,
+                RunState.SUCCEEDED if confirmed else RunState.SKIPPED,
+                RunOutcome.NO_CHANGE if confirmed else RunOutcome.INCONCLUSIVE,
                 "No supported tracked-event field changed.",
             )
         if _proposes_stale_event_date(changed_fields, frozen_event):
@@ -1118,12 +1187,6 @@ class ResearcherService:
         qualified = _qualified_capture_references(captures, event, anchor_url=anchor_url)
         if any(not set(item.evidence).issubset(qualified) for item in retained_support):
             return None, "unqualified_support_capture"
-        if "event_date" in changed_fields and changed_fields["event_date"] is None:
-            support = next(
-                item for item in retained_support if item.field is EventUpdateField.EVENT_DATE
-            )
-            if not _supports_date_withdrawal(event.event_date, support, captures):
-                return None, "unconfirmed_date_withdrawal"
         try:
             return ResearchDecision.model_validate(
                 {
@@ -1266,13 +1329,13 @@ def _draft_matches_capture(draft: EventProfileDraft, snapshot: PageSnapshot) -> 
 
 
 def _supports_date_withdrawal(
-    stored: str | None, support: ResolvedFieldEvidenceSupport, captures: tuple[CapturedPage, ...]
+    event: TrackedEvent, support: ResolvedFieldEvidenceSupport, captures: tuple[CapturedPage, ...]
 ) -> bool:
     """Only admit an explicit retraction of this exact scheduled race date."""
-    if not stored:
+    if not event.event_date:
         return False
     try:
-        previous = date.fromisoformat(stored)
+        previous = date.fromisoformat(event.event_date)
     except ValueError:
         return False
     month = previous.strftime("%B")
@@ -1286,14 +1349,30 @@ def _supports_date_withdrawal(
         rf"|{race_date} (?:of |on )?{named_date} (?:has been|is) (?:withdrawn|retracted)",
         re.IGNORECASE,
     )
+    # A retraction can also announce a new date. Require an undated current schedule.
+    unscheduled = re.compile(
+        r"no (?:new|replacement) (?:race |event )?date (?:is confirmed|has been (?:set|announced))"
+        r"|(?:the |a )?(?:new|replacement) (?:race |event )?date (?:is|has) yet to be announced",
+        re.IGNORECASE,
+    )
     for capture in captures:
         if capture.reference not in support.evidence:
             continue
         primary = capture.snapshot.primary_text
-        for sentence in re.split(r"(?<=[.!?])\s+", primary):
-            statement = sentence.rstrip(".").strip()
+        for heading in (capture.snapshot.title, f"{event.name} {year}", event.name):
+            if heading and primary.startswith(heading + " "):
+                primary = primary[len(heading) :].lstrip()
+                break
+        statements = [
+            sentence.rstrip(".").strip() for sentence in re.split(r"(?<=[.!?])\s+", primary)
+        ]
+        if not unscheduled.fullmatch(statements[-1]):
+            continue
+        if support.quote and statements[-1] not in support.quote:
+            continue
+        for statement in statements[:-1]:
             if retraction.fullmatch(statement) and (
-                support.quote is None or statement.casefold() in support.quote.casefold()
+                support.quote is None or statement in support.quote
             ):
                 return True
     return False
@@ -1684,6 +1763,7 @@ def _field_support_evidence_lines(decision: ResearchDecision) -> tuple[str, ...]
             f"{reference.artifact_name}#{reference.content_hash[:12]}"
             for reference in support.evidence
         )
+        + (f" | {_single_line(support.quote, 500)}" if support.quote else "")
         for support in decision.field_support
     )
 

@@ -218,6 +218,8 @@ class EvidenceApplicability(ResearchSchema):
 
 
 class FieldEvidenceSupport(ResearchSchema):
+    quote: EvidenceText
+    withdrawn_value: EvidenceText | None = None
     field: EventUpdateField
     evidence_keys: Annotated[
         tuple[EvidenceKey, ...],
@@ -266,17 +268,13 @@ class AssessorTerminalDecision(ResearchSchema):
         return self
 
 
-class AssessorNoPayloadDecision(AssessorTerminalDecision):
-    action: Literal[DecisionAction.NO_CHANGE, DecisionAction.INCONCLUSIVE]
-
-
-class AssessorInconclusiveDecision(AssessorNoPayloadDecision):
+class AssessorInconclusiveDecision(AssessorTerminalDecision):
     action: Literal[DecisionAction.INCONCLUSIVE]
 
 
-class AssessorUpdateDecision(AssessorTerminalDecision):
-    action: Literal[DecisionAction.PROPOSE_UPDATE]
-    proposed_fields: ProposedEventChanges
+class AssessorObservedFields(AssessorTerminalDecision):
+    action: Literal["observe_fields"]
+    observed_fields: ProposedEventChanges
     applicability: Annotated[
         tuple[EvidenceApplicability, ...],
         Field(min_length=1, max_length=8),
@@ -291,11 +289,21 @@ class AssessorUpdateDecision(AssessorTerminalDecision):
         support_fields = [item.field for item in self.field_support]
         if len(set(support_fields)) != len(support_fields):
             raise ValueError("Each proposed field must have exactly one support item.")
-        if set(support_fields) != set(self.proposed_fields.changed_fields):
+        if set(support_fields) != set(self.observed_fields.changed_fields):
             raise ValueError("field_support must exactly match the proposed fields.")
 
         applicability = {item.evidence_key: item for item in self.applicability}
         for support in self.field_support:
+            if (support.field.value in self.observed_fields.clear_fields) != (
+                support.withdrawn_value is not None
+            ):
+                raise ValueError("Supply the withdrawn value exactly for cleared fields.")
+            if (
+                support.field is EventUpdateField.REGISTRATION_URL
+                and support.withdrawn_value is not None
+                and support.withdrawn_value not in support.quote
+            ):
+                raise ValueError("Quote the withdrawn registration URL.")
             for evidence_key in support.evidence_keys:
                 item = applicability.get(evidence_key)
                 if item is None:
@@ -312,7 +320,7 @@ class AssessorUpdateDecision(AssessorTerminalDecision):
                         "distance/category, and field applicability.",
                     )
 
-        changed_fields = self.proposed_fields.changed_fields
+        changed_fields = self.observed_fields.changed_fields
         if any(
             conflict.field is None or conflict.field in changed_fields
             for conflict in self.conflicts
@@ -338,12 +346,15 @@ class EvidenceRequest(ResearchSchema):
 
 
 AssessorDecision = Annotated[
-    AssessorNoPayloadDecision | AssessorUpdateDecision | AssessorProfileDecision,
+    AssessorInconclusiveDecision | AssessorObservedFields | AssessorProfileDecision,
     Field(discriminator="action"),
 ]
 
 AssessorOutcome = Annotated[
-    AssessorNoPayloadDecision | AssessorUpdateDecision | AssessorProfileDecision | EvidenceRequest,
+    AssessorInconclusiveDecision
+    | AssessorObservedFields
+    | AssessorProfileDecision
+    | EvidenceRequest,
     Field(discriminator="action"),
 ]
 
@@ -352,7 +363,7 @@ ProfileAssessmentOutcome = Annotated[
 ]
 
 RefreshAssessmentOutcome = Annotated[
-    AssessorUpdateDecision | AssessorNoPayloadDecision | EvidenceRequest,
+    AssessorObservedFields | AssessorInconclusiveDecision | EvidenceRequest,
     Field(discriminator="action"),
 ]
 
@@ -375,6 +386,9 @@ class ResolvedEvidenceApplicability(ResearchSchema):
 
 
 class ResolvedFieldEvidenceSupport(ResearchSchema):
+    withdrawn_value: EvidenceText | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     quote: EvidenceText | None = Field(default=None, exclude_if=lambda value: value is None)
     field: EventUpdateField
     evidence: Annotated[
@@ -526,6 +540,7 @@ class ResearchRunStatus(ResearchSchema):
             "uncited_support",
             "unqualified_support_capture",
             "unconfirmed_date_withdrawal",
+            "withdrawn_value_mismatch",
             "normalized_decision_invalid",
         ]
         | None

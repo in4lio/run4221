@@ -33,6 +33,7 @@ from run4221.researcher.budget import (
 from run4221.researcher.policy import source_domain
 from run4221.researcher.schemas import (
     ArtifactReference,
+    AssessorObservedFields,
     AssessorOutcome,
     AssessorTerminalDecision,
     DecisionAction,
@@ -94,19 +95,19 @@ closed or ended registration may be proposed without a current registration URL.
 """
 
 _REFRESH_FIELD_POLICY = """\
-Evaluate each tracked field against its stored value. Propose the supported changes
-as soon as a current capture establishes them for the selected edition and distance.
-A planned entry deadline supports registration_close_at even when the current
-registration_status is unknown. Leave unrelated or unresolved fields unset.
-
-For registration_status, report the organizer's standard public entry route at the
-time of capture. Use sold_out when standard places are sold out and a separate
-waiting list offers no place. Use waitlist when applying to the waiting list is
-the only standard entry route. When the distinction is unclear, omit that field.
-Request a specific missing fact only if it blocks a supported decision.
-
-Clear a stored value only when the evidence establishes that the value itself is
-invalid. An announcement about another race cannot establish that.
+Extract the facts that primary_text states about this race, edition and distance.
+Return observe_fields with every independently supported value and its short, verbatim
+primary_text quote. The host compares the facts with the database. A request does not
+need a baseline or a second source to report a clear fact. Omit unknown fields.
+Use request_evidence only if no tracked fact is supported and a specific gap is resolvable.
+A published planned closing date supports registration_close_at. Quote its qualification.
+For registration_status use the standard public route as of capture. Sold-out places
+with a separate non-entry waiting list mean sold_out. A waiting list that is itself
+the only standard entry route means waitlist.
+For clear_fields report only explicit withdrawals. Include the exact withdrawn_value
+in its normalized field format and quote the complete statement identifying that value.
+For an event date, quote both the specific retraction and the current statement that
+no replacement date has been set. A pause or a different event cannot support removal.
 """
 
 _SAFE_DETAILS = {
@@ -182,8 +183,7 @@ _ASSESSOR_OUTCOME_ADAPTER = TypeAdapter(AssessorOutcome)
 _ALLOWED_ACTIONS: dict[str, frozenset[str]] = {
     "refresh": frozenset(
         {
-            DecisionAction.NO_CHANGE,
-            DecisionAction.PROPOSE_UPDATE,
+            "observe_fields",
             "request_evidence",
             DecisionAction.INCONCLUSIVE,
         }
@@ -448,6 +448,8 @@ class ResearchAgentJob:
 
         try:
             decision = _resolve_assessor_decision(assessed, request)
+        except _MissingEvidenceQuote:
+            return self._rejected_assessment(metadata, "unverified_field_quote")
         except _UnknownEvidenceKey:
             return self._rejected_assessment(metadata, "unknown_evidence_key")
         except (TypeError, ValueError):
@@ -701,6 +703,8 @@ def _resolve_assessor_decision(
     field_support = tuple(
         ResolvedFieldEvidenceSupport(
             field=item.field,
+            quote=item.quote,
+            withdrawn_value=item.withdrawn_value,
             evidence=tuple(
                 _resolve_evidence_key(evidence_key, evidence_by_key)
                 for evidence_key in item.evidence_keys
@@ -708,6 +712,10 @@ def _resolve_assessor_decision(
         )
         for item in getattr(assessed, "field_support", ())
     )
+    primary_by_ref = {item.reference: item.primary_text for item in request.evidence}
+    for support in field_support:
+        if any(support.quote not in primary_by_ref[ref] for ref in support.evidence):
+            raise _MissingEvidenceQuote
     conflicts = tuple(
         ResolvedEvidenceConflict(
             field=item.field,
@@ -731,15 +739,26 @@ def _resolve_assessor_decision(
         cited_keys.extend(evidence_by_key)
     cited_references = [evidence_by_key[key] for key in dict.fromkeys(cited_keys)]
 
+    payload = assessed.model_dump(
+        exclude={"applicability", "field_support", "conflicts", "observed_fields"}
+    )
+    if isinstance(assessed, AssessorObservedFields):
+        payload.update(
+            action=DecisionAction.PROPOSE_UPDATE, proposed_fields=assessed.observed_fields
+        )
     return ResearchDecision.model_validate(
         {
-            **assessed.model_dump(exclude={"applicability", "field_support", "conflicts"}),
+            **payload,
             "evidence": cited_references,
             "applicability": applicability,
             "field_support": field_support,
             "conflicts": conflicts,
         }
     )
+
+
+class _MissingEvidenceQuote(ValueError):
+    pass
 
 
 class _UnknownEvidenceKey(ValueError):
@@ -769,9 +788,26 @@ def _model_input(label: str, request: ResearchSchema) -> str:
 
 
 def _assessment_model_input(request: AssessmentRequest) -> str:
+    context = request.context
+    if request.mode == "refresh":
+        stable = {
+            "event_id",
+            "name",
+            "city",
+            "country",
+            "timezone",
+            "distances",
+            "official_url",
+            "approved_source_url",
+        }
+        identity = [item for item in context if item.name in stable]
+        stored_date = next((item.value for item in context if item.name == "event_date"), "")
+        if stored_date:
+            identity.append(FrozenContextField(name="edition_year", value=stored_date[:4]))
+        context = identity
     payload = {
         "mode": request.mode,
-        "context": [item.model_dump(mode="json") for item in request.context],
+        "context": [item.model_dump(mode="json") for item in context],
         "evidence": [
             {
                 "evidence_key": f"E{index}",
@@ -779,7 +815,11 @@ def _assessment_model_input(request: AssessmentRequest) -> str:
                     mode="json",
                     exclude={"reference", "text_hash", "primary_text"},
                 ),
-                "primary_text": item.primary_text or item.normalized_text,
+                "primary_text": (
+                    item.primary_text
+                    if request.mode == "refresh"
+                    else item.primary_text or item.normalized_text
+                ),
             }
             for index, item in enumerate(request.evidence, start=1)
         ],
@@ -915,7 +955,7 @@ def _attempt_metadata(metadata: AgentRunMetadata, mode: str, outcome: object) ->
     action = outcome.get("action")
     known_actions = _ALLOWED_ACTIONS["refresh"] | _ALLOWED_ACTIONS["profile"]
     fields: set[str] = set()
-    proposed = outcome.get("proposed_fields")
+    proposed = outcome.get("observed_fields")
     if isinstance(proposed, Mapping):
         cleared = proposed.get("clear_fields")
         for field in EventUpdateField:
