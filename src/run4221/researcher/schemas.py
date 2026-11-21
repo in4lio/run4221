@@ -375,6 +375,7 @@ class ResolvedEvidenceApplicability(ResearchSchema):
 
 
 class ResolvedFieldEvidenceSupport(ResearchSchema):
+    quote: EvidenceText | None = Field(default=None, exclude_if=lambda value: value is None)
     field: EventUpdateField
     evidence: Annotated[
         tuple[ArtifactReference, ...],
@@ -524,6 +525,7 @@ class ResearchRunStatus(ResearchSchema):
             "missing_field_support",
             "uncited_support",
             "unqualified_support_capture",
+            "unconfirmed_date_withdrawal",
             "normalized_decision_invalid",
         ]
         | None

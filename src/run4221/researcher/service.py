@@ -4,6 +4,7 @@ import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
+from datetime import date
 from typing import Protocol
 from urllib.parse import urlparse
 
@@ -52,6 +53,7 @@ from run4221.researcher.schemas import (
     ResearchCandidate,
     ResearchDecision,
     ResearchRunStatus,
+    ResolvedFieldEvidenceSupport,
     RunOutcome,
     RunState,
 )
@@ -1116,6 +1118,12 @@ class ResearcherService:
         qualified = _qualified_capture_references(captures, event, anchor_url=anchor_url)
         if any(not set(item.evidence).issubset(qualified) for item in retained_support):
             return None, "unqualified_support_capture"
+        if "event_date" in changed_fields and changed_fields["event_date"] is None:
+            support = next(
+                item for item in retained_support if item.field is EventUpdateField.EVENT_DATE
+            )
+            if not _supports_date_withdrawal(event.event_date, support, captures):
+                return None, "unconfirmed_date_withdrawal"
         try:
             return ResearchDecision.model_validate(
                 {
@@ -1255,6 +1263,40 @@ def _draft_matches_capture(draft: EventProfileDraft, snapshot: PageSnapshot) -> 
         draft.official_url,
         snapshot.final_url,
     )
+
+
+def _supports_date_withdrawal(
+    stored: str | None, support: ResolvedFieldEvidenceSupport, captures: tuple[CapturedPage, ...]
+) -> bool:
+    """Only admit an explicit retraction of this exact scheduled race date."""
+    if not stored:
+        return False
+    try:
+        previous = date.fromisoformat(stored)
+    except ValueError:
+        return False
+    month = previous.strftime("%B")
+    day, year = previous.day, previous.year
+    named_date = rf"(?:{previous.isoformat()}|{day} {month} {year}|{month} {day},? {year})"
+    # Conservative admission for destructive edits. Other wording needs manual review.
+    race_date = r"(?:the |our )?(?:previously (?:confirmed |announced )?)?(?:race|event) date"
+    retraction = re.compile(
+        rf"(?:we (?:have )?|the organi[sz]er (?:has )?)"
+        rf"(?:withdrawn|withdrew|retracted) {race_date} (?:of |on )?{named_date}"
+        rf"|{race_date} (?:of |on )?{named_date} (?:has been|is) (?:withdrawn|retracted)",
+        re.IGNORECASE,
+    )
+    for capture in captures:
+        if capture.reference not in support.evidence:
+            continue
+        primary = capture.snapshot.primary_text
+        for sentence in re.split(r"(?<=[.!?])\s+", primary):
+            statement = sentence.rstrip(".").strip()
+            if retraction.fullmatch(statement) and (
+                support.quote is None or statement.casefold() in support.quote.casefold()
+            ):
+                return True
+    return False
 
 
 def _proposes_stale_event_date(

@@ -1589,6 +1589,33 @@ def test_refresh_request_respects_search_and_page_caps_without_queue(tmp_path: P
         assert count_proposed_event_updates(database_url=url) == 0
 
 
+@pytest.mark.parametrize(
+    ("notice", "admitted"),
+    [
+        ("The usual race is paused. A separate replacement takes place next spring.", False),
+        ("We have withdrawn the race date of 19 September 2027.", True),
+        ("We have withdrawn the race date of 18 September 2027.", False),
+        ("We have not withdrawn the race date of 19 September 2027.", False),
+        ("If necessary, we have withdrawn the race date of 19 September 2027.", False),
+    ],
+)
+def test_date_clear_needs_a_retraction_of_the_stored_date(tmp_path, notice, admitted):
+    db = database_url(tmp_path)
+    source = tracked_source(db)
+
+    async def fetch(url):
+        return snapshot(url, text=notice, primary_text=notice)
+
+    agent = FakeAgent(decide=lambda request: supported_update(
+        request, proposed_fields={"clear_fields": ["event_date"]}
+    ))
+    result = asyncio.run(service(tmp_path, url=db, agent=agent, fetch=fetch).refresh(source))
+    queue = list_proposed_event_updates(database_url=db)
+    assert [row.proposed_fields for row in queue] == ([{"event_date": None}] if admitted else [])
+    assert result.status.validation_reason == (None if admitted else "unconfirmed_date_withdrawal")
+    assert find_event(source.event.id, db) == source.event
+
+
 def test_thin_high_confidence_no_change_is_inconclusive(tmp_path: Path) -> None:
     url = database_url(tmp_path)
     source = tracked_source(url)
