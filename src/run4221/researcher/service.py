@@ -336,6 +336,7 @@ class ResearcherService:
             if assessment.state is not AgentRunState.SUCCEEDED:
                 return await self._finish_agent_outcome(run_id, source.url, assessment)
             evidence_gap = assessment.gap
+            wrong_edition = False
             if assessment.decision is not None:
                 try:
                     decision = ResearchDecision.model_validate(
@@ -348,6 +349,17 @@ class ResearcherService:
                         RunState.SKIPPED,
                         RunOutcome.INCONCLUSIVE,
                         "Terminal decision failed host schema validation.",
+                    )
+                editions = {item.event_edition for item in decision.applicability}
+                wrong_edition = (
+                    frozen_event.event_date is not None
+                    and AssessmentVerdict.REJECTED in editions
+                    and AssessmentVerdict.CONFIRMED not in editions
+                )
+                if wrong_edition:
+                    evidence_gap = EvidenceGap(
+                        purpose=EvidenceRequestPurpose.EVENT_EDITION,
+                        description=f"Find the {frozen_event.event_date[:4]} race edition.",
                     )
                 observed = decision.proposed_fields
                 if evidence_gap and not _needs_followup(evidence_gap, decision, frozen_fields):
@@ -422,11 +434,9 @@ class ResearcherService:
                 captured_final_urls=frozenset(captured_final_urls),
             )
             candidate_urls = linked_candidate_urls
-            if not candidate_urls:
-                if completed_web_searches >= min(
-                    MAX_REFRESH_WEB_SEARCHES,
-                    self.budget.max_web_searches_per_job,
-                ):
+            search_limit = min(MAX_REFRESH_WEB_SEARCHES, self.budget.max_web_searches_per_job)
+            if not candidate_urls or (wrong_edition and completed_web_searches < search_limit):
+                if completed_web_searches >= search_limit:
                     return await self._finish_without_queue(
                         run_id,
                         source.url,
@@ -462,7 +472,7 @@ class ResearcherService:
                     scout.candidates,
                     event=frozen_event,
                     approved_source_url=source.url,
-                )
+                ) or linked_candidate_urls
             if not candidate_urls:
                 return await self._finish_without_queue(
                     run_id,
@@ -1584,7 +1594,14 @@ def _refresh_link_candidate_urls(
                 continue
             if conflicts_with_event_identity(link.url, link.text, event.distances):
                 continue
-            score = sum(weight for term, weight in weights.items() if term in tokens)
+            if request.purpose is EvidenceRequestPurpose.EVENT_EDITION and event.event_date:
+                # A generic link from the wrong edition cannot resolve a year mismatch.
+                # With no link naming the requested year, use the targeted scout.
+                if event.event_date[:4] not in tokens:
+                    continue
+                score = 100
+            else:
+                score = sum(weight for term, weight in weights.items() if term in tokens)
             if score <= 0:
                 continue
             path = urlparse(link.url).path.casefold()
@@ -1796,6 +1813,7 @@ def _conflict_evidence_lines(decision: ResearchDecision) -> tuple[str, ...]:
             for reference in conflict.evidence
         )
         + f" | {_single_line(conflict.summary, 300)}"
+        + "".join(f" | {_single_line(quote, 180)}" for quote in conflict.quotes or ())
         for conflict in decision.conflicts
     )
 

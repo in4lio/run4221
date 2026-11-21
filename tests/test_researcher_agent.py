@@ -1496,3 +1496,71 @@ def test_failed_unmetered_call_preserves_only_requested_profile_reserve() -> Non
     assert result.metadata.failure_reason == "unknown"
     assert result.metadata.output_tokens is None
     assert job.budget.remaining_output_tokens == 2 * 768
+
+
+@pytest.mark.parametrize("first_tokens", [1200, 2000, None])
+def test_sdk_bounds_every_request_in_a_multi_response_turn(monkeypatch, first_tokens):
+    from agents import ModelResponse, Usage, trace
+    from agents.models.multi_provider import MultiProvider
+    from openai.types.responses import ResponseOutputMessage, ResponseOutputText
+
+    limits = []
+
+    async def get_response(self, **kwargs):
+        settings = kwargs["model_settings"]
+        limits.append(settings.max_tokens)
+        assert settings.retry.max_retries == 0
+        used = first_tokens if len(limits) == 1 else 100
+        output = [] if len(limits) == 1 else [
+            ResponseOutputMessage(
+                id="msg_test", role="assistant", type="message", status="completed",
+                content=[ResponseOutputText(
+                    type="output_text", text=json.dumps(empty_report()), annotations=[],
+                )],
+            )
+        ]
+        return ModelResponse(
+            output=output, usage=Usage(output_tokens=used or 0), response_id=f"r{len(limits)}",
+            raw_usage=None if used is None else {"output_tokens": used},
+        )
+
+    model = OpenAIResponsesModel(DEFAULT_RESEARCH_MODEL, AsyncOpenAI(api_key="test"))
+    monkeypatch.setattr(MultiProvider, "get_model", lambda self, name: model)
+    monkeypatch.setattr(OpenAIResponsesModel, "get_response", get_response)
+    job = ResearchAgentJob(
+        instructions="Read the page.", prompt_reference="test",
+        budget=ResearchBudget(max_output_tokens_per_job=2000),
+    )
+    with trace("local unit test", disabled=True):
+        result = asyncio.run(job.assess(assessment_request()))
+    if first_tokens == 1200:
+        assert limits == [2000, 800]
+        assert result.state is AgentRunState.SUCCEEDED
+        assert result.metadata.output_tokens == 1300
+    else:
+        assert limits == [2000]
+        assert result.error_code == "output_token_budget"
+        assert result.metadata.model_responses == 1
+
+
+@pytest.mark.parametrize("second_quote", ["Registration ends in May.", "Unsupported quote."])
+def test_single_page_conflict_requires_grounded_passages(second_quote):
+    text = "Registration ends in April. Registration ends in May."
+    page = assessment_request().evidence[0].model_copy(update={"primary_text": text})
+    report = {
+        **empty_report(),
+        "observed_fields": {"event_date": None, "clear_fields": []},
+        "applicability": [update_applicability()],
+        "conflicts": [{
+            "field": "registration_close_at", "summary": "Two closing dates.",
+            "evidence_keys": ["E1"], "quotes": ["Registration ends in April.", second_quote],
+        }],
+    }
+    result = assess_decision(report, evidence=(page,))
+    if second_quote in text:
+        assert result.decision.action == "inconclusive"
+        assert result.decision.conflicts[0].evidence == (page.reference,)
+        assert result.decision.conflicts[0].quotes == tuple(report["conflicts"][0]["quotes"])
+    else:
+        assert result.decision is None
+        assert result.metadata.failure_reason == "unverified_field_quote"

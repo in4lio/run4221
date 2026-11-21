@@ -86,8 +86,11 @@ reference, or queue payload; the host resolves validated keys to immutable refer
 and owns all later search and capture. Confidence is metadata and never bypasses exact
 event, edition, distance/category, field-purpose, or conflict gates. Never approve,
 reject, publish, send messages, mutate records, search, or infer facts absent from the
-captured evidence. A
-closed or ended registration may be proposed without a current registration URL.
+captured evidence. For contradictory statements on one page, cite its key once and
+supply two distinct verbatim primary_text passages in quotes. For a conflict between
+pages, cite the different keys and set quotes to null. Distinguish registration phases
+and entry routes before treating two statements as contradictory. Omit the disputed
+field. A closed or ended registration may be proposed without a current registration URL.
 """
 
 _REFRESH_FIELD_POLICY = """\
@@ -241,9 +244,25 @@ class SDKRunner:
         self,
         starting_agent: Agent[Any],
         input: str,
+        *,
+        hooks: _RunResponses,
         **kwargs: object,
     ) -> Any:
-        return await Runner.run(starting_agent, input, **kwargs)
+        # Retry only a rejected initial request. Unmetered transport retries
+        # could generate twice against the same token allowance.
+        retries = starting_agent.model_settings.retry.max_retries
+        for attempt in range(retries + 1):
+            try:
+                return await Runner.run(starting_agent, input, hooks=hooks, **kwargs)
+            except APIError as error:
+                if (
+                    getattr(error, "status_code", None) != 429
+                    or getattr(error, "code", None) == "insufficient_quota"
+                    or hooks.responses
+                    or attempt == retries
+                ):
+                    raise
+                await asyncio.sleep(min(2**attempt, 8))
 
 
 class ResearchAgentJob:
@@ -290,19 +309,22 @@ class ResearchAgentJob:
             )
 
         agent = self._scout_agent(limits, request)
+        observations = _RunResponses(limits.max_output_tokens)
         try:
             result = await asyncio.wait_for(
                 self.runner.run(
                     agent,
                     _model_input("SCOUT REQUEST", request),
                     max_turns=limits.max_turns,
-                    run_config=_run_config(),
+                    run_config=observations.config,
+                    hooks=observations,
                 ),
                 timeout=limits.wall_time_seconds,
             )
         except Exception as error:
             return self._scout_error(
                 error,
+                observations=observations,
                 preserve_assessment_reserve=True,
             )
 
@@ -360,14 +382,14 @@ class ResearchAgentJob:
             )
 
         agent = self._assessor_agent(limits, request.mode)
-        observations = _AssessmentResponses()
+        observations = _RunResponses(limits.max_output_tokens)
         try:
             result = await asyncio.wait_for(
                 self.runner.run(
                     agent,
                     _assessment_model_input(request),
                     max_turns=limits.max_turns,
-                    run_config=_run_config(),
+                    run_config=observations.config,
                     hooks=observations,
                 ),
                 timeout=limits.wall_time_seconds,
@@ -557,15 +579,19 @@ class ResearchAgentJob:
         error: BaseException,
         *,
         preserve_assessment_reserve: bool,
+        observations: _RunResponses,
     ) -> ScoutRunResult:
+        metadata = self._response_metadata(tuple(observations.responses))
         state, error_code = self._classify_error(
             error,
-            observation=BudgetObservation(turns=1, web_searches=0, output_tokens=None),
+            observation=BudgetObservation(
+                metadata.model_responses or 1, metadata.web_search_calls, metadata.output_tokens
+            ),
             preserve_assessment_reserve=preserve_assessment_reserve,
         )
         return ScoutRunResult(
             state=state,
-            metadata=replace(self._empty_metadata(), runner_calls=1),
+            metadata=metadata,
             error_code=error_code,
             detail=_SAFE_DETAILS.get(error_code, _SAFE_DETAILS["provider_error"]),
         )
@@ -575,7 +601,7 @@ class ResearchAgentJob:
         error: BaseException,
         *,
         request: AssessmentRequest,
-        observations: _AssessmentResponses,
+        observations: _RunResponses,
         preserve_followups: int = 0,
     ) -> AssessmentRunResult:
         metadata = self._response_metadata(tuple(observations.responses))
@@ -632,6 +658,8 @@ class ResearchAgentJob:
             preserve_assessment_reserve=preserve_assessment_reserve,
             preserved_followups=preserved_followups,
         )
+        if isinstance(error, BudgetExhausted):
+            return AgentRunState.CAPPED, error.cap.value
         if turn_limit:
             return AgentRunState.CAPPED, "max_turns"
         if isinstance(error, (TimeoutError, asyncio.TimeoutError)):
@@ -691,6 +719,7 @@ def _resolve_assessor_decision(
                 for evidence_key in item.evidence_keys
             ),
             summary=item.summary,
+            quotes=item.quotes,
         )
         for item in assessed.conflicts
     )
@@ -698,6 +727,11 @@ def _resolve_assessor_decision(
     cited_keys: list[str] = []
     for support in getattr(assessed, "field_support", ()):
         cited_keys.extend(support.evidence_keys)
+    for conflict in conflicts:
+        if conflict.quotes and any(
+            quote not in primary_by_ref[conflict.evidence[0]] for quote in conflict.quotes
+        ):
+            raise _MissingEvidenceQuote
     for conflict in assessed.conflicts:
         cited_keys.extend(conflict.evidence_keys)
     if not cited_keys and assessed.applicability:
@@ -713,7 +747,8 @@ def _resolve_assessor_decision(
         payload["action"] = DecisionAction.INCONCLUSIVE
         if assessed.observed_fields is not None:
             payload.update(
-                action=DecisionAction.PROPOSE_UPDATE, proposed_fields=assessed.observed_fields
+                action=DecisionAction.PROPOSE_UPDATE,
+                proposed_fields=assessed.observed_fields.model_dump(),
             )
     return ResearchDecision.model_validate(
         {
@@ -742,13 +777,6 @@ def _resolve_evidence_key(
         return evidence_by_key[evidence_key]
     except KeyError as error:
         raise _UnknownEvidenceKey("The assessor cited an unknown evidence key.") from error
-
-
-def _run_config() -> RunConfig:
-    return RunConfig(
-        workflow_name="run4221-researcher",
-        trace_include_sensitive_data=False,
-    )
 
 
 def _model_input(label: str, request: ResearchSchema) -> str:
@@ -874,14 +902,27 @@ def _observed_stop_reason(responses: tuple[object, ...]) -> str | None:
     return None
 
 
-class _AssessmentResponses(RunHooks):
-    """Hold returned responses for this call if the SDK rejects its final output."""
+class _RunResponses(RunHooks):
+    """Cap each SDK turn using what earlier responses actually consumed."""
 
-    def __init__(self) -> None:
+    def __init__(self, allowance: int) -> None:
+        self.settings = ModelSettings(max_tokens=allowance, retry=ModelRetrySettings(max_retries=0))
+        self.config = RunConfig(
+            workflow_name="run4221-researcher",
+            trace_include_sensitive_data=False,
+            model_settings=self.settings,
+        )
         self.responses: list[Any] = []
+
+    async def on_llm_start(self, context, agent, system_prompt, input_items) -> None:
+        if not self.settings.max_tokens:
+            raise BudgetExhausted(BudgetCap.OUTPUT_TOKENS)
 
     async def on_llm_end(self, context, agent, response) -> None:
         self.responses.append(response)
+        used = _observed_usage((response,))["output_tokens"]
+        remaining = self.settings.max_tokens or 0
+        self.settings.max_tokens = 0 if used is None else max(0, remaining - used)
 
     def final_outcome(self, mode: str) -> object:
         if not self.responses:

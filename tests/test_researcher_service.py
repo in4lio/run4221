@@ -2796,3 +2796,41 @@ def test_refresh_skips_http_error_source_before_assessment(tmp_path: Path) -> No
     assert result.status.detail == "Approved source was unusable: unusable HTTP status 404."
     assert agent.assessment_calls == []
     assert count_proposed_event_updates(database_url=url) == 0
+
+
+def test_wrong_edition_routes_to_search_without_a_model_gap(tmp_path):
+    url = database_url(tmp_path)
+    source = tracked_source(url)
+    archived = "https://baden.example/archive/2027/marathon"
+
+    def wrong_edition(request):
+        return ResearchDecision.model_validate({
+            "action": "inconclusive", "summary": "The organizer covers 2028.",
+            "applicability": [{
+                "evidence": request.evidence[0].reference, "event_identity": "confirmed",
+                "event_edition": "rejected", "distance_category": "confirmed",
+            }],
+        })
+
+    agent = FakeAgent(
+        candidates=(ResearchCandidate(source_url=archived, title="2027 edition", snippet="Race"),),
+        assessments=(
+            wrong_edition, lambda request: supported_update(request, evidence_indexes=(1,)),
+        ),
+    )
+    fetched = []
+
+    async def fetch(address):
+        fetched.append(address)
+        if address == source.url:
+            return snapshot(
+                address, title="Baden Marathon 2028", primary_text="Baden Marathon 2028",
+                links=(PageLink(url="https://baden.example/event-merchandise", text="Race shop"),),
+            )
+        return snapshot(address, primary_text="Baden Marathon 2027. Registration is open.")
+
+    result = asyncio.run(service(tmp_path, url=url, agent=agent, fetch=fetch).refresh(source))
+    assert result.status.outcome == "proposal_created"
+    assert agent.call_order == ["assess", "scout", "assess"]
+    assert "2027" in agent.scout_calls[0].query
+    assert fetched == [source.url, archived]

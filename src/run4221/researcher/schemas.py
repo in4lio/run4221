@@ -117,7 +117,7 @@ class EventUpdateField(StrEnum):
     EVENT_DATE = "event_date"
 
 
-class ProposedEventChanges(ResearchSchema):
+class ObservedEventFields(ResearchSchema):
     registration_status: RegistrationStatus | None = None
     registration_open_at: Annotated[str, Field(max_length=40)] | None = None
     registration_open_precision: RegistrationOpenPrecision | None = None
@@ -149,8 +149,6 @@ class ProposedEventChanges(ResearchSchema):
         conflicts = [field for field in self.clear_fields if getattr(self, field) is not None]
         if conflicts:
             raise ValueError("A field cannot be set and cleared in the same decision.")
-        if not self.changed_fields:
-            raise ValueError("At least one event field must be set or cleared.")
         return self
 
     @property
@@ -158,6 +156,14 @@ class ProposedEventChanges(ResearchSchema):
         fields = {field for field in EventUpdateField if getattr(self, field.value) is not None}
         fields.update(EventUpdateField(name) for name in self.clear_fields)
         return frozenset(fields)
+
+
+class ProposedEventChanges(ObservedEventFields):
+    @model_validator(mode="after")
+    def require_changes(self) -> Self:
+        if not self.changed_fields:
+            raise ValueError("At least one event field must be set or cleared.")
+        return self
 
 
 class ArtifactReference(ResearchSchema):
@@ -233,18 +239,30 @@ class FieldEvidenceSupport(ResearchSchema):
         return self
 
 
-class EvidenceConflict(ResearchSchema):
+class ConflictDescription(ResearchSchema):
     field: EventUpdateField | None = None
+    summary: EvidenceText
+    quotes: Annotated[tuple[EvidenceText, ...], Field(min_length=2, max_length=2)] | None = None
+
+    def validate_sources(self, sources: tuple[object, ...]) -> None:
+        if len(sources) != len(set(sources)):
+            raise ValueError("Cite each conflict source once.")
+        if len(sources) == 1:
+            if self.quotes is None or self.quotes[0] == self.quotes[1]:
+                raise ValueError("A conflict on one page requires two distinct quotes.")
+        elif self.quotes is not None:
+            raise ValueError("Use quotes only for a conflict on one page.")
+
+
+class EvidenceConflict(ConflictDescription):
     evidence_keys: Annotated[
         tuple[EvidenceKey, ...],
-        Field(min_length=2, max_length=8),
+        Field(min_length=1, max_length=8),
     ]
-    summary: EvidenceText
 
     @model_validator(mode="after")
     def validate_evidence_keys(self) -> Self:
-        if len(set(self.evidence_keys)) != len(self.evidence_keys):
-            raise ValueError("A conflict must cite distinct evidence keys.")
+        self.validate_sources(self.evidence_keys)
         return self
 
 
@@ -278,11 +296,18 @@ class EvidenceGap(ResearchSchema):
 
 
 class RefreshAssessment(AssessorTerminalDecision):
-    observed_fields: ProposedEventChanges | None
+    observed_fields: ObservedEventFields | None
     field_support: Annotated[
         tuple[FieldEvidenceSupport, ...], Field(max_length=len(EventUpdateField))
     ]
     gap: EvidenceGap | None
+
+    @field_validator("observed_fields")
+    @classmethod
+    def normalize_empty_observations(
+        cls, value: ObservedEventFields | None
+    ) -> ObservedEventFields | None:
+        return value if value and value.changed_fields else None
 
     @model_validator(mode="after")
     def validate_update_support(self) -> Self:
@@ -381,18 +406,15 @@ class ResolvedFieldEvidenceSupport(ResearchSchema):
         return self
 
 
-class ResolvedEvidenceConflict(ResearchSchema):
-    field: EventUpdateField | None = None
+class ResolvedEvidenceConflict(ConflictDescription):
     evidence: Annotated[
         tuple[ArtifactReference, ...],
-        Field(min_length=2, max_length=8),
+        Field(min_length=1, max_length=8),
     ]
-    summary: EvidenceText
 
     @model_validator(mode="after")
     def validate_evidence(self) -> Self:
-        if len(set(self.evidence)) != len(self.evidence):
-            raise ValueError("A conflict must cite distinct evidence.")
+        self.validate_sources(self.evidence)
         return self
 
 
@@ -470,6 +492,11 @@ class ResearchDecision(ResearchSchema):
         if self.action is DecisionAction.PROFILE_EVENT:
             if self.draft is None:
                 raise ValueError("profile_event requires a draft.")
+            if any(
+                c.field is None or getattr(self.draft, c.field.value, None) is not None
+                for c in self.conflicts
+            ):
+                raise ValueError("A profile must omit the disputed field.")
         elif self.draft is not None or self.page_is_event is not None:
             raise ValueError("Only profile_event can include a profile draft payload.")
         return self
