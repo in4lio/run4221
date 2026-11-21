@@ -2834,3 +2834,22 @@ def test_wrong_edition_routes_to_search_without_a_model_gap(tmp_path):
     assert agent.call_order == ["assess", "scout", "assess"]
     assert "2027" in agent.scout_calls[0].query
     assert fetched == [source.url, archived]
+
+
+@pytest.mark.parametrize(("opening", "search"), [
+    ("2027-10-01", True), ("2027-10", True), ("2027-09-19", False),
+    ("2027-09-20T01:00:00+06:00", False),
+])
+def test_edition_check_compares_registration_to_local_race_day(tmp_path, opening, search):
+    url = database_url(tmp_path)
+    source = tracked_source(url)
+    agent = FakeAgent(decide=lambda request: supported_update(
+        request, proposed_fields={"registration_open_at": opening},
+    ))
+
+    async def fetch(address):
+        return snapshot(address, primary_text="Baden Marathon registration.")
+
+    result = asyncio.run(service(tmp_path, url=url, agent=agent, fetch=fetch).refresh(source))
+    assert bool(agent.scout_calls) is search
+    assert result.status.outcome == ("inconclusive" if search else "proposal_created")

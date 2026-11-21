@@ -4,9 +4,10 @@ import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Protocol
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import ValidationError
 
@@ -323,6 +324,7 @@ class ResearcherService:
         seen_gaps: set[str] = set()
         successful_captures = 1
         completed_web_searches = 0
+        post_race_sources: set[ArtifactReference] = set()
 
         while True:
             assessment = await self.agent.assess(
@@ -350,12 +352,18 @@ class ResearcherService:
                         RunOutcome.INCONCLUSIVE,
                         "Terminal decision failed host schema validation.",
                     )
+                post_race_sources.update(_post_race_registration_sources(decision, frozen_event))
                 editions = {item.event_edition for item in decision.applicability}
+                claimed_sources = {
+                    ref for item in decision.field_support for ref in item.evidence
+                }
+                if decision.action is DecisionAction.NO_CHANGE:
+                    claimed_sources.update(decision.evidence)
                 wrong_edition = (
                     frozen_event.event_date is not None
                     and AssessmentVerdict.REJECTED in editions
                     and AssessmentVerdict.CONFIRMED not in editions
-                )
+                ) or not post_race_sources.isdisjoint(claimed_sources)
                 if wrong_edition:
                     evidence_gap = EvidenceGap(
                         purpose=EvidenceRequestPurpose.EVENT_EDITION,
@@ -1489,6 +1497,38 @@ def _event_context(event: TrackedEvent, approved_source_url: str) -> tuple[Froze
         "approved_source_url": approved_source_url,
     }
     return tuple(FrozenContextField(name=name, value=str(value)) for name, value in values.items())
+
+
+def _post_race_registration_sources(
+    decision: ResearchDecision, event: TrackedEvent
+) -> set[ArtifactReference]:
+    """Registration after the tracked race cannot establish that edition's window."""
+    observed = decision.proposed_fields
+    if not event.event_date or observed is None:
+        return set()
+    # Allow a supported date correction within the tracked edition.
+    race_day = event.event_date
+    if observed.event_date and observed.event_date[:4] == race_day[:4]:
+        race_day = observed.event_date
+    sources: set[ArtifactReference] = set()
+    for support in decision.field_support:
+        if support.field not in {
+            EventUpdateField.REGISTRATION_OPEN_AT, EventUpdateField.REGISTRATION_CLOSE_AT
+        }:
+            continue
+        value = getattr(observed, support.field.value)
+        if not value:
+            continue
+        try:
+            # For a month-only value, even its earliest possible day must be too late.
+            when = datetime.fromisoformat(value + "-01" if len(value) == 7 else value)
+            if when.tzinfo is not None:
+                when = when.astimezone(ZoneInfo(event.timezone))
+            if when.date() > date.fromisoformat(race_day):
+                sources.update(support.evidence)
+        except (ValueError, ZoneInfoNotFoundError):
+            continue
+    return sources
 
 
 def _needs_followup(
